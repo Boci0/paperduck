@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (QAbstractButton, QComboBox, QFileDialog, QFormLayou
 
 from src.storage.recent_files import format_age
 from src.tools.ai_assist import (BRAVE_KEY_PAGE, BRAVE_URL, COMPACT_AT, COMPACT_PREFIX, KEY_PAGES, MAX_INPUT_CHARS, PRESETS,
-                                 compact_history, history_chars, summary_turns, DEEPSEEK_TOP_UP, deepseek_balance, is_deepseek,
+                                 compact_history, history_chars, summary_turns, DEEPSEEK_TOP_UP, deepseek_balance, is_anthropic, is_deepseek, keep_wire,
                                  THINKING_LEVELS, AiAssistPlugin, BranchNote, fit_thinking, thinking_levels, AiJob, AiReply, ModelInfo, ToolHost, ask, chat_messages, delete_key, list_models, load_key, save_key, valid_key,
                                  valid_model, validate_base_url)
 from src.tools.ai_sessions import archive_turns, delete_session, delete_sessions, list_sessions, load_session, new_id, save_session
@@ -1371,7 +1371,8 @@ class AiChat(QWidget):
                 return ask(url, key, model, messages or [], thinking=thinking, host=host, steer=lambda: self._take_steer(cancel), cancel=cancel)
             sent, n, summary = (compact_history(url, key, model, history, cancel) if history_chars(history) > COMPACT_AT
                                 else (history, 0, ""))
-            reply = ask(url, key, model, chat_messages(sent), thinking=thinking, host=host, progress=note,
+            # shortcut: Claude still gets earlier answers in note form (its turns are built in another shape)
+            reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url)), thinking=thinking, host=host, progress=note,
                          steer=lambda: self._take_steer(cancel), cancel=cancel)
             reply.compacted, reply.summary = n, summary
             return reply
@@ -1477,7 +1478,9 @@ class AiChat(QWidget):
         self._relayout()
 
     def _accept_reply(self, reply: AiReply) -> None:
-        self._history.append({"role": "assistant", "content": reply.text, "tools": reply.tools})
+        # "wire" stays in memory only (sessions save the note form): a resumed chat pays one cache miss
+        self._history.append({"role": "assistant", "content": reply.text, "tools": reply.tools,
+                              **({"wire": reply.wire} if keep_wire(self._history, reply.wire) else {})})
         self._plugin.record(reply.total_tokens)
         self._save_session()
         row, _label = self._add_row("assistant", reply.text, markdown=True)
