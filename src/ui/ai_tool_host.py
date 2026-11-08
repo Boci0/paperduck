@@ -30,7 +30,7 @@ from src.tools import computer
 from src.tools.ai_assist import ask, fit_thinking, load_key
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
-                                computer_action, destructive_reason, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
+                                computer_action, destructive_reason, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
                                 PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
@@ -369,6 +369,8 @@ class AiToolHost(QObject):
             return self.procs.stop(args.get("id"))
         if name == "load_skill":
             return load_skill(skills_dir(), args.get("name"))
+        if name == "find_skill":
+            return find_skills(skills_dir(), args.get("query"))
         if name == "find_mcp_servers":
             query = args.get("query")
             return find_servers(query.strip()) if isinstance(query, str) and query.strip() else "error: give a query"

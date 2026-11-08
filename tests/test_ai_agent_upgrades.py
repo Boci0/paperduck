@@ -233,7 +233,8 @@ def test_driving_office_without_its_skill_gets_one_nudge_per_app() -> None:
         return ai_assist._steer(name, ai_assist._call_key(name, args), "exit code 0\nok", state)
 
     word = {"script": "$w = New-Object -ComObject Word.Application\n$w.Documents.Add()"}
-    assert "load the built-in word-docs skill" in run("run_powershell", word).lower()
+    note = run("run_powershell", word)
+    assert "here is the word-docs skill, loaded for you" in note and "word_helpers.ps1" in note  # the text itself
     assert run("run_powershell", {**word, "script": word["script"] + "\n# again"}) == ""  # once per answer
     assert run("load_skill", {"name": "slides"}) == ""
     assert run("run_powershell", {"script": "New-Object -ComObject PowerPoint.Application"}) == ""  # already loaded

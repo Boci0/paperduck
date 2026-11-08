@@ -11,7 +11,7 @@ import pytest
 
 from src.tools import ai_assist, ai_tools
 from src.tools.ai_assist import chat_messages
-from src.tools.ai_tools import (MAX_SKILL_CHARS, MAX_SKILL_DESC, MAX_SKILLS, TOOL_SPECS, list_skills, load_skill,
+from src.tools.ai_tools import (MAX_SKILL_CHARS, MAX_SKILL_DESC, MAX_SKILLS, TOOL_SPECS, find_skills, list_skills, load_skill,
                                 parse_skill, run_command, run_file_tool, skills_dir, skills_prompt)
 
 
@@ -218,13 +218,31 @@ def test_parse_skill_frontmatter() -> None:
 def test_skills_list_is_capped_and_lands_in_the_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     root = skills_dir()
     assert skills_prompt(root).startswith("Skills built into Paperduck") and "The user wrote" not in skills_prompt(root)
-    for i in range(MAX_SKILLS + 5):
+    for i in range(5):
         _skill(root, f"s{i:02d}", f"---\ndescription: does {i} " + "x" * 500 + "\n---\nbody")
     (root / "no_md").mkdir()
     listed = list_skills(root)
-    assert len(listed) == MAX_SKILLS and listed[0][0] == "s00" and len(listed[0][1]) == MAX_SKILL_DESC
+    assert len(listed) == 5 and listed[0][0] == "s00" and len(listed[0][1]) == MAX_SKILL_DESC
     system = chat_messages([{"role": "user", "content": "hi"}])[0]["content"]
-    assert "load_skill" in system and "- s00: does 0" in system and "s34" not in system
+    assert "load_skill" in system and "- s00: does 0" in system  # few skills: names and descriptions
+    for i in range(MAX_SKILLS):
+        _skill(root, f"t{i:03d}", f"---\ndescription: does {i}\n---\nbody")
+    assert len(list_skills(root)) == MAX_SKILLS
+    system = chat_messages([{"role": "user", "content": "hi"}])[0]["content"]
+    assert "s00, s01" in system and "does 0" not in system and "find_skill" in system  # many: names only
+    assert len(skills_prompt(root)) < 8 * MAX_SKILLS  # a few tokens per skill, whatever their descriptions
+
+
+def test_find_skill_ranks_name_then_description_then_text(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _skill(root, "commit-message", "---\ndescription: Write a clear git commit message\n---\nRun git diff first.")
+    _skill(root, "poster", "---\ndescription: Print layouts\n---\nExport a PowerPoint slide as a poster.")
+    assert find_skills(root, "git commit").startswith("- commit-message: Write a clear git commit message")
+    top = find_skills(root, "powerpoint deck").splitlines()
+    assert top[0].startswith("- slides: ") and any(line.startswith("- poster:") for line in top)  # built-ins too
+    assert find_skills(root, "zzzz qqqq") == "no skill matches; go ahead without one"
+    assert find_skills(root, " ").startswith("error:")
+    assert any(s["function"]["name"] == "find_skill" for s in TOOL_SPECS)
 
 
 def test_load_skill_returns_listed_bodies_only(tmp_path: Path) -> None:
