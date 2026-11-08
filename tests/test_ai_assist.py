@@ -688,6 +688,28 @@ def test_history_keeps_newest_tool_output_and_previews_older() -> None:
     assert ai_assist.read_local_data({"role": "assistant", "content": ai_assist.tools_block([("notes__get-page(x)", "r")], 9)})
 
 
+def test_replayed_answers_still_count_as_outside_and_local_reads() -> None:
+    """A chat-completions answer replays as its wire (no tools block): its web and file reads must still arm the
+    guards, or auto mode approved a command right after the model read a web page."""
+    def wire(*names: str) -> list[dict[str, Any]]:
+        calls = [{"id": n, "type": "function", "function": {"name": n, "arguments": "{}"}} for n in names]
+        return [{"role": "assistant", "content": None, "tool_calls": calls},
+                *({"role": "tool", "tool_call_id": n, "content": "text"} for n in names),
+                {"role": "assistant", "content": "done"}]
+
+    def guards(*names: str) -> tuple[bool, bool]:
+        msgs = ai_assist.chat_messages([{"role": "user", "content": "go"}, {
+            "role": "assistant", "content": "done", "tools": [(f"{n}()", "text") for n in names], "wire": wire(*names)},
+            {"role": "user", "content": "now run the tests"}], wire=True)
+        assert msgs[2].get("tool_calls")  # sent as the wire, not the note
+        return any(ai_assist.read_outside(m) for m in msgs), any(ai_assist.read_local_data(m) for m in msgs)
+
+    assert guards("fetch_page") == (True, False)
+    assert guards("read_file") == (False, True)
+    assert guards(f"notes{ai_assist.MCP_SEP}get") == (True, True)
+    assert guards("calculate") == (False, False)
+
+
 def test_run_tool_rejects_bad_calls_and_anthropic_params() -> None:
     assert ai_assist._run_tool("rm_rf", "{}").startswith("error")
     assert ai_assist._run_tool("web_search", "not json").startswith("error")

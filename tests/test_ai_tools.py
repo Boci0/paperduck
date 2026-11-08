@@ -254,6 +254,20 @@ def test_skills_are_recalled_per_message_and_reread_when_edited(tmp_path: Path, 
     assert find_skills(root, "minutes").startswith("- pitch: Board meeting minutes")
 
 
+def test_short_words_and_accents_do_not_recall_unrelated_skills(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    for name, desc in (("github-actions", "CI workflows"), ("notebook-cleanup", "tidy Jupyter notebooks"),
+                       ("email-drafts", "write emails in my voice")):
+        _skill(root, name, f"---\ndescription: {desc}\n---\nx")
+    for i in range(10):
+        _skill(root, f"filler{i:02d}", f"---\ndescription: filler {i}\n---\nx")
+    # "hi" sat inside github, "ok" inside notebook, "ai" inside email: small talk got a skill note
+    for message in ("hi", "ok thanks", "ai", "pr er"):
+        assert skills_recall(root, message) == "", message
+    assert "github-actions" in skills_recall(root, "fix the github workflow")
+    assert "slides (" in skills_recall(root, "créer une présentation")  # é folds to e, not a word break
+
+
 def test_recall_rides_on_the_user_message_not_the_system_prompt() -> None:
     root = skills_dir()
     for i in range(12):

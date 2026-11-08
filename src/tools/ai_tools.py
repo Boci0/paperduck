@@ -35,6 +35,7 @@ import tempfile
 import itertools
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -1239,17 +1240,27 @@ def _variants(word: str) -> set[str]:
     return out
 
 
+def _matcher(variants: set[str]) -> Any:
+    """Whether a field holds one of the variants: a long one anywhere (invoice in invoices), a short one only as a
+    whole word, so "hi" or "ok" never match github or notebook."""
+    long = [v for v in variants if len(v) > 3]
+    short = [v for v in variants if len(v) <= 3]
+    pattern = re.compile(rf"\b(?:{'|'.join(map(re.escape, short))})s?\b") if short else None
+    return lambda field: any(v in field for v in long) or (pattern is not None and pattern.search(field) is not None)
+
+
 def rank_skills(root: Path, text: Any, top: int, head_min: int = 0) -> list[tuple[str, str]]:
     """The `top` skills whose name (3 per word), description (2) and text (1) best match `text`'s words or their
     synonyms; `head_min` is the least the name and description must score, so body-only hits can be left out."""
-    words = [_variants(w) for w in {w for w in re.findall(r"[a-z0-9]+", str(text or "").lower())
-                                    if len(w) > 1 and w not in _STOP}]
+    folded = unicodedata.normalize("NFKD", str(text or "").lower()).encode("ascii", "ignore").decode()  # é -> e
+    words = [_matcher(_variants(w)) for w in {w for w in re.findall(r"[a-z0-9]+", folded)
+                                              if len(w) > 1 and w not in _STOP}]
     scored = []
     for name, (desc, body) in _all_skills(root).items():
         fields = ((name.lower().replace("-", " ").replace("_", " "), 3), (desc.lower(), 2))
-        head = sum(weight for vs in words for field, weight in fields if any(v in field for v in vs))
+        head = sum(weight for hit in words for field, weight in fields if hit(field))
         low = body.lower()
-        score = head + sum(1 for vs in words if any(v in low for v in vs))
+        score = head + sum(1 for hit in words if hit(low))
         if score and head >= head_min:
             scored.append((-score, name, desc))
     return [(name, desc) for _s, name, desc in sorted(scored)[:top]]
