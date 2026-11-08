@@ -30,6 +30,15 @@ $StandaloneAsset = "paperduck-win64.zip"
 $ReleasePublicKey = "f0cc212a80d53fe877827253c020e2c01d023c4280eebf47423c6032a0259316"
 $SigningPySha256 = "B415F26BF5BA35C3BA626DCB6D22FED740714BBBC5E185B5A99B766B7B73ED15"
 
+# A shell started by a packaged app (such as the Claude desktop app) writes new AppData files to that app's private
+# copy while deletes still hit the real folder, so installing from it destroys the real install (writes_redirected)
+New-Item -ItemType Directory -Force $Root | Out-Null
+$probe = ".write-probe-$PID"
+Set-Content -LiteralPath (Join-Path $Root $probe) -Value ""
+$sandboxed = Test-Path (Join-Path $env:LOCALAPPDATA "Packages\*\LocalCache\Local\Paperduck\$probe")
+Remove-Item -LiteralPath (Join-Path $Root $probe) -Force -ErrorAction SilentlyContinue
+if ($sandboxed) { throw "This shell runs inside another app's sandbox (its AppData writes are redirected). Run the installer from a normal PowerShell window." }
+
 function Find-Python {
     $ErrorActionPreference = "Continue"  # a missing runtime writes to stderr, which 5.1 would make fatal
     foreach ($cmd in @(@("py", "-3.12"), @("py", "-3"), @("python"))) {

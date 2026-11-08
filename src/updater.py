@@ -69,6 +69,40 @@ def is_installed(app_dir: Path = APP_DIR) -> bool:
     return (app_dir / INSTALL_MARKER).is_file()
 
 
+SANDBOXED = ("refusing to change the install from inside another app's sandbox (its AppData writes are redirected); "
+             "run it from a normal PowerShell or the Start Menu Paperduck")
+
+
+def writes_redirected(folder: Path) -> bool:
+    """True when this process's new files in `folder` land in an app package's private copy of %LOCALAPPDATA%.
+
+    Processes started by a packaged (MSIX) app, such as shells run by the Claude desktop app, write new files
+    to that copy while renames and deletes of existing files still hit the real folder: a 2.4.1 swap run that
+    way deleted the real install and left the new one where only that app could see it.
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return False
+    try:
+        rel = folder.resolve().relative_to(Path(local).resolve())
+    except ValueError:
+        return False
+    probe = folder / f".write-probe-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+    except OSError:
+        return False
+    try:
+        return any((Path(local) / "Packages").glob(f"*/LocalCache/Local/{rel.as_posix()}/{probe.name}"))
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def refuse_if_sandboxed(folder: Path) -> None:
+    if writes_redirected(folder):
+        raise OSError(SANDBOXED)
+
+
 RETRY_WAITS_S = (2.0, 8.0)  # GitHub's download servers time out (502/503/504) for minutes at a time
 
 
@@ -197,6 +231,7 @@ def install_source_zip(data: bytes, app_dir: Path = APP_DIR) -> None:
     ones is refused ("needs installer"): new code on old libraries can crash at start, and the running
     app cannot safely replace its own libraries, so the user re-runs install.ps1 for that release.
     """
+    refuse_if_sandboxed(app_dir)
     new_dir, old_dir = app_dir / "src.new", app_dir / "src.old"
     shutil.rmtree(new_dir, ignore_errors=True)
     shutil.rmtree(old_dir, ignore_errors=True)
@@ -243,6 +278,7 @@ def install_frozen_zip(data: bytes, app_dir: Path = APP_DIR) -> None:
 
     The running app is not touched. No library check: a frozen bundle carries its own runtime.
     """
+    refuse_if_sandboxed(app_dir.parent)
     new_dir = app_dir.with_name(app_dir.name + ".new")
     shutil.rmtree(new_dir, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -307,6 +343,7 @@ def finish_frozen_update(old_pid: int, new_dir: Path = APP_DIR,
         raise ValueError(f"not a staged update: {new_dir}")
     app_dir = new_dir.with_name(new_dir.name.removesuffix(".new"))
     old_dir = app_dir.with_name(app_dir.name + ".old")
+    refuse_if_sandboxed(app_dir.parent)
     if not _wait_for_exit(old_pid):
         return None
     shutil.rmtree(old_dir, ignore_errors=True)
