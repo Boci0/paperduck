@@ -1158,3 +1158,27 @@ def test_host_asks_again_only_for_guarded_tools_after_outside_content() -> None:
     AiToolHost._allowed(fake, "run_command", "t", "w")
     assert asked == [("run_command", {"untrusted": True}), ("computer", {"untrusted": True}), ("mcp:notes", {}),
                      ("run_command", {"danger": "rm -rf"}), ("run_command", {})]
+
+
+def test_apps_at_points_takes_the_topmost_window_at_each_point() -> None:
+    from src.tools.computer import apps_at_points
+
+    windows = [((0, 0, 100, 100), "Code.exe"), ((0, 0, 400, 300), "msedge.exe"), ((0, 0, 1920, 1080), "explorer.exe")]
+    assert apps_at_points(windows, [(50, 50)]) == {"code.exe"}  # Edge is covered there
+    assert apps_at_points(windows, [(50, 50), (200, 200)]) == {"code.exe", "msedge.exe"}
+    assert apps_at_points(windows, [(5000, 5000)]) == set()
+
+
+def test_a_screen_read_showing_a_browser_arms_the_outside_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools import computer
+    from src.ui import ai_tool_host
+    from src.ui.ai_tool_host import AiToolHost
+
+    monkeypatch.setattr(ai_tool_host, "grab_screen", lambda win, done, primary=False: done("image"))
+    host = SimpleNamespace(outside=False, _win=None)
+    got: list[object] = []
+    for apps, armed in (({"code.exe", "explorer.exe"}, False), ({"code.exe", "msedge.exe"}, True)):
+        monkeypatch.setattr(computer, "visible_apps", lambda apps=apps: apps)
+        AiToolHost._grab_screen(host, got.append)
+        assert host.outside is armed
+    assert got == ["image", "image"]  # the grab still reaches the caller

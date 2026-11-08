@@ -39,6 +39,7 @@ from src.tools.clip_vault import clipboard_is_private
 from src.tools.file_forge import scrub_metadata
 from src.tools.macros import parse_recipe
 from src.tools.mcp_client import SEP, McpHub, add_server, env_summary, find_servers, safe_name
+from src.tools.watch import MESSAGE_APPS, READERS
 from src.ui.quick_tools import ocr_image_file
 
 GUI_TIMEOUT_S = 15.0
@@ -46,6 +47,8 @@ SAVE_TIMEOUT_S = 600.0  # the Save dialog waits on the user
 APPROVE_TIMEOUT_S = 300.0  # the user reads the MCP confirm, a diff or a command in the chat
 # Allowed-for-this-chat keys that ask again once the chat holds web, MCP or agent content: what an injected
 # instruction could use to act on the PC. MCP calls stay allowed (a browser server would ask on every click).
+# Apps whose window on screen shows content from outside the PC: a screen read with one visible arms the guard too
+OUTSIDE_APPS = READERS | MESSAGE_APPS
 OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "memory", "add_skill",
                              "update_skill", "add_mcp_server"})
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
@@ -734,7 +737,13 @@ class AiToolHost(QObject):
     # ------------------------------------------------------------------ Qt-thread tools
 
     def _grab_screen(self, done: Callable[[Any], None], primary: bool = False) -> None:
-        grab_screen(self._win, done, primary)
+        """Every screen read of a chat comes here; one that shows a browser, reader or chat app arms `outside`."""
+        def got(result: Any) -> None:
+            if result is not None and computer.visible_apps() & OUTSIDE_APPS:
+                self.outside = True  # the page or message on screen could carry instructions, like a fetched page
+            done(result)
+
+        grab_screen(self._win, got, primary)
 
     def _save_file(self, file_name: str, content: str) -> str:
         """Nothing is written unless the user picks a path; the dialog itself confirms overwrites."""

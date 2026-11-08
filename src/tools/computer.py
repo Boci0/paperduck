@@ -8,6 +8,7 @@ import os
 import time
 from ctypes import wintypes
 
+from src.tools.ports import process_name
 from src.tools.watch import is_private_title
 
 MAX_TYPE_CHARS = 2000
@@ -246,6 +247,48 @@ def front_app() -> int:
             return int(hwnd)
         hwnd = user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT
     return 0
+
+
+def apps_at_points(windows: list[tuple[tuple[int, int, int, int], str]], points: list[tuple[int, int]]) -> set[str]:
+    """Exe names of the topmost window at each point. `windows` is ((left, top, right, bottom), exe), topmost first."""
+    found = set()
+    for x, y in points:
+        hit = next((exe for (left, top, right, bottom), exe in windows if left <= x < right and top <= y < bottom), "")
+        if hit:
+            found.add(hit.lower())
+    return found
+
+
+def visible_apps(cols: int = 8, rows: int = 5) -> set[str]:
+    """Apps that show on screen: the topmost real window (not ours, minimized, cloaked or a tool window) at a grid
+    of points over every monitor. shortcut: a window smaller than one grid cell can be missed; denser if needed."""
+    user32 = _user32()
+    user32.GetTopWindow.restype = user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)  # the virtual screen: every monitor
+    width, height = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    windows: list[tuple[tuple[int, int, int, int], str]] = []
+    names: dict[int, str] = {}
+    hwnd = user32.GetTopWindow(None)
+    for _ in range(1000):  # bounded z-order walk, as in front_app
+        if not hwnd:
+            break
+        cloaked = wintypes.DWORD()
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), 14, ctypes.byref(cloaked), 4)  # DWMWA_CLOAKED
+        if (user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd) and not cloaked.value
+                and not user32.GetWindowLongW(hwnd, -20) & 0x80 and not _ours(user32, hwnd)):  # WS_EX_TOOLWINDOW
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in names:
+                names[pid.value] = process_name(pid.value)
+            windows.append(((rect.left, rect.top, rect.right, rect.bottom), names[pid.value]))
+        hwnd = user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT
+    points = [(left + width * (2 * c + 1) // (2 * cols), top + height * (2 * r + 1) // (2 * rows))
+              for c in range(cols) for r in range(rows)]
+    return apps_at_points(windows, points)
 
 
 def focus_front_app() -> int:
