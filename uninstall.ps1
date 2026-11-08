@@ -5,6 +5,15 @@ param([switch]$Purge)
 
 $Root = Join-Path $env:LOCALAPPDATA "Paperduck"
 
+# Same sandbox guard as install.ps1: from a packaged app's shell this would leave a half-removed install
+$probe = ".write-probe-$PID"
+if (Test-Path $Root) {
+    Set-Content -LiteralPath (Join-Path $Root $probe) -Value ""
+    $sandboxed = Test-Path (Join-Path $env:LOCALAPPDATA "Packages\*\LocalCache\Local\Paperduck\$probe")
+    Remove-Item -LiteralPath (Join-Path $Root $probe) -Force -ErrorAction SilentlyContinue
+    if ($sandboxed) { throw "This shell runs inside another app's sandbox (its AppData writes are redirected). Run the uninstaller from a normal PowerShell window." }
+}
+
 # Stop running copies from this install (graceful close first so state.json is saved)
 $procs = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe' OR Name='Paperduck.exe'" |
     Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase) }

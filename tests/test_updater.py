@@ -463,3 +463,43 @@ def test_launch_env_drops_the_parent_qt_dll_folder(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setenv("PATH", os.pathsep.join([r"C:\app.new\_internal\PyQt6\Qt6\bin", r"C:\Windows"]))
     assert updater.launch_env()["PATH"] == r"C:\Windows"
+
+
+def _sandboxed_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Fake %LOCALAPPDATA% whose Paperduck writes "land" in a package's private copy (the probe is pre-made)."""
+    local = tmp_path / "Local"
+    (local / "Paperduck" / "app" / "src").mkdir(parents=True)
+    (local / "Paperduck" / "app" / "src" / "main.py").write_text("old")
+    copy = local / "Packages" / "Claude_abc" / "LocalCache" / "Local" / "Paperduck"
+    (copy / "app").mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr("src.updater.os.getpid", lambda: 4242)
+    for folder in (copy, copy / "app"):
+        (folder / ".write-probe-4242").write_text("")
+    return local
+
+
+def test_writes_redirected_only_when_the_probe_lands_in_a_package_copy(tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.updater import writes_redirected
+
+    local = _sandboxed_local(tmp_path, monkeypatch)
+    assert writes_redirected(local / "Paperduck")
+    assert not (local / "Paperduck" / ".write-probe-4242").exists()  # the probe is cleaned up
+    assert not writes_redirected(tmp_path)  # outside %LOCALAPPDATA%
+    shutil.rmtree(local / "Packages")
+    assert not writes_redirected(local / "Paperduck")
+
+
+def test_sandboxed_updates_refuse_before_touching_the_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.updater import SANDBOXED, finish_frozen_update, install_frozen_zip
+
+    app = _sandboxed_local(tmp_path, monkeypatch) / "Paperduck" / "app"
+    for run in (lambda: install_source_zip(_zipball({"src/main.py": "new"}), app),
+                lambda: install_frozen_zip(_zipball({"Paperduck.exe": "x"}), app),
+                lambda: finish_frozen_update(0, app.with_name("app.new"), starts=lambda _: True)):
+        with pytest.raises(OSError, match="sandbox") as err:
+            run()
+        assert str(err.value) == SANDBOXED
+    assert (app / "src" / "main.py").read_text() == "old"
+    assert sorted(p.name for p in app.parent.iterdir()) == ["app"]
