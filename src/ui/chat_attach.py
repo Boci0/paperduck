@@ -17,6 +17,7 @@ from src.ui.chat_widgets import (
     Attachment,
     Chip,
     _size_text,
+    place_chips,
     image_data_url,
     read_text_file,
 )
@@ -136,7 +137,7 @@ class ChatAttachMixin:
         self._attachments.append(item)
         chip = Chip(item, on_remove=lambda it=item: self._remove_attachment(it))
         self._chips.append(chip)
-        self._chip_row.insertWidget(self._chip_row.count() - 1, chip)
+        place_chips(self._chip_row, self._chips)
         self._chip_box.show()
         self._relayout()
         self._draft.setFocus()
@@ -146,6 +147,7 @@ class ChatAttachMixin:
         for chip in [c for c in self._chips if c.item is item]:
             self._chips.remove(chip)
             chip.deleteLater()
+        place_chips(self._chip_row, self._chips)
         self._attachments = [a for a in self._attachments if a is not item]
         self._chip_box.setVisible(bool(self._attachments))
         QTimer.singleShot(0, self._relayout)
@@ -154,6 +156,7 @@ class ChatAttachMixin:
         for chip in self._chips:
             chip.deleteLater()
         self._chips.clear()
+        place_chips(self._chip_row, self._chips)
         self._attachments.clear()
         self._chip_box.hide()
 

@@ -20,6 +20,7 @@ from PyQt6.QtGui import QCursor, QDesktopServices, QFont, QGuiApplication, QKeyE
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -88,6 +89,7 @@ from src.ui.chat_widgets import (
     _TaskList,
     _ThinkingDots,
     friendly_error,
+    place_chips,
     reply_details,
 )
 from src.ui.context_menu import style_menu
@@ -270,10 +272,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
 
         # Input: attachment chips (when any) above a raised field holding + / draft / send
         self._chip_box = QWidget()
-        self._chip_row = QHBoxLayout(self._chip_box)
+        self._chip_row = QGridLayout(self._chip_box)
         self._chip_row.setContentsMargins(2, 2, 2, 0)
         self._chip_row.setSpacing(6)
-        self._chip_row.addStretch(1)
         self._chip_box.hide()
         # Quick actions for an ask-about-this card (Watch): one click, or Enter on an empty draft, runs the first
         self._action_box = QWidget()
@@ -710,11 +711,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         layout.setSpacing(4)
         align = Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft
         if attachments:
-            chips = QHBoxLayout()
+            chips = QGridLayout()
             chips.setSpacing(6)
-            chips.addStretch(1)
-            for item in attachments:
-                chips.addWidget(Chip(item))
+            place_chips(chips, [Chip(item) for item in attachments])
             layout.addLayout(chips)
         label = ChatText(text, markdown=markdown, pt=9 if role in ("error", "note") else 10,
                          color={"thinking": ACCENT_HEX, "note": TEXT_DIM_HEX}.get(role, TEXT_HEX))

@@ -41,6 +41,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -346,8 +347,9 @@ class Chip(_Frosted):
         self.status = QLabel()
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setFont(ui_font(7.5))
-        text.addWidget(name)
-        text.addWidget(self.status)
+        for label in (name, self.status):  # clip instead of widening the fixed-width chat
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            text.addWidget(label)
         row.addLayout(text)
         if on_remove is not None:
             close = IconButton("close", "Remove", size=22)
@@ -360,6 +362,16 @@ class Chip(_Frosted):
         bad = item.detail.startswith("Can't")
         self.status.setText("reading..." if item.pending else item.detail)
         self.status.setStyleSheet(f"color: {DANGER_HEX if bad else TEXT_DIM_HEX};")
+
+
+def place_chips(grid: QGridLayout, chips: list[Chip]) -> None:
+    """Lay chips two per row (one long row overflowed the fixed-width chat), replacing what the grid held."""
+    while grid.count():
+        grid.takeAt(0)
+    for i, chip in enumerate(chips):
+        grid.addWidget(chip, i // 2, i % 2)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1)
 
 
 class _Draft(QPlainTextEdit):
