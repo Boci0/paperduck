@@ -222,3 +222,31 @@ def test_the_same_call_over_and_over_is_flagged_even_when_it_succeeds() -> None:
     assert all(n == "" for n in notes[:7]) and "8 times" in notes[7] and "9 times" in notes[8]
     other = [0, 0, None, []]
     assert all(ai_assist._steer("t", f"call{i}", "ok", other) == "" for i in range(30))  # different calls are fine
+
+
+def test_driving_office_without_its_skill_gets_one_nudge_per_app() -> None:
+    from src.tools import ai_assist
+
+    state = [0, 0, None, [], None, set()]
+
+    def run(name: str, args: dict) -> str:
+        return ai_assist._steer(name, ai_assist._call_key(name, args), "exit code 0\nok", state)
+
+    word = {"script": "$w = New-Object -ComObject Word.Application\n$w.Documents.Add()"}
+    assert "load the built-in word-docs skill" in run("run_powershell", word).lower()
+    assert run("run_powershell", {**word, "script": word["script"] + "\n# again"}) == ""  # once per answer
+    assert run("load_skill", {"name": "slides"}) == ""
+    assert run("run_powershell", {"script": "New-Object -ComObject PowerPoint.Application"}) == ""  # already loaded
+    assert "excel-sheets" in run("run_command", {"command": "powershell -c \"New-Object -ComObject excel.application\""})
+    assert run("read_file", {"path": "Word.Application.txt"}) == ""  # only scripts count
+
+
+def test_a_stale_checklist_gets_a_reminder_until_it_is_finished() -> None:
+    from src.tools import ai_assist
+
+    state = [0, 0, None, [], None]
+    assert ai_assist._steer("plan_tasks", "p1", "task list shown (0 of 3 done)", state) == ""
+    notes = [ai_assist._steer("t", f"c{i}", "ok", state) for i in range(10)]
+    assert [i for i, n in enumerate(notes) if "checklist" in n] == [4, 9]
+    ai_assist._steer("plan_tasks", "p2", "task list shown (3 of 3 done)", state)  # all done: no more reminders
+    assert all(ai_assist._steer("t", f"d{i}", "ok", state) == "" for i in range(10))

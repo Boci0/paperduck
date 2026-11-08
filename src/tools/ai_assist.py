@@ -144,6 +144,16 @@ LOOP_WINDOW = 40
 LOOP_NOTE = ("\n\n[Paperduck: you have made this exact call {n} times in this answer. Repeating it is not working: "
              "change the approach (read the screen or file again, use a different tool), or tell the user what blocks "
              "you.]")
+TASK_EVERY = 5  # tool calls since the last plan_tasks, while steps are open, between checklist reminders
+TASK_NOTE = ("\n\n[Paperduck: your checklist has not changed for {n} tool calls. If a step finished, call plan_tasks "
+             "with the updated list now; mark every step done before your final answer.]")
+OFFICE_SKILLS = {"Word": "word-docs", "PowerPoint": "slides", "Excel": "excel-sheets"}  # COM app -> built-in skill
+OFFICE_NOTE = ("\n\n[Paperduck: this script drives {app}. Load the built-in {skill} skill (load_skill) and use its "
+               "tested helpers for the next script, then check the saved file with one preview_document instead of "
+               "paging the window.]")
+BLIND_NOTE = ("\n\n[Paperduck: this model cannot see images, so screen_map, preview_document and scrolling will not "
+              "show layout or styling. Check documents by reading them back (COM: page of each paragraph, fonts, sizes, "
+              "positions) instead of paging through the screen.]")
 STUCK_NOTE = ("\n\n[Paperduck: that is {n} in a row, so tools are off for the rest of this answer. Tell the user what "
               "failed and what you need.]")
 # Claude's own server-side tools, run by Anthropic (web search is billed per search, fetch is free)
@@ -198,13 +208,16 @@ SYSTEM_PROMPT = (
     "part is. A single small lookup you do yourself. "
     "For anything beyond one simple command on Windows, use run_powershell (the script goes to a file, so no "
     "cmd.exe quoting touches it), never a long powershell -Command line through run_command. "
-    "Driving Office through COM: put the whole job in one script, run it, then at most two refinement passes, "
-    "since every run-and-look round is slow. A drop cap is set on the Paragraph, not its Range "
-    "($p.DropCap.Enable(); $p.DropCap.Position=1; $p.DropCap.LinesToDrop=3). Never click the Office window "
+    "Driving Office through COM: put the whole job in one script, save, check it with one preview_document call "
+    "(never by paging the window with screen_map), then at most two refinement passes, since every run-and-look "
+    "round is slow. Load the matching built-in skill first (word-docs, slides, excel-sheets): its helpers are "
+    "tested. Office traps in PowerShell: variable names ignore case ($d is $D); pass COM plain \"...\" strings, "
+    "never a Join-Path result; Word's Close(0) and Quit(0) throw, use [ref]0. Never click the Office window "
     "while a COM script may run; a COM call that hangs means a dialog is open, so press esc and look at the screen. "
     "Creative requests (a poem, a design, a document to decorate) deserve original, ambitious work, not the "
-    "safest first idea. To style an open Word, Excel or PowerPoint document, drive it through its COM object "
-    "with run_command (powershell -NoProfile -Command, [Runtime.InteropServices.Marshal]::GetActiveObject("
+    "safest first idea. After building anything visual, look at the whole result once (preview_document for a "
+    "saved file), name its three weakest points, fix them in one pass, look once more, then stop.To style an open Word, Excel or PowerPoint document, drive it through its COM object "
+    "with run_powershell ([Runtime.InteropServices.Marshal]::GetActiveObject("
     "'Word.Application')): fonts, sizes, alignment, spacing, borders, shading, drop caps and page borders are "
     "exact and far cheaper than clicking through screen_map. Use the screen tools only for what COM cannot do. "
     f"Each message allows at most {MAX_TOOL_ROUNDS} rounds of tool calls, so plan bigger jobs around that: stop "
@@ -972,7 +985,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     reasoning: list[str] = []
     used: list[tuple[str, str]] = []
     tool_rounds = hits = 0
-    fails: list[Any] = [0, 0, None, []]
+    fails: list[Any] = [0, 0, None, [], None, set()]
     # set once a tool has returned the user's own data; a sub-agent (`local_data`) starts set: its task may hold some
     read_local = getattr(host, "local_data", False) or any(read_local_data(m) for m in messages)
     _note_outside(host, messages=messages)
@@ -1084,7 +1097,8 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     used: list[tuple[str, str]] = []
     shot_at: list[int] = []  # indexes in `messages` of the screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
-    fails: list[Any] = [0, 0, None, []]
+    fails: list[Any] = [0, 0, None, [], None, set()]
+    blind_told = False
     for round_ in range(MAX_TOOL_ROUNDS + 1):
         _check(cancel)
         shots: list[str] = []
@@ -1173,13 +1187,16 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + said}
                 if shots and (base_url, model) not in _NO_VISION:
                     messages.append({"role": "user", "content": [
-                        {"type": "text", "text": "Screenshot from screen_map:"},
+                        {"type": "text", "text": "Image from that tool (screen_map or preview_document):"},
                         {"type": "image_url", "image_url": {"url": shots[-1]}}]})
                     shot_at.append(len(messages) - 1)
                     if len(shot_at) > KEEP_SHOTS:  # old ones go in one batch, so the prompt cache holds in between
                         for i in shot_at[:-1]:
                             messages[i] = {"role": "user", "content": "(earlier screenshot removed)"}
                         shot_at = shot_at[-1:]
+                elif shots and not blind_told:  # once per answer: paging a blind model through screen_map wastes rounds
+                    messages[-1] = {**messages[-1], "content": messages[-1]["content"] + BLIND_NOTE}
+                    blind_told = True
                 _trim_results(messages, start)
                 continue
             reply = AiReply(
@@ -1220,7 +1237,30 @@ def _failed(result: str) -> bool:
     return head.startswith(("error", "stopped after")) or (head.startswith("exit code") and not head.startswith("exit code 0"))
 
 
+def _office_note(name: str, call: str, state: list[Any]) -> str:
+    """OFFICE_NOTE the first time this answer's script drives an Office app whose built-in skill it has not
+    loaded; state[5] holds the skills loaded or already nudged."""
+    if len(state) <= 5:
+        return ""
+    if name == "load_skill":
+        state[5].update(skill for skill in OFFICE_SKILLS.values() if f'"{skill}"' in call)
+        return ""
+    if name not in ("run_powershell", "run_command"):
+        return ""
+    lowered = call.lower()
+    for app, skill in OFFICE_SKILLS.items():
+        if f"{app.lower()}.application" in lowered and skill not in state[5]:
+            state[5].add(skill)
+            return OFFICE_NOTE.format(app=app, skill=skill)
+    return ""
+
+
 def _steer(name: str, call: str, result: str, state: list[Any], tokens: int = 0) -> str:
+    """`_steer_note` plus, once per Office app, OFFICE_NOTE when a script drives it without its built-in skill."""
+    return _steer_note(name, call, result, state, tokens) + _office_note(name, call, state)
+
+
+def _steer_note(name: str, call: str, result: str, state: list[Any], tokens: int = 0) -> str:
     """The note to add to a tool result once STEER_AFTER results in a row failed, the same call gave the same
     result that often within the last REPEAT_WINDOW calls, or the answer used MAX_ANSWER_TOKENS; `state` is
     [failure streak, repeat count, recent (call, result) pairs] and lives for one answer. Also logs the call (name and outcome only: never arguments or output)."""
@@ -1229,6 +1269,12 @@ def _steer(name: str, call: str, result: str, state: list[Any], tokens: int = 0)
     state[0] = state[0] + 1 if bad else 0
     window = [*(state[2] if isinstance(state[2], list) else []), (call, result)][-REPEAT_WINDOW:]
     state[1], state[2] = window.count(window[-1]), window  # A,B,A,B repeats count, not only A,A
+    if len(state) > 4:  # calls since an unfinished plan_tasks list, or None with no open list
+        if name == "plan_tasks":
+            m = re.match(r"task list shown \((\d+) of (\d+)", result)
+            state[4] = 0 if m and m[1] != m[2] else None
+        elif state[4] is not None:
+            state[4] += 1
     looped = 0
     if len(state) > 3:  # the calls alone, so a click that "works" 24 times in a row is still caught
         state[3] = [*state[3], call][-LOOP_WINDOW:]
@@ -1241,7 +1287,10 @@ def _steer(name: str, call: str, result: str, state: list[Any], tokens: int = 0)
         return STEER_NOTE.format(n=state[0])
     if state[1] >= STEER_AFTER:
         return REPEAT_NOTE.format(n=state[1])
-    return LOOP_NOTE.format(n=looped) if looped >= LOOP_CALLS else ""
+    if looped >= LOOP_CALLS:
+        return LOOP_NOTE.format(n=looped)
+    open_for = state[4] if len(state) > 4 else None
+    return TASK_NOTE.format(n=open_for) if open_for and open_for % TASK_EVERY == 0 else ""
 
 
 def _take_shot(host: ToolHost | None) -> str:
