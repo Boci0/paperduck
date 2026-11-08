@@ -56,7 +56,7 @@ try {{
     $doc = $word.Documents.Add()
     . "{helpers_path('word-docs')}"
     Set-Margins $doc.Sections.Item(1) 3 3 6 3
-    $h = Add-Para 'Tide Tables' @{{ size = 28; caps = 1; after = 24; right = 9 }}
+    $h = Add-Para 'Tide Tables' @{{ size = 28; caps = 1; after = 24; right = 9; keep = 1 }}
     Set-Rule $h 'bottom' '#A8482B' 8 6
     $s = New-Section 4 3 3 3 2
     $poem = Add-Para ("one`vtwo`vthree") @{{ line = 20; left = 0.6; italic = 1 }}
@@ -65,10 +65,28 @@ try {{
     Set-Band $band '#1F2A2E' 14
     $g = Add-Grid 1 2; $null = Set-Cell $g 1 2 "02`vGull" @{{ size = 10 }}
     Save-Doc "{out}"
-    "poem lines: $($poem.Paragraphs.Count) rule: $($poem.ParagraphFormat.Borders.Item(-2).LineStyle) cols: $($s.PageSetup.TextColumns.Count)"
+    "poem lines: $($poem.Paragraphs.Count) rule: $($poem.ParagraphFormat.Borders.Item(-2).LineStyle) cols: $($s.PageSetup.TextColumns.Count) keep: $($h.ParagraphFormat.KeepWithNext)"
 }} finally {{ $word.Quit([ref]0) }}
 """)
-    assert "2 sections, 1 tables" in text and "poem lines: 1 rule: 1 cols: 2" in text and out.is_file()
+    assert "2 sections, 1 tables" in text and "poem lines: 1 rule: 1 cols: 2 keep: -1" in text and out.is_file()
+
+
+@pytest.mark.skipif(not _has("Word.Application"), reason="needs Microsoft Word")
+def test_save_doc_saves_over_a_result_another_word_still_holds(tmp_path: Path) -> None:
+    out = tmp_path / "rebuild.docx"
+    text = _run(tmp_path, f"""
+$held = New-Object -ComObject Word.Application; $held.Visible = $false; $held.DisplayAlerts = 0
+$word = New-Object -ComObject Word.Application; $word.Visible = $false; $word.DisplayAlerts = 0
+try {{
+    $first = $held.Documents.Add(); $first.SaveAs2("{out}", 16)   # the last run's result, still open
+    $doc = $word.Documents.Add()
+    . "{helpers_path('word-docs')}"
+    $null = Add-Para 'second build'
+    Save-Doc "{out}"
+    "held docs left: $($held.Documents.Count)"
+}} finally {{ $held.Quit([ref]0); $word.Quit([ref]0) }}
+""")
+    assert "Saved " in text and "held docs left: 0" in text
 
 
 @pytest.mark.skipif(not _has("PowerPoint.Application"), reason="needs Microsoft PowerPoint")

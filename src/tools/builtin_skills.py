@@ -43,7 +43,7 @@ function Add-Para([string]$Text, [hashtable]$o = @{}) {
     $p.LeftIndent = Cm $(if ($o.left) { $o.left } else { 0 })
     $p.RightIndent = Cm $(if ($o.right) { $o.right } else { 0 })
     $p.FirstLineIndent = Cm $(if ($o.first) { $o.first } else { 0 })
-    $p.KeepWithNext = [int][bool]$o.keep
+    $p.KeepWithNext = $(if ($o.keep) { -1 } else { 0 })  # Word refuses 1 here: true is -1
     $r.Borders.Enable = 0
     $r.Shading.BackgroundPatternColor = -16777216  # automatic: no fill carried over from the paragraph before
     $r
@@ -108,6 +108,14 @@ function Set-Cell($Table, [int]$Row, [int]$Col, [string]$Text, [hashtable]$o = @
 
 # Save as .docx (path must be a plain "..." string, not a Join-Path result) and report what a reader can check
 function Save-Doc([string]$Path) {
+    # A rebuild saving over the last run's result, still open in Word, would fail "already open elsewhere":
+    # close exactly that document (found by its file in Word's running table), never a whole Word.
+    if ((Test-Path -LiteralPath $Path) -and $doc.FullName -ne $Path) {
+        $locked = try { [IO.File]::Open($Path, 'Open', 'ReadWrite', 'None').Close(); $false } catch { $true }
+        if ($locked) {
+            try { [Runtime.InteropServices.Marshal]::BindToMoniker($Path).Close([ref]0) } catch { }
+        }
+    }
     $doc.SaveAs2([string]$Path, 16)  # wdFormatDocumentDefault
     "Saved $Path : $($doc.ComputeStatistics(2)) pages, $($doc.Sections.Count) sections, $($doc.Tables.Count) tables"
 }
@@ -138,6 +146,8 @@ Add-Para options: font size color bold italic caps align(left|center|right|justi
 leading, pt) left right first (indents, cm) spacing (letter spacing, pt) keep (keep with next).
 
 ## 2. Word traps (the Office ones in the system prompt apply too)
+- Save-Doc closes the last run's copy of the same file before saving over it, so a rebuild needs no clean-up.
+  Never stop a Word process: that closes the user's own documents too.
 - Formatting lives on `Range.Font` and `Range.ParagraphFormat`. There is no `.Space` on a border and no
   `SpaceAfter` on PageSetup. `if` used as a value needs `$( )` and a cast: `[single]$(if ($x) { 1 } else { 0 })`.
 - A drop cap is set on the Paragraph, not its Range: `$p.DropCap.Enable(); $p.DropCap.LinesToDrop = 3`.
