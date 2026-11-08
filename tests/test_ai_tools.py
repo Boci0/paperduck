@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,8 @@ import pytest
 from src.tools import ai_assist, ai_tools
 from src.tools.ai_assist import chat_messages
 from src.tools.ai_tools import (MAX_SKILL_CHARS, MAX_SKILL_DESC, MAX_SKILLS, TOOL_SPECS, find_skills, list_skills, load_skill,
-                                parse_skill, run_command, run_file_tool, skills_dir, skills_prompt)
+                                parse_skill, run_command, run_file_tool, skills_dir, skills_prompt,
+                                skills_recall)
 
 
 @pytest.fixture()
@@ -225,12 +227,59 @@ def test_skills_list_is_capped_and_lands_in_the_system_prompt(monkeypatch: pytes
     assert len(listed) == 5 and listed[0][0] == "s00" and len(listed[0][1]) == MAX_SKILL_DESC
     system = chat_messages([{"role": "user", "content": "hi"}])[0]["content"]
     assert "load_skill" in system and "- s00: does 0" in system  # few skills: names and descriptions
-    for i in range(MAX_SKILLS):
+    monkeypatch.setattr(ai_tools, "MAX_SKILLS", 40)  # the real cap is thousands; the logic is the same
+    for i in range(45):
         _skill(root, f"t{i:03d}", f"---\ndescription: does {i}\n---\nbody")
-    assert len(list_skills(root)) == MAX_SKILLS
+    assert len(list_skills(root)) == 40 and MAX_SKILLS >= 1000
     system = chat_messages([{"role": "user", "content": "hi"}])[0]["content"]
-    assert "s00, s01" in system and "does 0" not in system and "find_skill" in system  # many: names only
-    assert len(skills_prompt(root)) < 8 * MAX_SKILLS  # a few tokens per skill, whatever their descriptions
+    assert "s00" not in system and "does 0" not in system and "find_skill" in system  # many: none listed
+    assert len(skills_prompt(root)) < 600  # the same size however many skills there are
+
+
+def test_skills_are_recalled_per_message_and_reread_when_edited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ai_tools, "RECHECK_S", 0)
+    root = tmp_path / "skills"
+    for i in range(12):
+        _skill(root, f"filler{i:02d}", f"---\ndescription: filler {i}\n---\nWrite things down.")
+    _skill(root, "pitch", "---\ndescription: Investor pitch presentation in the house style\n---\nTen slides.")
+    note = skills_recall(root, "make me a deck for the investors")  # "deck" matches "presentation"
+    assert note.startswith("\n\n[Paperduck: skills that may fit") and "pitch (Investor" in note
+    assert "slides (" in note  # the built-in too
+    assert skills_recall(root, "hi, how was your day?") == ""  # small talk: no note
+    assert skills_recall(root, "please write things down") == ""  # body-only hits are not recalled
+    md = root / "pitch" / "SKILL.md"
+    md.write_text("---\ndescription: Board meeting minutes\n---\nx", encoding="utf-8")
+    os.utime(md, ns=(md.stat().st_atime_ns, md.stat().st_mtime_ns + 10_000_000))
+    assert "pitch" not in skills_recall(root, "make me a deck for the investors")  # edited: re-read
+    assert find_skills(root, "minutes").startswith("- pitch: Board meeting minutes")
+
+
+def test_recall_rides_on_the_user_message_not_the_system_prompt() -> None:
+    root = skills_dir()
+    for i in range(12):
+        _skill(root, f"filler{i:02d}", f"---\ndescription: filler {i}\n---\nx")
+    msgs = chat_messages([{"role": "user", "content": "make me a deck"}, {"role": "assistant", "content": "ok"},
+                          {"role": "user", "content": "thanks"}])
+    assert "slides (" not in msgs[0]["content"] and "slides (" in msgs[1]["content"]  # stays on its own turn
+    assert msgs[3]["content"] == "thanks"
+
+
+def test_a_finished_answer_drops_the_skill_text() -> None:
+    body = "WORD SKILL " * 500
+    office = ai_assist.OFFICE_NOTE.format(app="Word", skill="word-docs", body=body)
+    reply = ai_assist.AiReply(text="done", tools=[("load_skill(slides)", body), ("run_powershell(x)", "ok")], wire=[
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "load_skill", "arguments": '{"name": "slides"}'}},
+            {"id": "b", "type": "function", "function": {"name": "run_powershell", "arguments": '{"script": "x"}'}}]},
+        {"role": "tool", "tool_call_id": "a", "content": body},
+        {"role": "tool", "tool_call_id": "b", "content": "saved" + office},
+        {"role": "assistant", "content": "done"}])
+    ai_assist.drop_skills(reply)
+    dropped = ai_assist.SKILL_DROPPED.format
+    assert reply.tools == [("load_skill(slides)", dropped(name="slides")), ("run_powershell(x)", "ok")]
+    assert reply.wire[1]["content"] == dropped(name="slides")
+    assert reply.wire[2]["content"] == "saved\n\n" + dropped(name="word-docs")
+    assert "WORD SKILL" not in json.dumps(reply.wire)
 
 
 def test_find_skill_ranks_name_then_description_then_text(tmp_path: Path) -> None:
