@@ -638,7 +638,8 @@ def _request(base_url: str, key: str, path: str, body: dict[str, Any] | None, ti
             logger.info("request %s: %s, retrying in %.0f s", path.split("?")[0], exc, delay)
             time.sleep(delay)
         except ValueError as exc:
-            logger.warning("request %s failed: %s", path.split("?")[0], exc)
+            if str(exc) != "stopped":  # the user's Stop, not a failure
+                logger.warning("request %s failed: %s", path.split("?")[0], exc)
             raise
     raise AssertionError("unreachable")
 

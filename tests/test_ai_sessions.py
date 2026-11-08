@@ -168,7 +168,7 @@ def test_chat_saved_before_the_rename_still_shows_its_summary() -> None:
     chat = _chat()
     try:
         assert chat.resume(sid)
-        from src.ui.ai_chat import ChatText
+        from src.ui.chat_widgets import ChatText
         rows = [chat._thread_layout.itemAt(i).widget() for i in range(chat._thread_layout.count())]
         shown = " | ".join(w.toPlainText() for row in rows for w in row.findChildren(ChatText))
         assert "compacted into a summary" in shown and "compacted by Paperduck" not in shown
@@ -181,7 +181,7 @@ def test_copy_links_put_the_exact_prompt_and_reply_on_the_clipboard() -> None:
     from PyQt6.QtGui import QGuiApplication
     from PyQt6.QtTest import QTest
 
-    from src.ui.ai_chat import _ClickLabel
+    from src.ui.chat_widgets import _ClickLabel
 
     chat = _chat()
     clip = QGuiApplication.clipboard()

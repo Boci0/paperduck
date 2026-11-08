@@ -181,7 +181,7 @@ def test_model_that_rejects_thinking_fields_is_retried_without_them(monkeypatch)
 
 
 def test_reply_details_show_served_model_reasoning_and_tokens(api: str) -> None:
-    from src.ui.ai_chat import reply_details
+    from src.ui.chat_widgets import reply_details
 
     _Api.mode = "thinking"
     reply = ask(api, KEY, "deepseek-chat", T, thinking="low")
@@ -301,7 +301,8 @@ def _chat(monkeypatch: pytest.MonkeyPatch, api: str):
     from src.ui.ai_chat import AiChat
 
     _app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr("src.ui.ai_chat.load_key", lambda _url: KEY)
+    for mod in ("ai_chat", "chat_setup"):  # the chat and its Setup page both read the key
+        monkeypatch.setattr(f"src.ui.{mod}.load_key", lambda _url: KEY)
     plugin = AiAssistPlugin()
     plugin.base_url, plugin.model = api, "m1"
     monkeypatch.setattr(AiAssistPlugin, "has_key", lambda self: True)
@@ -364,7 +365,7 @@ def test_model_switcher_and_reasoning_toggle_work(monkeypatch: pytest.MonkeyPatc
 
 
 def test_chat_sends_only_on_enter_and_renders_reply(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
-    from src.ui.ai_chat import ChatText
+    from src.ui.chat_widgets import ChatText
 
     app, plugin, chat = _chat(monkeypatch, api)
     try:
@@ -389,7 +390,7 @@ def test_chat_sends_only_on_enter_and_renders_reply(monkeypatch: pytest.MonkeyPa
 def test_chat_attachments_are_sent_as_text_and_images(monkeypatch: pytest.MonkeyPatch, api: str, tmp_path) -> None:
     from PyQt6.QtGui import QImage
 
-    from src.ui import ai_chat
+    from src.ui import ai_chat, chat_widgets
 
     app, _plugin, chat = _chat(monkeypatch, api)
     try:
@@ -398,7 +399,7 @@ def test_chat_attachments_are_sent_as_text_and_images(monkeypatch: pytest.Monkey
         binary = tmp_path / "blob.bin"
         binary.write_bytes(bytes([0, 1]) * 10)
         big = tmp_path / "big.log"
-        big.write_bytes(b"a" * (ai_chat.MAX_FILE_BYTES + 1))
+        big.write_bytes(b"a" * (chat_widgets.MAX_FILE_BYTES + 1))
         for path in (notes, binary, big):
             chat.attach_path(path)
         details = [a.detail for a in chat._attachments]
@@ -470,7 +471,7 @@ def test_new_chat_clears_thread_draft_and_attachments_even_while_waiting(
 def test_oversize_attachment_is_not_read_into_memory(tmp_path) -> None:
     import tracemalloc
 
-    from src.ui.ai_chat import read_text_file
+    from src.ui.chat_widgets import read_text_file
 
     huge = tmp_path / "huge.log"
     with huge.open("wb") as f:
@@ -741,7 +742,7 @@ def test_chat_answers_after_a_web_search_and_setup_saves_the_search_key(
         monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     app, plugin, chat = _chat(monkeypatch, api)
     saved = []
-    monkeypatch.setattr("src.ui.ai_chat.save_key", lambda url, key: saved.append((url, key)) or True)
+    monkeypatch.setattr("src.ui.chat_setup.save_key", lambda url, key: saved.append((url, key)) or True)
     monkeypatch.setattr(ai_assist, "web_search", lambda q: f"result for {q}")
     try:
         _Api.mode = "tool-once"
@@ -764,7 +765,7 @@ def test_chat_answers_after_a_web_search_and_setup_saves_the_search_key(
 
 
 def ai_chat_brave() -> str:
-    from src.ui.ai_chat import BRAVE_URL
+    from src.tools.ai_assist import BRAVE_URL
 
     return BRAVE_URL
 
@@ -809,8 +810,9 @@ def test_claude_native_request_pause_turn_sources_and_thinking(api: str, monkeyp
 def test_setup_remove_buttons_delete_only_their_key(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     _app, plugin, chat = _chat(monkeypatch, api)
     saved = {api: KEY, ai_assist.BRAVE_URL: KEY}
-    monkeypatch.setattr("src.ui.ai_chat.load_key", lambda url: saved.get(url, ""))
-    monkeypatch.setattr("src.ui.ai_chat.delete_key", lambda url: saved.pop(url, None) is not None)
+    for mod in ("ai_chat", "chat_setup"):  # the chat and its Setup page both read the key
+        monkeypatch.setattr(f"src.ui.{mod}.load_key", lambda url: saved.get(url, ""))
+    monkeypatch.setattr("src.ui.chat_setup.delete_key", lambda url: saved.pop(url, None) is not None)
     chat._load_setup()
     assert chat._remove_key.isEnabled() and chat._remove_search.isEnabled()
     chat._remove_search.click()
@@ -821,7 +823,7 @@ def test_setup_remove_buttons_delete_only_their_key(monkeypatch: pytest.MonkeyPa
 
 
 def test_header_and_reply_line_name_the_version_behind_an_alias(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
-    from src.ui.ai_chat import reply_details
+    from src.ui.chat_widgets import reply_details
 
     _app, plugin, chat = _chat(monkeypatch, api)
     plugin.model = "deepseek-flash"
@@ -837,7 +839,7 @@ def test_saved_files_get_a_row_and_programs_are_not_opened(monkeypatch: pytest.M
     from pathlib import Path
     from types import SimpleNamespace
 
-    from src.ui.ai_chat import _ClickLabel
+    from src.ui.chat_widgets import _ClickLabel
 
     _app, _plugin, chat = _chat(monkeypatch, api)
     saved = [Path("C:/x/notes.md"), Path("C:/x/run.bat")]
@@ -900,7 +902,7 @@ def test_chat_text_formats_safely_and_never_widens_the_thread() -> None:
     from PyQt6.QtCore import QUrl
     from PyQt6.QtWidgets import QApplication
 
-    from src.ui.ai_chat import ChatText
+    from src.ui.chat_widgets import ChatText
 
     _app = QApplication.instance() or QApplication([])
     reply = ChatText("## Head\n\n- **bold** item\n\n<b>raw</b> ![x](file:///C:/secret.png)", markdown=True)
@@ -967,7 +969,7 @@ def test_compact_history_summarizes_old_turns_and_falls_back(monkeypatch: pytest
 
 def test_chat_auto_compacts_long_history(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     from src.ui import ai_chat
-    from src.ui.ai_chat import ChatText
+    from src.ui.chat_widgets import ChatText
 
     monkeypatch.setattr(ai_chat, "COMPACT_AT", 100)
     app, _plugin, chat = _chat(monkeypatch, api)
@@ -1259,7 +1261,7 @@ def test_timeout_retried_once_and_patient_jobs_wait_longer(monkeypatch: pytest.M
 
 
 def test_cache_hits_cost_screenshot_batches_and_deepseek_balance(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.ui.ai_chat import reply_details
+    from src.ui.chat_widgets import reply_details
     sent: list[list[dict]] = []
     rounds = iter(range(6))
 
@@ -1303,7 +1305,7 @@ def test_cache_hits_cost_screenshot_batches_and_deepseek_balance(monkeypatch: py
 
 
 def test_balance_note_shows_balance_and_spend_since_start() -> None:
-    from src.ui.ai_chat import balance_note
+    from src.ui.chat_widgets import balance_note
     assert balance_note(("USD", 3.51), ("USD", 3.51)) == "balance 3.51 USD"  # one reply rarely moves whole cents
     assert balance_note(("USD", 3.51), ("USD", 3.48)) == "balance 3.48 USD (0.03 spent since start)"
     assert balance_note(("CNY", 20.0), ("USD", 3.0)) == "balance 3.00 USD"  # a currency switch is not spend
@@ -1311,7 +1313,7 @@ def test_balance_note_shows_balance_and_spend_since_start() -> None:
 
 def test_deepseek_cost_estimate_uses_the_price_table_and_peak_hours() -> None:
     from datetime import datetime, timezone
-    from src.ui.ai_chat import reply_details
+    from src.ui.chat_widgets import reply_details
     off = datetime(2026, 11, 7, 12, tzinfo=timezone.utc)  # Saturday: off-peak all day
     peak = datetime(2026, 11, 6, 2, tzinfo=timezone.utc)  # Friday 02:00 UTC
     flash = ai_assist.deepseek_cost("deepseek-flash", 1_000_000, 1_000_000, 1_000_000, off)
