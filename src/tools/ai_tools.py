@@ -35,6 +35,7 @@ import tempfile
 import itertools
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -1095,11 +1096,14 @@ class BackgroundProcs:
 
 # ---------------------------------------------------------------------- skills
 # A skill is %LOCALAPPDATA%/Paperduck/skills/<name>/SKILL.md: frontmatter (name, description), then instructions.
-# Only names and descriptions go in the system prompt; load_skill returns a body on demand. Past LIST_IN_FULL
-# skills only the names go in (a few tokens each) and find_skill searches them, so skills can grow cheaply.
-MAX_SKILLS = 200
+# load_skill returns a body on demand. Up to LIST_IN_FULL skills, names and descriptions go in the system prompt;
+# past that none do: each user message gets the few that match it (skills_recall) and find_skill searches the
+# rest, so the prompt costs the same with ten skills or thousands. The index is re-read only when a SKILL.md changes.
+MAX_SKILLS = 5000
 LIST_IN_FULL = 12
 FIND_TOP = 5
+RECALL_TOP = 3
+SEARCH_CHARS = 3000  # of each body, for find_skill's weakest signal
 MAX_SKILL_DESC = 200
 MAX_SKILL_CHARS = 24000
 _SKILL_NAME = re.compile(r"^[\w.-]{1,64}$")
@@ -1138,22 +1142,58 @@ def parse_skill(text: str) -> tuple[dict[str, str], str]:
     return meta, "\n".join(lines[end + 1:]).strip()
 
 
-def list_skills(root: Path) -> list[tuple[str, str]]:
-    """(folder name, one-line description) of up to MAX_SKILLS skills, sorted by name."""
+RECHECK_S = 5.0  # an edited SKILL.md is seen within this; an added or removed folder at once
+# root -> (checked at, the folder's mtime, {name: (SKILL.md mtime, (description, body start))})
+_INDEX: dict[Path, tuple[float, int, dict[str, tuple[int, tuple[str, str]]]]] = {}
+_RECALL: dict[tuple[Path, str], str] = {}
+
+
+def skill_index(root: Path) -> dict[str, tuple[str, str]]:
+    """{folder name: (one-line description, start of the body)} for up to MAX_SKILLS skills, sorted by name.
+    Cached: stat-ing thousands of files takes about a second here, so that happens at most every RECHECK_S (or
+    when a folder is added or removed), and only the SKILL.md files that changed are read again."""
+    try:
+        mtime = root.stat().st_mtime_ns
+    except OSError:
+        return {}
+    cached = _INDEX.get(root)
+    if cached and cached[1] == mtime and time.monotonic() - cached[0] < RECHECK_S:
+        return {name: entry for name, (_stamp, entry) in cached[2].items()}
+    old = cached[2] if cached else {}
     try:
         folders = sorted(p for p in root.iterdir() if p.is_dir() and _SKILL_NAME.match(p.name))
     except OSError:
-        return []
-    out = []
+        return {}
+    fresh: dict[str, tuple[int, tuple[str, str]]] = {}
     for folder in folders:
         try:
-            meta, _body = parse_skill((folder / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
+            stamp = (folder / "SKILL.md").stat().st_mtime_ns
+            if folder.name in old and old[folder.name][0] == stamp:
+                fresh[folder.name] = old[folder.name]
+            else:
+                meta, body = parse_skill((folder / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
+                fresh[folder.name] = (stamp, (" ".join(meta.get("description", "").split())[:MAX_SKILL_DESC],
+                                              body[:SEARCH_CHARS]))
         except OSError:
             continue
-        out.append((folder.name, " ".join(meta.get("description", "").split())[:MAX_SKILL_DESC]))
-        if len(out) >= MAX_SKILLS:
+        if len(fresh) >= MAX_SKILLS:
             break
-    return out
+    if fresh != old:
+        _RECALL.clear()
+    _INDEX[root] = (time.monotonic(), mtime, fresh)
+    return {name: entry for name, (_stamp, entry) in fresh.items()}
+
+
+def list_skills(root: Path) -> list[tuple[str, str]]:
+    """(folder name, one-line description) of up to MAX_SKILLS skills, sorted by name."""
+    return [(name, desc) for name, (desc, _body) in skill_index(root).items()]
+
+
+def _all_skills(root: Path) -> dict[str, tuple[str, str]]:
+    """Built-in and user skills, {name: (description, body start)}; a user skill of the same name wins."""
+    from src.tools.builtin_skills import BUILTIN  # it imports scratch_dir from here
+
+    return {**{name: (entry[0], entry[1][:SEARCH_CHARS]) for name, entry in BUILTIN.items()}, **skill_index(root)}
 
 
 def skills_prompt(root: Path) -> str:
@@ -1163,11 +1203,11 @@ def skills_prompt(root: Path) -> str:
     skills = list_skills(root)
     own = {name for name, _d in skills}
     builtins = [(name, entry[0]) for name, entry in BUILTIN.items() if name not in own]
-    if len(skills) + len(builtins) > LIST_IN_FULL:  # names only: the prompt stays small however many there are
-        names = ", ".join(sorted([n for n, _d in skills] + [n for n, _d in builtins]))
-        return ("Skills (the user's own instructions, plus Paperduck's built-in ones): " + names + ". Before a job "
-                "that one might cover (a document, a deck, a workflow, a house style), call find_skill with a few "
-                "words about the job, then load_skill the best match and follow it.")
+    if len(skills) + len(builtins) > LIST_IN_FULL:  # none listed: the prompt stays the same size however many
+        return (f"The user has {len(skills) + len(builtins)} skills (their own instructions, plus Paperduck's built-in "
+                "ones), not listed here. Paperduck adds the ones that match each message to it; follow a suggestion "
+                "that fits with load_skill. For a job no suggestion covers (a document, a deck, a workflow, a house "
+                "style), call find_skill with a few words about it first.")
     built = "\n".join(f"- {name}: {desc}" for name, desc in builtins)
     rows = "\n".join(f"- {name}: {desc or '(no description)'}" for name, desc in skills)
     parts = []
@@ -1179,29 +1219,77 @@ def skills_prompt(root: Path) -> str:
     return "\n\n".join(parts)
 
 
-def find_skills(root: Path, query: Any) -> str:
-    """The FIND_TOP skills (user and built-in) whose name, description and text best match the query's words."""
-    from src.tools.builtin_skills import BUILTIN
+# Words that say nothing about the job, and words that name the same job, for the keyword match below.
+_STOP = frozenset("a an and are as at be but by can could do does for from have help how in is it its me my "
+                  "need of on or please so some that the this to up us use want we what when with would you your "
+                  "make makes create new get put let lets just also into out".split())
+_SAME = [frozenset(g.split()) for g in (
+    "deck decks slide slides presentation presentations powerpoint pptx ppt",
+    "word docx document documents doc docs",
+    "excel xlsx spreadsheet spreadsheets workbook sheet sheets",
+    "email emails mail gmail outlook inbox",
+    "chart charts graph graphs plot",
+)]
 
-    words = {w for w in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(w) > 1}
-    if not words:
-        return "error: give a few words about the job"
-    found: dict[str, tuple[str, str]] = {name: (entry[0], entry[1]) for name, entry in BUILTIN.items()}
-    for name, desc in list_skills(root):  # a user skill of the same name wins
-        try:
-            _meta, body = parse_skill((root / name / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
-        except OSError:
-            body = ""
-        found[name] = (desc, body)
+
+def _variants(word: str) -> set[str]:
+    out = {word, word[:-1] if len(word) > 3 and word.endswith("s") else word}
+    for group in _SAME:
+        if word in group:
+            out |= group
+    return out
+
+
+def _matcher(variants: set[str]) -> Any:
+    """Whether a field holds one of the variants: a long one anywhere (invoice in invoices), a short one only as a
+    whole word, so "hi" or "ok" never match github or notebook."""
+    long = [v for v in variants if len(v) > 3]
+    short = [v for v in variants if len(v) <= 3]
+    pattern = re.compile(rf"\b(?:{'|'.join(map(re.escape, short))})s?\b") if short else None
+    return lambda field: any(v in field for v in long) or (pattern is not None and pattern.search(field) is not None)
+
+
+def rank_skills(root: Path, text: Any, top: int, head_min: int = 0) -> list[tuple[str, str]]:
+    """The `top` skills whose name (3 per word), description (2) and text (1) best match `text`'s words or their
+    synonyms; `head_min` is the least the name and description must score, so body-only hits can be left out."""
+    folded = unicodedata.normalize("NFKD", str(text or "").lower()).encode("ascii", "ignore").decode()  # é -> e
+    words = [_matcher(_variants(w)) for w in {w for w in re.findall(r"[a-z0-9]+", folded)
+                                              if len(w) > 1 and w not in _STOP}]
     scored = []
-    for name, (desc, body) in found.items():
-        fields = ((name.lower().replace("-", " "), 3), (desc.lower(), 2), (body.lower(), 1))
-        score = sum(weight for w in words for text, weight in fields if w in text)
-        if score:
+    for name, (desc, body) in _all_skills(root).items():
+        fields = ((name.lower().replace("-", " ").replace("_", " "), 3), (desc.lower(), 2))
+        head = sum(weight for hit in words for field, weight in fields if hit(field))
+        low = body.lower()
+        score = head + sum(1 for hit in words if hit(low))
+        if score and head >= head_min:
             scored.append((-score, name, desc))
-    if not scored:
+    return [(name, desc) for _s, name, desc in sorted(scored)[:top]]
+
+
+def find_skills(root: Path, query: Any) -> str:
+    """The FIND_TOP skills (user and built-in) that best match the query."""
+    if not re.search(r"[a-z0-9]{2}", str(query or "").lower()):
+        return "error: give a few words about the job"
+    found = rank_skills(root, query, FIND_TOP)
+    if not found:
         return "no skill matches; go ahead without one"
-    return "\n".join(f"- {name}: {desc or '(no description)'}" for _s, name, desc in sorted(scored)[:FIND_TOP])
+    return "\n".join(f"- {name}: {desc or '(no description)'}" for name, desc in found)
+
+
+def skills_recall(root: Path, message: str) -> str:
+    """A note for a user message naming up to RECALL_TOP skills that match it, or "". Only past LIST_IN_FULL
+    skills (below that the system prompt lists them all), and only skills whose name or description match
+    (3 points: a name word, or two description words), so small talk gets no note."""
+    if len(_all_skills(root)) <= LIST_IN_FULL:
+        return ""
+    if (root, message) not in _RECALL:  # the same message always gets the same note, so the prompt cache holds
+        if len(_RECALL) > 500:
+            _RECALL.clear()
+        found = rank_skills(root, message[:2000], RECALL_TOP, head_min=3)
+        _RECALL[(root, message)] = ("\n\n[Paperduck: skills that may fit this message: " + "; ".join(
+            f"{name} ({desc or 'no description'})" for name, desc in found)
+            + ". load_skill one only if it fits.]" if found else "")
+    return _RECALL[(root, message)]
 
 
 def skill_text(description: str, instructions: str) -> str:

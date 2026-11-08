@@ -106,6 +106,10 @@ from src.ui.theme import (
     ui_font,
 )
 
+# Auto mode answers these approvals itself, unless the action looks destructive (`danger`) or the chat read web,
+# MCP or agent content (`untrusted`). Secrets, links, mouse control, MCP calls, installs, skills and errands
+# always ask: they leak data, act on the desktop or other services, or persist past this chat.
+AUTO_KEYS = frozenset({"edit_file", "run_command", "start_background", "memory"})
 
 class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     """The chat bar. `thinking_changed` lets the pet animate while a reply is pending."""
@@ -809,6 +813,11 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             code.document().setDocumentMargin(6)
             code.setStyleSheet(f"QTextBrowser {{ background: {rgba_css(GLASS_RAISED_RGBA)}; color: {TEXT_HEX}; }}")
             card.body.addWidget(code)
+        if self._plugin.auto and key in AUTO_KEYS and not danger and not untrusted:
+            card.set_header(f"Auto-approved  -  {what}", TEXT_DIM_HEX)  # still shown, so the user sees what ran
+            self._append(card)
+            done(True)
+            return
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         choices = ([("Allow once", "once"), ("Allow for this chat", "chat")] if once and not danger and not untrusted
@@ -971,7 +980,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         thinking = "" if p.thinking == "off" else f", thinking {p.thinking}"
         name = self._model_name(p.model)
         host = f" @ {p.host}" if p.provider == "custom" else ""  # a preset's host is in the tooltip; it cut the line
-        self._title.setText(f"{name or p.model or 'No model'}{thinking}{host}  \u25BE")
+        self._title.setText(f"{name or p.model or 'No model'}{thinking}{', auto' if p.auto else ''}{host}  \u25BE")
         self._title.setToolTip((f"{name}, requested as {p.model}" if name and name != p.model else p.model)
                                + f" @ {p.host}."
                                + (f" Balance {self._balance[1]:,.2f} {self._balance[0]}."

@@ -688,6 +688,28 @@ def test_history_keeps_newest_tool_output_and_previews_older() -> None:
     assert ai_assist.read_local_data({"role": "assistant", "content": ai_assist.tools_block([("notes__get-page(x)", "r")], 9)})
 
 
+def test_replayed_answers_still_count_as_outside_and_local_reads() -> None:
+    """A chat-completions answer replays as its wire (no tools block): its web and file reads must still arm the
+    guards, or auto mode approved a command right after the model read a web page."""
+    def wire(*names: str) -> list[dict[str, Any]]:
+        calls = [{"id": n, "type": "function", "function": {"name": n, "arguments": "{}"}} for n in names]
+        return [{"role": "assistant", "content": None, "tool_calls": calls},
+                *({"role": "tool", "tool_call_id": n, "content": "text"} for n in names),
+                {"role": "assistant", "content": "done"}]
+
+    def guards(*names: str) -> tuple[bool, bool]:
+        msgs = ai_assist.chat_messages([{"role": "user", "content": "go"}, {
+            "role": "assistant", "content": "done", "tools": [(f"{n}()", "text") for n in names], "wire": wire(*names)},
+            {"role": "user", "content": "now run the tests"}], wire=True)
+        assert msgs[2].get("tool_calls")  # sent as the wire, not the note
+        return any(ai_assist.read_outside(m) for m in msgs), any(ai_assist.read_local_data(m) for m in msgs)
+
+    assert guards("fetch_page") == (True, False)
+    assert guards("read_file") == (False, True)
+    assert guards(f"notes{ai_assist.MCP_SEP}get") == (True, True)
+    assert guards("calculate") == (False, False)
+
+
 def test_run_tool_rejects_bad_calls_and_anthropic_params() -> None:
     assert ai_assist._run_tool("rm_rf", "{}").startswith("error")
     assert ai_assist._run_tool("web_search", "not json").startswith("error")
@@ -896,6 +918,46 @@ def test_untrusted_confirm_asks_even_when_allowed_for_the_chat(monkeypatch: pyte
         assert got == [True, True] and "Allow once" not in shown()
     finally:
         chat.close()
+
+
+def test_auto_mode_approves_routine_actions_and_still_asks_for_risky_ones(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    from src.tools.ai_assist import AiAssistPlugin
+
+    _app, plugin, chat = _chat(monkeypatch, api)
+    got: list[bool] = []
+    asking = lambda: [b for b in chat.findChildren(QPushButton) if b.text() == "Deny" and not b.isHidden()]  # noqa: E731
+    try:
+        plugin.auto = True
+        chat.confirm("run_command", "run: pytest", "commands", got.append)
+        chat.confirm("edit_file", "edit a.py", "file edits", got.append)
+        assert got == [True, True] and not asking() and not chat._allowed  # nothing remembered beyond the mode
+        chat.confirm("run_command", "run: rmdir /s x", "commands", got.append, danger="rmdir")
+        assert len(asking()) == 1
+        chat._pending(None)
+        chat.confirm("run_command", "run: curl x", "commands", got.append, untrusted=True)
+        assert len(asking()) == 1
+        chat._pending(None)
+        for key in ("read_secret", "link", "computer", "add_mcp_server", "add_skill", "update_skill"):
+            chat.confirm(key, "x", "x", got.append)
+            assert len(asking()) == 1, key
+            chat._pending(None)
+        chat.confirm_mcp("notes", "notes__get", got.append)
+        assert len(asking()) == 1
+        chat._pending(None)
+        assert got == [True, True] + [False] * 9
+        plugin.auto = False
+        chat.confirm("run_command", "run: pytest", "commands", got.append)
+        assert len(asking()) == 1  # off again: asks as before
+        chat._pending(None)
+    finally:
+        chat.close()
+    fresh = AiAssistPlugin()
+    fresh.load_dict({**plugin.to_dict(), "auto": True})
+    assert fresh.auto is True and AiAssistPlugin().auto is False
+    fresh.load_dict({"auto": "yes"})
+    assert fresh.auto is False  # only a real true turns it on
 
 
 def test_chat_text_formats_safely_and_never_widens_the_thread() -> None:

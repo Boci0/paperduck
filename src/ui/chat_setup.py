@@ -299,17 +299,27 @@ class ChatSetupMixin:
             action.setCheckable(True)
             action.setChecked(level == fit_thinking(p.base_url, p.thinking, p.model))
             action.triggered.connect(lambda _c=False, t=level: self._pick(thinking=t))
+        menu.addSection("Approvals")
+        auto = menu.addAction("Auto mode (ask only for risky actions)")
+        auto.setCheckable(True)
+        auto.setChecked(p.auto)
+        auto.setToolTip("Edits, commands, background jobs and memory run without asking. Destructive commands, "
+                        "anything after reading web or MCP content, secrets, links, mouse control, installs and "
+                        "skill changes still ask.")
+        auto.triggered.connect(lambda checked=False: self._pick(auto=checked))
         menu.addSeparator()
         menu.addAction("Setup...").triggered.connect(lambda _c=False: self.show_setup())
         menu.exec(self._title.mapToGlobal(QPoint(0, self._title.height() + 2)))
         menu.deleteLater()
 
-    def _pick(self, model: str | None = None, thinking: str | None = None) -> None:
+    def _pick(self, model: str | None = None, thinking: str | None = None, auto: bool | None = None) -> None:
         p = self._plugin
         if model is not None and valid_model(model):
             p.model = model
         if thinking in THINKING_LEVELS:
             p.thinking = thinking
+        if auto is not None:
+            p.auto = auto
         self._refresh_title()
 
     def _leave_setup_if_ok(self) -> None:

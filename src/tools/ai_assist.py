@@ -48,7 +48,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.engine.models import CompanionState, HudBar, HudData, ToolMenuItem
 from src.tools.ai_tools import (CHAIN_NOTE, MEMORY_HEADER, scratch_dir, LOCAL_DATA_TOOLS, RULES_HEADER, memory_path, memory_prompt, rules_path,
-                                rules_prompt, load_skill, skills_dir, skills_prompt)
+                                rules_prompt, load_skill, skills_dir, skills_prompt, skills_recall)
 from src.tools.errands import ERRAND_MARK
 from src.tools.mcp_client import SEP as MCP_SEP, ensure_config
 
@@ -426,6 +426,8 @@ def chat_messages(history: list[dict[str, Any]], wire: bool = False) -> list[dic
             recent = recent and not turn.get("tools")
             continue
         content = turn["content"][:MAX_INPUT_CHARS]
+        if turn["role"] == "user":
+            content += skills_recall(skills_dir(), content)
         if tools := turn.get("tools"):
             content = tools_block(tools, _tool_share(tools) if recent else OLD_TOOL_CHARS) + content
             recent = False
@@ -1075,6 +1077,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
                         cut_off=stop == "max_tokens", tools=used)
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
+        drop_skills(reply)
         return reply
     raise ValueError("bad reply")
 
@@ -1213,6 +1216,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
             raise ValueError("bad reply") from None
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
+        drop_skills(reply)
         return reply
     raise ValueError("bad reply")
 
@@ -1234,6 +1238,29 @@ def _failed(result: str) -> bool:
         return False
     head = head[:60]
     return head.startswith(("error", "stopped after")) or (head.startswith("exit code") and not head.startswith("exit code 0"))
+
+
+SKILL_DROPPED = "(the {name} skill was loaded for that answer, then dropped; load_skill it again if needed)"
+_OFFICE_MARK = "\n\n[Paperduck: this script drives "
+
+
+def drop_skills(reply: "AiReply") -> None:
+    """Swap the skill text a finished answer loaded for a one-line stub in what later turns replay (its wire and
+    its tool notes): the answer needed it, the rest of the chat does not, and load_skill can fetch it again."""
+    for i, (note, out) in enumerate(reply.tools):
+        if note.startswith("load_skill(") and not out.startswith("error"):
+            reply.tools[i] = (note, SKILL_DROPPED.format(name=note[11:-1]))
+    names = {c.get("id"): tool_note("", c["function"].get("arguments"))[1:-1]  # its first argument: the name
+             for m in reply.wire for c in m.get("tool_calls") or []
+             if c.get("function", {}).get("name") == "load_skill"}
+    for i, m in enumerate(reply.wire):
+        if m.get("role") != "tool" or not isinstance(content := m.get("content"), str):
+            continue
+        if m.get("tool_call_id") in names and not content.startswith("error"):
+            reply.wire[i] = {**m, "content": SKILL_DROPPED.format(name=names[m["tool_call_id"]])}
+        elif (at := content.find(_OFFICE_MARK)) >= 0:
+            skill = next((s for s in OFFICE_SKILLS.values() if f"the {s} skill" in content[at:at + 200]), "Office")
+            reply.wire[i] = {**m, "content": content[:at] + "\n\n" + SKILL_DROPPED.format(name=skill)}
 
 
 def _office_note(name: str, call: str, state: list[Any]) -> str:
@@ -1437,8 +1464,15 @@ OUTSIDE_TOOLS = frozenset({"web_search", "fetch_page", "web_fetch", "wait_agents
 _BRANCH_HEAD = BRANCH_NOTE.split("{source}")[0].strip()
 
 
+def _wire_calls(message: dict[str, Any]) -> list[str]:
+    """Tool names a replayed (wire) assistant message called: such a turn has no tools block to match."""
+    return [str((c.get("function") or {}).get("name")) for c in message.get("tool_calls") or [] if isinstance(c, dict)]
+
+
 def read_outside(message: dict[str, Any]) -> bool:
     """An earlier turn that brought outside content into the chat: an outside tool or MCP call, or a branch report."""
+    if any(name in OUTSIDE_TOOLS or MCP_SEP in name for name in _wire_calls(message)):
+        return True
     content = message.get("content")
     if not isinstance(content, str):
         return False
@@ -1465,6 +1499,8 @@ def read_local_data(message: dict[str, Any]) -> bool:
 
     Matches a call line anywhere in the turn: a stray match in output text only blocks more, never less.
     """
+    if any(name in LOCAL_DATA_TOOLS or MCP_SEP in name for name in _wire_calls(message)):
+        return True
     content = message.get("content")
     if message.get("role") == "user" and isinstance(content, str) and content.startswith(ERRAND_MARK):
         return True  # a fired errand hands over output, file names or titles from the PC
@@ -1768,6 +1804,7 @@ class AiAssistPlugin:
         self.base_url = PRESETS["deepseek"][1]
         self.model = PRESETS["deepseek"][2]
         self.thinking = "off"
+        self.auto = False  # auto mode: routine approvals (AUTO_KEYS in ai_chat) answer themselves
         self.asks = 0
         self.tokens = 0
         self._notice: tuple[str, str] | None = None
@@ -1898,7 +1935,7 @@ class AiAssistPlugin:
 
     def to_dict(self) -> dict[str, Any]:
         return {"provider": self.provider, "base_url": self.base_url, "model": self.model,
-                "thinking": self.thinking}
+                "thinking": self.thinking, "auto": self.auto}
 
     def load_dict(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
@@ -1919,3 +1956,4 @@ class AiAssistPlugin:
             self.thinking = thinking
         elif data.get("low_effort") is True:  # before thinking levels: a checkbox for reasoning_effort low
             self.thinking = "low"
+        self.auto = data.get("auto") is True
