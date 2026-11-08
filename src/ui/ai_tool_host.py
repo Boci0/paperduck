@@ -50,7 +50,7 @@ APPROVE_TIMEOUT_S = 300.0  # the user reads the MCP confirm, a diff or a command
 # instruction could use to act on the PC. MCP calls stay allowed (a browser server would ask on every click).
 # Apps whose window on screen shows content from outside the PC: a screen read with one visible arms the guard too
 OUTSIDE_APPS = READERS | MESSAGE_APPS
-OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "memory", "add_skill",
+OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "edit_outside", "memory", "add_skill",
                              "update_skill", "add_mcp_server"})
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
 MAX_CLIP_CHARS = 12000
@@ -288,7 +288,14 @@ class AiToolHost(QObject):
             else:
                 diffs = "\n\n".join(f"{'new file' if e.before is None else 'edit'} {e.rel}\n{e.diff}" for e in edits)
                 ask = f"The model wants to change {len(edits)} files, all or none:\n\n{diffs}"
-            if not self._allowed("edit_file", ask, "file edits"):
+            # Only edits wholly inside the Project Folder share the "edit_file" approval (the one auto mode answers):
+            # elsewhere (Startup, secrets, Paperduck's own skills and MCP config) asks under its own key.
+            root, app_data = self._project(), skills_dir().parent.resolve()
+            inside = root is not None and all(
+                e.path.resolve().is_relative_to(root.resolve()) and not e.path.resolve().is_relative_to(app_data)
+                and not is_secret(e.path) for e in edits)
+            if not self._allowed("edit_file" if inside else "edit_outside", ask,
+                                 "file edits" if inside else "edits outside the Project Folder"):
                 return "error: the user declined this edit"
             return apply_edits(edits)
         if name in ("set_errand", "cancel_errand"):

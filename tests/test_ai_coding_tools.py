@@ -136,6 +136,35 @@ def test_host_edit_files_asks_once_with_every_diff_and_task_list_reaches_the_cha
     assert results[2].startswith("error:")
 
 
+def test_edits_outside_the_project_folder_ask_under_their_own_key(repo: Path, tmp_path: Path) -> None:
+    from src.tools.ai_tools import skills_dir
+
+    keys: list[str] = []
+
+    class Chat:
+        def confirm(self, key, text, what, done, **extra):
+            keys.append(key)
+            done(True)
+
+    app, host = _host(repo, Chat())
+    outside = tmp_path / "elsewhere.txt"
+    skill = skills_dir() / "mine" / "SKILL.md"
+
+    def work() -> None:
+        host.run("edit_file", {"path": "inside.txt", "old_text": "", "new_text": "x"})
+        host.run("edit_file", {"path": str(outside), "old_text": "", "new_text": "x"})
+        host.run("edit_file", {"path": str(skill), "old_text": "", "new_text": "x"})
+        host.run("edit_files", {"edits": [{"path": "a2.txt", "old_text": "", "new_text": "x"},
+                                          {"path": str(tmp_path / "b2.txt"), "old_text": "", "new_text": "x"}]})
+
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    _run_on_thread(app, work)
+    assert keys == ["edit_file", "edit_outside", "edit_outside", "edit_outside"]  # one file outside: the whole batch
+    from src.ui.ai_chat import AUTO_KEYS
+    from src.ui.ai_tool_host import OUTSIDE_GUARDED
+    assert "edit_outside" not in AUTO_KEYS and "edit_outside" in OUTSIDE_GUARDED
+
+
 def _py(code: str) -> str:
     return f'"{sys.executable}" -c "{code}"'
 
