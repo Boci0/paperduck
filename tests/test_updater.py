@@ -82,6 +82,7 @@ def test_git_checkout_is_not_an_install(tmp_path: Path) -> None:
 
 import json  # noqa: E402
 import threading  # noqa: E402
+import urllib.error  # noqa: E402
 from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 
 from src import signing, updater  # noqa: E402
@@ -239,6 +240,7 @@ def test_update_job_reports_a_broken_http_reply(monkeypatch: pytest.MonkeyPatch,
         conn.close()
 
     threading.Thread(target=serve, daemon=True).start()
+    monkeypatch.setattr(updater, "RETRY_WAITS_S", ())  # this server answers once
     monkeypatch.setattr(updater, "LATEST_API", f"http://127.0.0.1:{server.getsockname()[1]}/latest")
     results: list[tuple[str, str]] = []
     job = updater.UpdateJob()
@@ -418,6 +420,39 @@ def test_download_reports_progress_and_enforces_the_limit() -> None:
         assert seen == sorted(set(seen)) and seen[-1] == 100  # rising, no repeats, ends at 100
         with pytest.raises(ValueError, match="too large"):
             updater._get(url, len(body) - 1)
+    finally:
+        server.shutdown()
+
+
+def test_download_retries_github_outages_and_says_whose_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+    replies: list[int] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            code = replies.pop(0)
+            self.send_response(code)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    monkeypatch.setattr(updater, "RETRY_WAITS_S", (0.0, 0.0))
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/bundle.zip"
+    try:
+        replies[:] = [504, 503, 200]
+        assert updater._get(url, 10) == b"ok" and not replies  # two outages, then it works
+        replies[:] = [504, 504, 504]
+        with pytest.raises(OSError, match=r"GitHub is not responding \(HTTP 504\); try again in a few minutes"):
+            updater._get(url, 10)
+        assert not replies  # three tries in all
+        replies[:] = [404, 200]
+        with pytest.raises(urllib.error.HTTPError):
+            updater._get(url, 10)
+        assert replies == [200]  # a 404 is not retried
     finally:
         server.shutdown()
 

@@ -23,6 +23,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -68,7 +69,30 @@ def is_installed(app_dir: Path = APP_DIR) -> bool:
     return (app_dir / INSTALL_MARKER).is_file()
 
 
+RETRY_WAITS_S = (2.0, 8.0)  # GitHub's download servers time out (502/503/504) for minutes at a time
+
+
 def _get(url: str, limit: int, progress: Callable[[int], None] | None = None) -> bytes:
+    """`_get_once`, retried after RETRY_WAITS_S when GitHub or the network fails; a final failure is an OSError
+    that says plainly whose side it is on (it reaches the user as "Update failed: ...")."""
+    for wait in (*RETRY_WAITS_S, None):
+        try:
+            return _get_once(url, limit, progress)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500 and exc.code != 429:  # 404 and friends: retrying will not help
+                raise
+            if wait is None:
+                raise OSError(f"GitHub is not responding (HTTP {exc.code}); try again in a few minutes") from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+            if wait is None:
+                reason = getattr(exc, "reason", None) or exc
+                raise OSError(f"could not reach GitHub ({reason}); check the connection and try again") from exc
+        logger.info("download of %s failed, retrying in %.0f s", url, wait)
+        time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _get_once(url: str, limit: int, progress: Callable[[int], None] | None = None) -> bytes:
     """Download up to `limit` bytes; `progress` gets the percent done whenever it changes (needs Content-Length)."""
     req = urllib.request.Request(url, headers={"User-Agent": f"Paperduck/{__version__}"})
     chunks: list[bytes] = []
