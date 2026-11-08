@@ -1795,6 +1795,7 @@ class AiAssistPlugin:
         self.base_url = PRESETS["deepseek"][1]
         self.model = PRESETS["deepseek"][2]
         self.thinking = "off"
+        self.auto = False  # auto mode: routine approvals (AUTO_KEYS in ai_chat) answer themselves
         self.asks = 0
         self.tokens = 0
         self._notice: tuple[str, str] | None = None
@@ -1925,7 +1926,7 @@ class AiAssistPlugin:
 
     def to_dict(self) -> dict[str, Any]:
         return {"provider": self.provider, "base_url": self.base_url, "model": self.model,
-                "thinking": self.thinking}
+                "thinking": self.thinking, "auto": self.auto}
 
     def load_dict(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
@@ -1946,3 +1947,4 @@ class AiAssistPlugin:
             self.thinking = thinking
         elif data.get("low_effort") is True:  # before thinking levels: a checkbox for reasoning_effort low
             self.thinking = "low"
+        self.auto = data.get("auto") is True

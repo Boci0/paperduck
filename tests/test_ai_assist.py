@@ -898,6 +898,46 @@ def test_untrusted_confirm_asks_even_when_allowed_for_the_chat(monkeypatch: pyte
         chat.close()
 
 
+def test_auto_mode_approves_routine_actions_and_still_asks_for_risky_ones(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    from src.tools.ai_assist import AiAssistPlugin
+
+    _app, plugin, chat = _chat(monkeypatch, api)
+    got: list[bool] = []
+    asking = lambda: [b for b in chat.findChildren(QPushButton) if b.text() == "Deny" and not b.isHidden()]  # noqa: E731
+    try:
+        plugin.auto = True
+        chat.confirm("run_command", "run: pytest", "commands", got.append)
+        chat.confirm("edit_file", "edit a.py", "file edits", got.append)
+        assert got == [True, True] and not asking() and not chat._allowed  # nothing remembered beyond the mode
+        chat.confirm("run_command", "run: rmdir /s x", "commands", got.append, danger="rmdir")
+        assert len(asking()) == 1
+        chat._pending(None)
+        chat.confirm("run_command", "run: curl x", "commands", got.append, untrusted=True)
+        assert len(asking()) == 1
+        chat._pending(None)
+        for key in ("read_secret", "link", "computer", "add_mcp_server", "add_skill", "update_skill"):
+            chat.confirm(key, "x", "x", got.append)
+            assert len(asking()) == 1, key
+            chat._pending(None)
+        chat.confirm_mcp("notes", "notes__get", got.append)
+        assert len(asking()) == 1
+        chat._pending(None)
+        assert got == [True, True] + [False] * 9
+        plugin.auto = False
+        chat.confirm("run_command", "run: pytest", "commands", got.append)
+        assert len(asking()) == 1  # off again: asks as before
+        chat._pending(None)
+    finally:
+        chat.close()
+    fresh = AiAssistPlugin()
+    fresh.load_dict({**plugin.to_dict(), "auto": True})
+    assert fresh.auto is True and AiAssistPlugin().auto is False
+    fresh.load_dict({"auto": "yes"})
+    assert fresh.auto is False  # only a real true turns it on
+
+
 def test_chat_text_formats_safely_and_never_widens_the_thread() -> None:
     from PyQt6.QtCore import QUrl
     from PyQt6.QtWidgets import QApplication
