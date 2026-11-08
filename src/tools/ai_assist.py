@@ -852,10 +852,13 @@ def _billable(fresh: int, cached: int, completion: int) -> int:
     return fresh + cached // 10 + completion
 
 
-def _steered(steer: Callable[[], list[str]] | None) -> str:
+def _steered(steer: Callable[[], list[str]] | None, host: ToolHost | None = None) -> str:
     """Notes the user typed while the model worked, as one text for the next tool result ('' when none)."""
+    notes = steer() if steer else []
+    if any(isinstance(t, BranchNote) for t in notes):
+        _note_outside(host, "wait_agents")  # a branch's report is outside content, like an agent's
     return "".join(t.note() if isinstance(t, BranchNote) else USER_NOTE.format(text=t[:MAX_INPUT_CHARS])
-                   for t in (steer() if steer else []))
+                   for t in notes)
 
 
 def _int(value: Any) -> int:
@@ -925,6 +928,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     fails: list[Any] = [0, 0, None, []]
     # set once a tool has returned the user's own data; a sub-agent (`local_data`) starts set: its task may hold some
     read_local = getattr(host, "local_data", False) or any(read_local_data(m) for m in messages)
+    _note_outside(host, messages=messages)
     seen_buf: list[Any] = ["", 0]  # see _grow_seen
     start = len(turns)  # this answer's own turns follow
     for _ in range(MAX_NATIVE_ROUNDS + MAX_TOOL_ROUNDS + 1):
@@ -950,6 +954,8 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
             reasoning += [b["thinking"] for b in blocks if b.get("type") == "thinking" and isinstance(b.get("thinking"), str)]
             used += [(tool_note(b.get("name", "?"), b.get("input")), "") for b in blocks
                      if b.get("type") == "server_tool_use"]  # Claude's own search results come back encrypted
+            if any(b.get("type") == "server_tool_use" for b in blocks):
+                _note_outside(host, "web_fetch")
             if data.get("stop_reason") == "pause_turn":  # send the paused turn back unchanged
                 turns = [*turns, {"role": "assistant", "content": blocks}]
                 continue
@@ -968,6 +974,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
                     elif out is None:
                         out = _run_tool(b["name"], b.get("input"), host, _grow_seen(seen_buf, turns) if read_local else None)
                     read_local = read_local or b["name"] in LOCAL_DATA_TOOLS or MCP_SEP in b["name"]
+                    _note_outside(host, b["name"])
                     shot = _take_shot(host)
                     sent = out + _steer(b["name"], _call_key(b["name"], b.get("input")), out, fails, paid)
                     content: Any = sent if not shot else [{"type": "text", "text": sent}, {"type": "image", "source": {
@@ -978,7 +985,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
                 tool_rounds += 1
                 note = [{"type": "text", "text": (BUDGET_NOTE if tool_rounds == MAX_TOOL_ROUNDS else PACE_NOTE).strip()}]                     if tool_rounds in (MAX_TOOL_ROUNDS, PACE_AT) else []
                 _check(cancel)  # a stopped answer must not take steer text meant for the next one
-                if said := _steered(steer):
+                if said := _steered(steer, host):
                     note = [*note, {"type": "text", "text": said.strip()}]
                 if results:  # the prompt cache mark moves to the newest result, so the next round reads the rest cached
                     _unmark(turns, start)
@@ -1023,6 +1030,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     start = len(messages)  # this answer's own turns follow
     # set once a tool has returned the user's own data; a sub-agent (`local_data`) starts set: its task may hold some
     read_local = getattr(host, "local_data", False) or any(read_local_data(m) for m in messages)
+    _note_outside(host, messages=messages)
     seen_buf: list[Any] = ["", 0]  # see _grow_seen
     spent = [0, 0, 0, 0]  # prompt, completion, reasoning, total tokens over every round
     paid = 0  # billable tokens (see _billable)
@@ -1108,12 +1116,13 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                                      "content": result + _steer(fn["name"], _call_key(fn["name"], fn.get("arguments")), result, fails, paid)
                                      + (BUDGET_NOTE if last else PACE_NOTE if round_ == PACE_AT - 1 and call is calls[-1] else "")})
                     read_local = read_local or fn["name"] in LOCAL_DATA_TOOLS or MCP_SEP in fn["name"]
+                    _note_outside(host, fn["name"])
                     used.append((tool_note(fn["name"], fn.get("arguments")), result))
                     shot = _take_shot(host)
                     if shot:
                         shots.append(shot)
                 _check(cancel)  # a stopped answer must not take steer text meant for the next one
-                if said := _steered(steer):
+                if said := _steered(steer, host):
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + said}
                 if shots and (base_url, model) not in _NO_VISION:
                     messages.append({"role": "user", "content": [
@@ -1321,6 +1330,35 @@ def tools_block(tools: list[tuple[str, str]], per_tool: int) -> str:
     if len(tools) > MAX_TOOL_LINES:
         lines.insert(0, f"- ({len(tools) - MAX_TOOL_LINES} earlier calls not shown)")
     return TOOLS_MARK + "\n" + "\n".join(lines) + "]\n"
+
+
+# Tools whose output comes from outside the PC (web pages, search results, sub-agent reports) and so may carry
+# instructions the user never wrote; MCP tools count too. web_fetch is Claude's own server tool.
+OUTSIDE_TOOLS = frozenset({"web_search", "fetch_page", "web_fetch", "wait_agents"})
+_BRANCH_HEAD = BRANCH_NOTE.split("{source}")[0].strip()
+
+
+def read_outside(message: dict[str, Any]) -> bool:
+    """An earlier turn that brought outside content into the chat: an outside tool or MCP call, or a branch report."""
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    if message.get("role") == "user":
+        return _BRANCH_HEAD in content
+    return (message.get("role") == "assistant" and content.startswith(TOOLS_MARK)
+            and (any(f"\n- {name}(" in content for name in OUTSIDE_TOOLS)
+                 or re.search(rf"\n- [^\s(]*{MCP_SEP}[^\s(]*\(", content) is not None))
+
+
+def _note_outside(host: ToolHost | None, name: str | None = None, messages: list[dict[str, Any]] = ()) -> None:
+    """Keeps `host.outside` (on a host that has it) true once this answer's context holds outside content: with
+    `name`, after that tool ran; without, from the chat so far (set at the start of each answer)."""
+    if host is None or not hasattr(host, "outside"):
+        return
+    if name is None:
+        host.outside = any(read_outside(m) for m in messages)
+    elif name in OUTSIDE_TOOLS or MCP_SEP in name:
+        host.outside = True
 
 
 def read_local_data(message: dict[str, Any]) -> bool:

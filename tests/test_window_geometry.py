@@ -501,7 +501,7 @@ def test_topmost_yields_to_held_buttons_and_foreign_topmost_windows() -> None:
 
 def test_away_naps_and_wakes_with_a_yawn(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
     import src.tools.system_monitor as system_monitor
-    import src.ui.pet_window as pw
+    import src.ui.pet_watch as pw
 
     # real CPU or RAM over 90% (a busy suite) would make it hungry from the first sample, taken while it is built
     monkeypatch.setattr(system_monitor, "get_system_metrics", lambda: system_monitor.SystemMetrics(5.0, 40.0, 50.0))

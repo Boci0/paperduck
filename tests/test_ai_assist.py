@@ -875,6 +875,24 @@ def test_chat_confirm_offers_once_or_for_this_chat(monkeypatch: pytest.MonkeyPat
         chat.close()
 
 
+def test_untrusted_confirm_asks_even_when_allowed_for_the_chat(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    app, _plugin, chat = _chat(monkeypatch, api)
+    got: list[bool] = []
+    shown = lambda: [b.text() for b in chat.findChildren(QPushButton) if not b.isHidden()]  # noqa: E731
+    try:
+        chat._allowed.add("run_command")
+        chat.confirm("run_command", "run: curl x", "commands", got.append, untrusted=True)
+        assert "Allow for this chat" not in shown() and {"Allow once", "Deny"} <= set(shown())
+        [b for b in chat.findChildren(QPushButton) if b.text() == "Allow once" and not b.isHidden()][-1].click()
+        app.processEvents()
+        chat.confirm("run_command", "run: git status", "commands", got.append)  # no outside content: still allowed
+        assert got == [True, True] and "Allow once" not in shown()
+    finally:
+        chat.close()
+
+
 def test_chat_text_formats_safely_and_never_widens_the_thread() -> None:
     from PyQt6.QtCore import QUrl
     from PyQt6.QtWidgets import QApplication

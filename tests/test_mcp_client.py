@@ -268,3 +268,37 @@ def test_servers_start_in_the_scratch_folder(monkeypatch: pytest.MonkeyPatch, tm
     with pytest.raises(_Stop):
         mcp_client.McpServer("fake", {"command": sys.executable, "args": [FAKE], "env": {}})
     assert seen["cwd"] == tmp_path
+
+
+def _npx_install(cache: Path, spec: str, name: str, bin_field: object) -> Path:
+    root = cache / "_npx" / "abc123"
+    pkg = root / "node_modules" / name
+    (pkg / "dist").mkdir(parents=True)
+    (root / "package.json").write_text(json.dumps({"_npx": {"packages": [spec]}}), encoding="utf-8")
+    (pkg / "package.json").write_text(json.dumps({"name": name, "bin": bin_field}), encoding="utf-8")
+    (pkg / "dist" / "index.js").write_text("", encoding="utf-8")
+    return pkg / "dist" / "index.js"
+
+
+def test_cached_npx_servers_run_on_node_directly_and_refresh_weekly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mcp_client.shutil, "which", lambda name: "C:/node/node.exe" if name == "node" else None)
+    cache, seen = tmp_path / "cache", tmp_path / "refresh.json"
+    script = _npx_install(cache, "@scope/srv@latest", "@scope/srv", {"srv": "dist/index.js"})
+    run = lambda now: mcp_client.direct_command("C:/nodejs/npx.cmd", ["-y", "@scope/srv@latest", "--port", "1"],
+                                                cache, seen, now)
+    assert run(1000.0) is None  # first start goes through npx and is recorded
+    assert run(2000.0) == ["C:/node/node.exe", str(script.resolve()), "--port", "1"]
+    assert run(1000.0 + mcp_client.NPX_REFRESH_S + 1) is None  # a week on, npx again to pick up updates
+    assert run(1000.0 + mcp_client.NPX_REFRESH_S + 2) is not None
+
+
+def test_direct_command_keeps_npx_when_unsure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mcp_client.shutil, "which", lambda name: "node.exe")
+    cache, seen = tmp_path / "cache", tmp_path / "refresh.json"
+    seen.write_text(json.dumps({"pkg": 0.0, "evil": 0.0}), encoding="utf-8")
+    assert mcp_client.direct_command("python", ["pkg"], cache, seen, 1.0) is None  # not npx
+    assert mcp_client.direct_command("npx", ["pkg"], cache, seen, 1.0) is None  # not cached
+    assert mcp_client.direct_command("npx", ["-p", "pkg", "x"], cache, seen, 1.0) is None  # unsupported form
+    _npx_install(cache, "evil", "evil", "../../../outside.js")
+    (cache / "_npx" / "abc123" / "outside.js").write_text("", encoding="utf-8")
+    assert mcp_client.direct_command("npx", ["evil"], cache, seen, 1.0) is None  # bin must stay inside the package
