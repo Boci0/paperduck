@@ -7,6 +7,7 @@ import faulthandler
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -281,6 +282,25 @@ def setup_logging() -> Path | None:
 
 MAX_LOGGED_ERRORS = 20  # an error in a paint or timer handler repeats every frame; the first ones say enough
 _crash_file = None  # faulthandler writes to this file on a native crash, so it must stay open
+_CRASH_BLOCK = re.compile(r"(?m)^(?=Windows fatal exception:|Fatal Python error:)")
+# COM RPC errors (facility RPC, 0x8001xxxx, e.g. 0x8001010d during a clipboard change): RPC raises and catches them
+# itself, but faulthandler's Windows handler sees every first-chance exception and logs them as fatal
+_HANDLED_CODE = re.compile(r"Windows fatal exception: code 0x8001[0-9a-f]{4}\b", re.I)
+
+
+def prune_crash_log(path: Path) -> None:
+    """Drop the handled COM RPC entries from crash.log, so a real crash stands out (faulthandler has no filter)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    blocks = _CRASH_BLOCK.split(text)
+    kept = [b for b in blocks if not _HANDLED_CODE.match(b)]
+    if len(kept) != len(blocks):
+        try:
+            path.write_text("".join(kept), encoding="utf-8")
+        except OSError:
+            pass
 
 
 def install_crash_guard(on_error: Callable[[], None] | None = None) -> Callable[..., None]:
@@ -306,6 +326,7 @@ def install_crash_guard(on_error: Callable[[], None] | None = None) -> Callable[
     sys.excepthook = hook
     if _crash_file is None:
         try:
+            prune_crash_log(log_path().with_name("crash.log"))  # what the last run logged; this run's waits a launch
             _crash_file = open(log_path().with_name("crash.log"), "a", encoding="utf-8")  # noqa: SIM115
             faulthandler.enable(_crash_file)
         except (OSError, RuntimeError):

@@ -43,3 +43,16 @@ def test_error_in_a_slot_is_logged_and_the_app_keeps_running(tmp_path, monkeypat
         faulthandler.disable()
         if main_mod._crash_file is not None:
             main_mod._crash_file.close()
+
+
+def test_crash_log_drops_handled_com_errors_and_keeps_real_crashes(tmp_path) -> None:
+    stack = ('\nThread 0x000070b0 (most recent call first):\n  File "src/ui/quick_tools.py", line 436 in _run\n\n'
+             'Current thread 0x000069a8 (most recent call first):\n  File "src/main.py", line 377 in main\n')
+    real = "Windows fatal exception: access violation\n" + stack
+    fatal = "Fatal Python error: Segmentation fault\n" + stack
+    log = tmp_path / "crash.log"
+    log.write_text("Windows fatal exception: code 0x8001010d\n" + stack + real
+                   + "Windows fatal exception: code 0x80010108\n" + stack + fatal, encoding="utf-8")
+    main_mod.prune_crash_log(log)
+    assert log.read_text(encoding="utf-8") == real + fatal
+    main_mod.prune_crash_log(tmp_path / "missing.log")  # no file: nothing to do, no error
