@@ -44,6 +44,10 @@ from src.ui.quick_tools import ocr_image_file
 GUI_TIMEOUT_S = 15.0
 SAVE_TIMEOUT_S = 600.0  # the Save dialog waits on the user
 APPROVE_TIMEOUT_S = 300.0  # the user reads the MCP confirm, a diff or a command in the chat
+# Allowed-for-this-chat keys that ask again once the chat holds web, MCP or agent content: what an injected
+# instruction could use to act on the PC. MCP calls stay allowed (a browser server would ask on every click).
+OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "memory", "add_skill",
+                             "update_skill", "add_mcp_server"})
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
 MAX_CLIP_CHARS = 12000
 MAX_SCREEN_CHARS = 8000
@@ -214,6 +218,7 @@ class AiToolHost(QObject):
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
         self.approve_s = APPROVE_TIMEOUT_S  # the chat raises it for an errand's answer
+        self.outside = False  # ask() sets it while the chat holds web, MCP or agent content (see _allowed)
         self.agents = Agents(self._run_agent, lambda text, source: self._win._ai_chat.add_branch_note(text, source),
                              self.agent_event.emit)
         self._call.connect(self._on_call)
@@ -671,10 +676,12 @@ class AiToolHost(QObject):
 
     def _allowed(self, key: str, text: str, what: str, risk: str = "") -> bool:
         """The user's answer in the chat; no answer within APPROVE_TIMEOUT_S counts as declined.
-        A `risk` (destructive command) is asked every time, even when the chat allowed the tool before."""
+        A `risk` (destructive command) is asked every time, even when the chat allowed the tool before. So is a
+        tool in OUTSIDE_GUARDED once the chat holds outside content, which could have told the model what to do."""
         chat = self._win._ai_chat
-        ask = (lambda done: chat.confirm(key, text, what, done, danger=risk)) if risk else (
-            lambda done: chat.confirm(key, text, what, done))
+        extra: dict[str, Any] = {"danger": risk} if risk else {"untrusted": True} if (
+            self.outside and key in OUTSIDE_GUARDED) else {}
+        ask = lambda done: chat.confirm(key, text, what, done, **extra)  # noqa: E731
         return self._waiting(ask) is True
 
     def _waiting(self, ask: Callable[[Callable[[Any], None]], None]) -> Any:

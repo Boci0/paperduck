@@ -44,6 +44,8 @@ CALL_TIMEOUT_S = 60.0
 MAX_RESULT_CHARS = 30000
 MAX_TOOLS_PER_SERVER = 64
 IDLE_CLOSE_S = 300.0  # servers unused this long are closed (an npx server is two node processes, ~180 MB)
+NPX_REFRESH_S = 7 * 86400.0  # a cached npx server still starts through npx this often, so `@latest` updates
+REFRESH_PATH = CONFIG_PATH.parent / "mcp_refresh.json"  # spec -> last time it started through npx
 _NAME = re.compile(r"[^A-Za-z0-9_-]")
 MAX_DESCRIPTION_CHARS = 500  # a tool description goes into the model's context, so a server could plant text there
 # What a server inherits from the app's environment: the system basics, proxies and certificates, package-manager
@@ -121,6 +123,70 @@ def result_text(result: Any) -> str:
     return ("error: " + text) if result.get("isError") else text
 
 
+def _npx_cache() -> Path:
+    return Path(os.environ.get("NPM_CONFIG_CACHE") or Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "npm-cache")
+
+
+def direct_command(command: str, args: list[str], cache: Path | None = None, refresh_path: Path | None = None,
+                   now: float | None = None) -> list[str] | None:
+    """`node <bin script>` for an `npx [-y] <spec> ...` server npx already installed, else None (start it as given).
+
+    npx runs a server as cmd -> node (npx) -> cmd -> node (server), about 100 MB of launchers; the cached
+    package runs the same script with one node. Once every NPX_REFRESH_S it still goes through npx to update.
+    """
+    if Path(command).stem.lower() != "npx":
+        return None
+    rest = list(args)
+    while rest and rest[0] in ("-y", "--yes"):
+        rest.pop(0)
+    if not rest or rest[0].startswith("-"):
+        return None  # shortcut: -p / --package / -c forms keep npx, add them if a config needs it
+    spec, server_args = rest[0], rest[1:]
+    node = shutil.which("node")
+    refresh_path = refresh_path or REFRESH_PATH
+    now = time.time() if now is None else now
+    try:
+        seen = json.loads(refresh_path.read_text(encoding="utf-8"))
+        seen = seen if isinstance(seen, dict) else {}
+    except (OSError, ValueError):
+        seen = {}
+    script = _cached_bin(spec, cache or _npx_cache()) if node else None
+    last = seen.get(spec)
+    if script is not None and isinstance(last, (int, float)) and now - last < NPX_REFRESH_S:
+        return [node, str(script), *server_args]
+    seen[spec] = now  # this start goes through npx, which installs or refreshes the cache
+    try:
+        refresh_path.write_text(json.dumps(seen), encoding="utf-8")
+    except OSError:
+        pass
+    return None
+
+
+def _cached_bin(spec: str, cache: Path) -> Path | None:
+    """The bin script of `spec` in npx's cache (`_npx/<hash>/package.json` lists the exact spec it installed)."""
+    name = spec if spec.rfind("@") <= 0 else spec[:spec.rfind("@")]  # @scope/pkg@1 -> @scope/pkg, pkg@1 -> pkg
+    for manifest in (cache / "_npx").glob("*/package.json"):
+        try:
+            if json.loads(manifest.read_text(encoding="utf-8")).get("_npx", {}).get("packages") != [spec]:
+                continue
+            root = manifest.parent / "node_modules" / name
+            pkg = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, AttributeError):
+            continue
+        bins = pkg.get("bin")
+        if isinstance(bins, str):
+            rel = bins
+        elif isinstance(bins, dict) and len(bins) == 1:
+            rel = next(iter(bins.values()))
+        else:
+            return None  # several bins: npx picks by name rules, leave it to npx
+        script = (root / str(rel)).resolve()
+        if script.suffix.lower() in (".js", ".mjs", ".cjs") and script.is_file() and script.is_relative_to(root.resolve()):
+            return script
+        return None
+    return None
+
+
 class McpServer:
     """One running stdio server. Calls are serialized; a reader thread queues every line it prints."""
 
@@ -132,8 +198,9 @@ class McpServer:
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._next_id = 0
         command = shutil.which(cfg["command"]) or cfg["command"]  # finds npx.cmd and the like
+        argv = direct_command(command, cfg["args"]) or [command, *cfg["args"]]
         self._proc = subprocess.Popen(
-            [command, *cfg["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env=child_env(cfg["env"]), cwd=scratch_dir(),  # not the app's data folder
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         threading.Thread(target=self._read, daemon=True).start()

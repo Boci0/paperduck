@@ -86,7 +86,7 @@ def test_windows_ocr_reads_rendered_text(tmp_path: Path) -> None:
 def test_snip_save_falls_back_when_pictures_dir_refuses_writes(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.ui import pet_window
+    from src.ui import pet_tools as pet_window  # _save_snip_png lives on ToolsMixin
 
     blocker = tmp_path / "pictures_is_a_file"
     blocker.write_text("x")  # mkdir under a file raises OSError, like a refused OneDrive dir
@@ -94,7 +94,7 @@ def test_snip_save_falls_back_when_pictures_dir_refuses_writes(
     monkeypatch.setattr(pet_window.Path, "home", lambda: tmp_path / "home")
     img = QImage(8, 8, QImage.Format.Format_RGB32)
     img.fill(QColor("#102030"))
-    saved = pet_window.PetWindow._save_snip_png(img)
+    saved = pet_window.ToolsMixin._save_snip_png(img)
     assert saved is not None and saved.parent == tmp_path / "home" / ".paperduck" / "snips"
     assert saved.exists()
 

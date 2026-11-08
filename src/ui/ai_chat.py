@@ -1806,20 +1806,23 @@ class AiChat(QWidget):
         self.confirm(f"mcp:{server}", text, f'MCP server "{server}"', done, once=False, danger=danger)
 
     def confirm(self, key: str, text: str, what: str, done: Callable[[bool], None], once: bool = True,
-                danger: str = "") -> None:
+                danger: str = "", untrusted: bool = False) -> None:
         """Allow/Deny row in the chat; the worker thread waits for done(allowed).
 
         `key` already allowed for this chat answers at once. With `once`, the row offers Allow once, Allow for
         this chat and Deny; without, Allow (for this chat) and Deny. A `danger` (what looks destructive) is never
-        remembered and always asks: a red card with Allow once and Deny only.
+        remembered and always asks: a red card with Allow once and Deny only. `untrusted` (the chat read web, MCP or
+        agent content, which could have steered the model) asks even when allowed for this chat: Allow once and Deny.
         """
-        if key in self._allowed and not danger:
+        if key in self._allowed and not danger and not untrusted:
             done(True)
             return
         intro, _sep, detail = text.partition("\n\n")  # the command, diff or note is shown apart from the question
         card = _Card("Permission needed", ACCENT_HEX)
         if danger:
             card.set_header(f'Destructive command ("{danger[:30]}") - check it', DANGER_HEX)
+        elif untrusted:
+            card.set_header("Asked again: this chat read web or MCP content - check it", ACCENT_HEX)
         card.body.addWidget(ChatText(intro, pt=9))
         if detail:
             code = ChatText(detail, pt=8.5)
@@ -1829,8 +1832,8 @@ class AiChat(QWidget):
             card.body.addWidget(code)
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
-        choices = ([("Allow once", "once"), ("Allow for this chat", "chat")] if once and not danger
-                   else [("Allow once", "once")] if danger else [("Allow", "chat")]) + [("Deny", None)]
+        choices = ([("Allow once", "once"), ("Allow for this chat", "chat")] if once and not danger and not untrusted
+                   else [("Allow once", "once")] if danger or untrusted else [("Allow", "chat")]) + [("Deny", None)]
         btns: list[QPushButton] = []
 
         def answer(choice: str | None) -> None:
