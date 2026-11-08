@@ -48,7 +48,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.engine.models import CompanionState, HudBar, HudData, ToolMenuItem
 from src.tools.ai_tools import (CHAIN_NOTE, MEMORY_HEADER, scratch_dir, LOCAL_DATA_TOOLS, RULES_HEADER, memory_path, memory_prompt, rules_path,
-                                rules_prompt, skills_dir, skills_prompt)
+                                rules_prompt, load_skill, skills_dir, skills_prompt)
 from src.tools.errands import ERRAND_MARK
 from src.tools.mcp_client import SEP as MCP_SEP, ensure_config
 
@@ -148,9 +148,8 @@ TASK_EVERY = 5  # tool calls since the last plan_tasks, while steps are open, be
 TASK_NOTE = ("\n\n[Paperduck: your checklist has not changed for {n} tool calls. If a step finished, call plan_tasks "
              "with the updated list now; mark every step done before your final answer.]")
 OFFICE_SKILLS = {"Word": "word-docs", "PowerPoint": "slides", "Excel": "excel-sheets"}  # COM app -> built-in skill
-OFFICE_NOTE = ("\n\n[Paperduck: this script drives {app}. Load the built-in {skill} skill (load_skill) and use its "
-               "tested helpers for the next script, then check the saved file with one preview_document instead of "
-               "paging the window.]")
+OFFICE_NOTE = ("\n\n[Paperduck: this script drives {app}, so here is the {skill} skill, loaded for you. Use its "
+               "tested helpers for the next script and check the saved file with one preview_document.]\n\n{body}")
 BLIND_NOTE = ("\n\n[Paperduck: this model cannot see images, so screen_map, preview_document and scrolling will not "
               "show layout or styling. Check documents by reading them back (COM: page of each paragraph, fonts, sizes, "
               "positions) instead of paging through the screen.]")
@@ -1238,8 +1237,8 @@ def _failed(result: str) -> bool:
 
 
 def _office_note(name: str, call: str, state: list[Any]) -> str:
-    """OFFICE_NOTE the first time this answer's script drives an Office app whose built-in skill it has not
-    loaded; state[5] holds the skills loaded or already nudged."""
+    """OFFICE_NOTE with the skill's text the first time this answer's script drives an Office app whose skill
+    it has not loaded, so the model never has to remember to; state[5] holds the skills loaded or already given."""
     if len(state) <= 5:
         return ""
     if name == "load_skill":
@@ -1251,12 +1250,12 @@ def _office_note(name: str, call: str, state: list[Any]) -> str:
     for app, skill in OFFICE_SKILLS.items():
         if f"{app.lower()}.application" in lowered and skill not in state[5]:
             state[5].add(skill)
-            return OFFICE_NOTE.format(app=app, skill=skill)
+            return OFFICE_NOTE.format(app=app, skill=skill, body=load_skill(skills_dir(), skill))  # a user's own wins
     return ""
 
 
 def _steer(name: str, call: str, result: str, state: list[Any], tokens: int = 0) -> str:
-    """`_steer_note` plus, once per Office app, OFFICE_NOTE when a script drives it without its built-in skill."""
+    """`_steer_note` plus, once per Office app, that app's skill when a script drives it without having loaded it."""
     return _steer_note(name, call, result, state, tokens) + _office_note(name, call, state)
 
 
@@ -1305,7 +1304,7 @@ KEEP_RESULTS = 4  # newest tool results a trim keeps whole (one trim frees room 
 TRIM_HEAD = 300  # characters a trimmed result keeps
 TRIMMED = "\n[Paperduck: older output trimmed to save room; run the tool again if you need it]"
 # Read-only tools that may run at the same time when one reply asks for several
-PARALLEL_SAFE = frozenset({"list_files", "find_files", "search_text", "web_search", "fetch_page", "calculate"})
+PARALLEL_SAFE = frozenset({"list_files", "find_files", "search_text", "web_search", "fetch_page", "calculate", "find_skill"})
 MAX_PARALLEL = 4
 
 

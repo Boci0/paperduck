@@ -167,6 +167,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "file you create with a script or a headless browser; --print-to-pdf output is cleaned for you.",
         {"path": _PATH}, ("path",)),
     _fn("open_link", "Open a web link (http or https) in the user's browser.", {"url": {"type": "string"}}, ("url",)),
+    _fn("find_skill", "Search every skill (the user's and the built-in ones) by a few words about the job, e.g. "
+        "'powerpoint deck design' or 'commit message'; returns the best matches with their descriptions. Then "
+        "load_skill the one that fits.", {"query": {"type": "string"}}, ("query",)),
     _fn("load_skill", "Load one of the user's skills (listed in the system prompt) and follow its instructions.",
         {"name": {"type": "string"}}, ("name",)),
     _fn("edit_file", "Change a text file in the Project Folder by replacing old_text, which must appear exactly once "
@@ -1092,8 +1095,11 @@ class BackgroundProcs:
 
 # ---------------------------------------------------------------------- skills
 # A skill is %LOCALAPPDATA%/Paperduck/skills/<name>/SKILL.md: frontmatter (name, description), then instructions.
-# Only names and descriptions go in the system prompt; load_skill returns a body on demand.
-MAX_SKILLS = 30
+# Only names and descriptions go in the system prompt; load_skill returns a body on demand. Past LIST_IN_FULL
+# skills only the names go in (a few tokens each) and find_skill searches them, so skills can grow cheaply.
+MAX_SKILLS = 200
+LIST_IN_FULL = 12
+FIND_TOP = 5
 MAX_SKILL_DESC = 200
 MAX_SKILL_CHARS = 24000
 _SKILL_NAME = re.compile(r"^[\w.-]{1,64}$")
@@ -1156,7 +1162,13 @@ def skills_prompt(root: Path) -> str:
 
     skills = list_skills(root)
     own = {name for name, _d in skills}
-    built = "\n".join(f"- {name}: {entry[0]}" for name, entry in BUILTIN.items() if name not in own)
+    builtins = [(name, entry[0]) for name, entry in BUILTIN.items() if name not in own]
+    if len(skills) + len(builtins) > LIST_IN_FULL:  # names only: the prompt stays small however many there are
+        names = ", ".join(sorted([n for n, _d in skills] + [n for n, _d in builtins]))
+        return ("Skills (the user's own instructions, plus Paperduck's built-in ones): " + names + ". Before a job "
+                "that one might cover (a document, a deck, a workflow, a house style), call find_skill with a few "
+                "words about the job, then load_skill the best match and follow it.")
+    built = "\n".join(f"- {name}: {desc}" for name, desc in builtins)
     rows = "\n".join(f"- {name}: {desc or '(no description)'}" for name, desc in skills)
     parts = []
     if rows:
@@ -1165,6 +1177,31 @@ def skills_prompt(root: Path) -> str:
     if built:
         parts.append(f"Skills built into Paperduck, loaded the same way when a request matches:\n{built}")
     return "\n\n".join(parts)
+
+
+def find_skills(root: Path, query: Any) -> str:
+    """The FIND_TOP skills (user and built-in) whose name, description and text best match the query's words."""
+    from src.tools.builtin_skills import BUILTIN
+
+    words = {w for w in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(w) > 1}
+    if not words:
+        return "error: give a few words about the job"
+    found: dict[str, tuple[str, str]] = {name: (entry[0], entry[1]) for name, entry in BUILTIN.items()}
+    for name, desc in list_skills(root):  # a user skill of the same name wins
+        try:
+            _meta, body = parse_skill((root / name / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
+        except OSError:
+            body = ""
+        found[name] = (desc, body)
+    scored = []
+    for name, (desc, body) in found.items():
+        fields = ((name.lower().replace("-", " "), 3), (desc.lower(), 2), (body.lower(), 1))
+        score = sum(weight for w in words for text, weight in fields if w in text)
+        if score:
+            scored.append((-score, name, desc))
+    if not scored:
+        return "no skill matches; go ahead without one"
+    return "\n".join(f"- {name}: {desc or '(no description)'}" for _s, name, desc in sorted(scored)[:FIND_TOP])
 
 
 def skill_text(description: str, instructions: str) -> str:
