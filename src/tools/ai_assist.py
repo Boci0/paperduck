@@ -66,6 +66,21 @@ MAX_INPUT_CHARS = 240000  # per message, attachments included
 MAX_HISTORY_CHARS = 600000  # what is sent; past COMPACT_AT the chat summarizes older turns instead of dropping them
 RECENT_TOOL_CHARS = 32000  # tool output kept for the newest answer that ran tools, so follow-ups need no rerun
 OLD_TOOL_CHARS = 1000  # ... and per tool for older answers
+# An answer whose own messages fit this is replayed word for word (a prefix cache hit next time); a bigger one
+# goes back to the note form, since carrying its full tool output through every later round costs more. Tuned
+# with a DeepSeek cache sim (miss 50x a hit): above these, the larger context costs more than the misses saved.
+MAX_WIRE_CHARS = 64000
+MAX_HISTORY_WIRE_CHARS = 256000  # replayed text a chat may carry in all (see keep_wire)
+
+
+def keep_wire(history: list[dict[str, Any]], wire: list[dict[str, Any]]) -> bool:
+    """Whether to keep a new answer's wire. When it would pass the chat's replay budget, every earlier replay
+    goes back to the note form in one go (one cache miss there) and the budget starts over: replays carried for
+    good cost more, round after round, than the misses they save."""
+    if sum(wire_chars(t["wire"]) for t in history if t.get("wire")) + wire_chars(wire) > MAX_HISTORY_WIRE_CHARS:
+        for turn in history:
+            turn.pop("wire", None)
+    return bool(wire)
 COMPACT_AT = MAX_HISTORY_CHARS * 3 // 4  # history size that makes the next send summarize older turns first
 KEEP_TURNS = 6  # newest turns kept word for word when compacting
 COMPACT_PREFIX = "[Earlier conversation, compacted by "
@@ -256,6 +271,9 @@ class AiReply:
     compacted: int = 0  # oldest history turns replaced by `summary` before this answer (auto-compact)
     summary: str = ""
     tools: list[tuple[str, str]] = field(default_factory=list)  # (call note, output), e.g. ("web_search(rust)", "...")
+    # Chat completions: this answer's own messages as last sent (tool calls, results, reasoning) plus the final one.
+    # The chat replays them word for word next time, so the provider's prefix cache still covers this answer.
+    wire: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -370,17 +388,31 @@ _NO_THINK: set[tuple[str, str]] = set()  # ... or the thinking fields (such a mo
 _NO_STREAM: set[tuple[str, str]] = set()  # ... or streaming
 
 
-def chat_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def wire_chars(wire: list[dict[str, Any]]) -> int:
+    """Characters a replayed answer sends: its texts, reasoning and tool-call arguments."""
+    return sum(len(m.get("content") or "") + len(m.get("reasoning_content") or "")
+               + sum(len(c.get("function", {}).get("arguments") or "") for c in m.get("tool_calls") or [])
+               for m in wire)
+
+
+def chat_messages(history: list[dict[str, Any]], wire: bool = False) -> list[dict[str, Any]]:
     """System prompt plus the newest turns that fit MAX_HISTORY_CHARS (the last turn is always kept).
 
     A turn's optional "images" (data URLs) become image parts; they are not counted against the budget.
     An answer's optional "tools" [(note, output)] lead its text: the newest such answer keeps up to
-    RECENT_TOOL_CHARS of output, older ones OLD_TOOL_CHARS per tool.
+    RECENT_TOOL_CHARS of output, older ones OLD_TOOL_CHARS per tool. With `wire` (chat completions), an answer
+    that kept its "wire" messages is sent as them, word for word, so the prompt cache covers it next time; one
+    too big for the budget left falls back to the note form.
     """
     kept: list[dict[str, Any]] = []
     total = 0
     recent = True
     for turn in reversed(history):
+        if wire and turn.get("wire") and total + (size := wire_chars(turn["wire"])) <= MAX_HISTORY_CHARS:
+            kept.extend(reversed(turn["wire"]))
+            total += size
+            recent = recent and not turn.get("tools")
+            continue
         content = turn["content"][:MAX_INPUT_CHARS]
         if tools := turn.get("tools"):
             content = tools_block(tools, _tool_share(tools) if recent else OLD_TOOL_CHARS) + content
@@ -406,9 +438,14 @@ def _tool_share(tools: list[tuple[str, str]]) -> int:
 
 
 def history_chars(history: list[dict[str, Any]]) -> int:
-    """Characters `chat_messages` would send for these turns (tool output counted as capped, not as stored)."""
+    """Characters `chat_messages` would send for these turns (tool output counted as capped, not as stored; a
+    replayed answer counted as its wire, so auto-compact still starts in time)."""
     total, recent = 0, True
     for t in reversed(history):
+        if t.get("wire"):
+            total += wire_chars(t["wire"])
+            recent = recent and not t.get("tools")
+            continue
         total += len(t["content"][:MAX_INPUT_CHARS])
         if tools := t.get("tools"):
             total += len(tools_block(tools, _tool_share(tools) if recent else OLD_TOOL_CHARS))
@@ -506,6 +543,13 @@ def thinking_params(base_url: str, thinking: str) -> dict[str, Any]:
     return {} if off else {"reasoning_effort": "high" if thinking == "max" else thinking}  # other OpenAI-style servers
 
 
+def _without_tool_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replayed answers without their tool calls, results and reasoning (each final answer stays), for a model
+    that refuses them (another model picked mid-chat)."""
+    return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages
+            if m.get("role") != "tool" and not m.get("tool_calls")]
+
+
 def _text_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{**m, "content": m["content"][0]["text"]} if isinstance(m["content"], list) else m for m in messages]
 
@@ -545,6 +589,8 @@ def ask(base_url: str, key: str, model: str, messages: list[dict[str, Any]], *,
                 raise
             if any(isinstance(m["content"], list) for m in messages):
                 _NO_VISION.add((base_url, model))
+            elif any(m.get("role") == "tool" or m.get("tool_calls") for m in messages):
+                messages = _without_tool_turns(messages)  # before blaming thinking or tools: the replay may be it
             elif thinking_params(base_url, level):  # e.g. a model that cannot turn thinking off, or lacks xhigh
                 _NO_THINK.add((base_url, model))
             elif tools:
@@ -1099,8 +1145,8 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
             calls = message.get("tool_calls") or []
             if calls and "tools" in body and "tool_choice" not in body:  # never run calls this round did not offer tools for (last round, stuck, budget)
                 # echo the model's own turn (DeepSeek also wants its reasoning back), then answer each call
-                messages.append({k: v for k, v in message.items()
-                                 if k in ("role", "content", "tool_calls", "reasoning_content") and v is not None})
+                messages.append({"role": "assistant", **{k: v for k, v in message.items()
+                                 if k in ("content", "tool_calls", "reasoning_content") and v is not None}})
                 named = [(c["function"]["name"], c["function"].get("arguments")) for c in calls]
                 ready = _run_calls(named, host, _grow_seen(seen_buf, messages) if read_local else None, progress)
                 for call, result in zip(calls, ready):
@@ -1141,7 +1187,11 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                 reasoning=reasoning.strip() if isinstance(reasoning, str) else "",
                 prompt_tokens=spent[0], completion_tokens=spent[1], reasoning_tokens=spent[2], total_tokens=spent[3],
                 cached_tokens=cached, cost=cost, cost_estimate=estimate, cut_off=choice.get("finish_reason") == "length", tools=used,
+                wire=[*messages[start:], {"role": "assistant", **{k: v for k, v in message.items()
+                                          if k in ("content", "reasoning_content") and v is not None}}],
             )
+            if any(isinstance(m.get("content"), list) for m in reply.wire) or wire_chars(reply.wire) > MAX_WIRE_CHARS:
+                reply.wire = []  # a screenshot is still in it (never kept), or too big to carry: the note form
         except (KeyError, IndexError, TypeError, AttributeError):
             raise ValueError("bad reply") from None
         if not reply.text:

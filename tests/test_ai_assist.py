@@ -749,7 +749,10 @@ def test_chat_answers_after_a_web_search_and_setup_saves_the_search_key(
         chat.send()
         _wait(app, lambda: chat._job is None and len(chat._history) == 2)
         assert chat._history[-1] == {"role": "assistant", "content": "It is a stack trace.",
-                                     "tools": [("web_search(news)", "result for news")]}
+                                     "tools": [("web_search(news)", "result for news")], "wire": [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search", "arguments": '{"query": "news"}'}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "result for news"},
+            {"role": "assistant", "content": "  It is a stack trace.  "}]}  # replayed as sent, for the prefix cache
         assert _Api.seen[-1]["body"]["messages"][-1] == {"role": "tool", "tool_call_id": "c1", "content": "result for news"}
         chat.show_setup()
         chat._search_key.setText("brave-key-123")
@@ -1346,3 +1349,75 @@ def test_reply_usage_line_is_not_clipped(monkeypatch: pytest.MonkeyPatch) -> Non
     bottom = info.mapTo(chat._stack, info.rect().bottomLeft()).y()
     assert bottom <= chat._stack.height(), (bottom, chat._stack.height())
     chat.close()
+
+
+class _ReadHost:
+    from src.tools.ai_tools import TOOL_SPECS as specs
+
+    def run(self, name, args):  # noqa: ANN001, ANN201
+        return "file text " * 10
+
+
+def _tool_then_answer(reply_text: str = "Fixed."):  # noqa: ANN202
+    """A fake _request: one read_file call (with thinking), then the final answer."""
+    script = [{"choices": [{"message": {"role": "assistant", "content": None, "reasoning_content": "Read it first.",
+                                        "tool_calls": [{"id": "c1", "type": "function", "function": {
+                                            "name": "read_file", "arguments": '{"path": "a.py"}'}}]}}]},
+              {"choices": [{"message": {"role": "assistant", "content": reply_text, "reasoning_content": "Done."},
+                            "finish_reason": "stop"}]}]
+    bodies: list[dict] = []
+
+    def fake(url, key, path, body, *a, **k):  # noqa: ANN001, ANN202
+        bodies.append(json.loads(json.dumps(body)))
+        return script.pop(0)
+    return fake, bodies
+
+
+def test_answer_is_replayed_word_for_word_so_the_next_message_hits_the_prefix_cache(monkeypatch) -> None:
+    fake, bodies = _tool_then_answer()
+    monkeypatch.setattr(ai_assist, "_request", fake)
+    url = "https://api.deepseek.com/v1"
+    history = [{"role": "user", "content": "fix a.py"}]
+    reply = ask(url, KEY, "deepseek-chat", chat_messages(history, wire=True), thinking="low", host=_ReadHost(), web=False)
+    assert [m["role"] for m in reply.wire] == ["assistant", "tool", "assistant"]
+    assert reply.wire[0]["reasoning_content"] == "Read it first." and reply.wire[-1] == {
+        "role": "assistant", "content": "Fixed.", "reasoning_content": "Done."}
+    assert ai_assist.keep_wire(history, reply.wire)
+    history += [{"role": "assistant", "content": reply.text, "tools": reply.tools, "wire": reply.wire},
+                {"role": "user", "content": "thanks"}]
+    sent = chat_messages(history, wire=True)
+    last_request = bodies[-1]["messages"]
+    assert sent[:len(last_request)] == last_request  # the old request is a prefix of the new one
+    assert sent[len(last_request)] == reply.wire[-1] and sent[-1]["content"] == "thanks"
+    assert ai_assist.history_chars(history) >= ai_assist.wire_chars(reply.wire)
+    assert all("wire" not in m and m.get("role") != "tool" for m in chat_messages(history))  # note form by default
+
+
+def test_replay_falls_back_to_note_form_for_big_answers_and_a_full_budget(monkeypatch) -> None:
+    fake, _ = _tool_then_answer("x" * (ai_assist.MAX_WIRE_CHARS + 1))
+    monkeypatch.setattr(ai_assist, "_request", fake)
+    msgs = [{"role": "user", "content": "go"}]
+    assert ask("https://api.deepseek.com/v1", KEY, "m", msgs, host=_ReadHost(), web=False).wire == []  # too big
+    monkeypatch.setattr(ai_assist, "MAX_HISTORY_WIRE_CHARS", 30)
+    wire = [{"role": "assistant", "content": "y" * 20}]
+    history = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "y", "wire": list(wire)}]
+    assert ai_assist.keep_wire(history, wire) and "wire" not in history[1]  # over budget: all earlier wires reset
+
+
+def test_bad_request_on_a_replayed_answer_retries_without_its_tool_turns(monkeypatch) -> None:
+    bodies = []
+
+    def fake(url, key, path, body, *a, **k):  # noqa: ANN001, ANN202
+        bodies.append(body["messages"])
+        if any(m.get("role") == "tool" for m in body["messages"]):
+            raise ValueError("bad request")
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(ai_assist, "_request", fake)
+    msgs = [{"role": "user", "content": "a"},
+            {"role": "assistant", "content": None, "reasoning_content": "r", "tool_calls": [{"id": "c"}]},
+            {"role": "tool", "tool_call_id": "c", "content": "out"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "r"}, {"role": "user", "content": "b"}]
+    assert ask("https://api.deepseek.com/v1", KEY, "m", msgs, web=False).text == "ok"
+    assert bodies[-1] == [{"role": "user", "content": "a"}, {"role": "assistant", "content": "answer"},
+                          {"role": "user", "content": "b"}]
