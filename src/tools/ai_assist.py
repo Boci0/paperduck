@@ -1464,8 +1464,15 @@ OUTSIDE_TOOLS = frozenset({"web_search", "fetch_page", "web_fetch", "wait_agents
 _BRANCH_HEAD = BRANCH_NOTE.split("{source}")[0].strip()
 
 
+def _wire_calls(message: dict[str, Any]) -> list[str]:
+    """Tool names a replayed (wire) assistant message called: such a turn has no tools block to match."""
+    return [str((c.get("function") or {}).get("name")) for c in message.get("tool_calls") or [] if isinstance(c, dict)]
+
+
 def read_outside(message: dict[str, Any]) -> bool:
     """An earlier turn that brought outside content into the chat: an outside tool or MCP call, or a branch report."""
+    if any(name in OUTSIDE_TOOLS or MCP_SEP in name for name in _wire_calls(message)):
+        return True
     content = message.get("content")
     if not isinstance(content, str):
         return False
@@ -1492,6 +1499,8 @@ def read_local_data(message: dict[str, Any]) -> bool:
 
     Matches a call line anywhere in the turn: a stray match in output text only blocks more, never less.
     """
+    if any(name in LOCAL_DATA_TOOLS or MCP_SEP in name for name in _wire_calls(message)):
+        return True
     content = message.get("content")
     if message.get("role") == "user" and isinstance(content, str) and content.startswith(ERRAND_MARK):
         return True  # a fired errand hands over output, file names or titles from the PC
