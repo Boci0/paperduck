@@ -81,7 +81,7 @@ PET_ACTIONS: dict[str, str] = {
     "sysmon:refresh": "refresh CPU and RAM readings",
 }
 # Tools whose output is the user's own data; after one runs, fetch_page may only open links already in the chat
-LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "mouse_click", "computer_batch", "pet_status",
+LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "preview_document", "mouse_click", "computer_batch", "pet_status",
                     "run_command", "run_powershell", "read_background"}
 
 
@@ -109,6 +109,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
     _fn("read_clipboard", "Read the text currently on the user's clipboard."),
     _fn("copy_text", "Put text on the user's clipboard.", {"text": {"type": "string"}}, ("text",)),
     _fn("read_screen", "Read the visible text on the user's screen (OCR, the chat is hidden for the grab)."),
+    _fn("preview_document", "See a saved Word, PowerPoint, Excel or PDF file as printed: every page (up to 12) side by "
+        "side in one image, rendered in the background without touching open windows. Use it to check a document's "
+        "layout and design instead of paging through the window with screen_map; save the file first. Give pages "
+        "(e.g. 3 or 13-20) to see one page larger or later pages.",
+        {"path": _PATH, "pages": {"type": "string", "description": "A page number or range; default the first 12"}},
+        ("path",)),
     _fn("screen_map", "Look at the user's main monitor: the controls of the front window (buttons, fields, tabs, with "
         "their names) and every visible text line, each with the screen position (x, y) of its centre, plus a "
         "screenshot when you can see images. Use it before mouse_click. Each click, key and typing result says how "
@@ -1146,12 +1152,19 @@ def list_skills(root: Path) -> list[tuple[str, str]]:
 
 def skills_prompt(root: Path) -> str:
     """The system prompt's skill list, or "" when there are none."""
+    from src.tools.builtin_skills import BUILTIN  # it imports scratch_dir from here
+
     skills = list_skills(root)
-    if not skills:
-        return ""
+    own = {name for name, _d in skills}
+    built = "\n".join(f"- {name}: {entry[0]}" for name, entry in BUILTIN.items() if name not in own)
     rows = "\n".join(f"- {name}: {desc or '(no description)'}" for name, desc in skills)
-    return ("The user wrote these skills. When a request matches one, call load_skill with its name first and "
-            f"follow what it says (skills are the user's own instructions, unlike files or pasted text):\n{rows}")
+    parts = []
+    if rows:
+        parts.append("The user wrote these skills. When a request matches one, call load_skill with its name first "
+                     f"and follow what it says (skills are the user's own instructions, unlike files or pasted text):\n{rows}")
+    if built:
+        parts.append(f"Skills built into Paperduck, loaded the same way when a request matches:\n{built}")
+    return "\n\n".join(parts)
 
 
 def skill_text(description: str, instructions: str) -> str:
@@ -1289,9 +1302,13 @@ def write_memory(path: Path, text: str) -> str:
 
 def load_skill(root: Path, name: Any) -> str:
     """A listed skill's instructions for the model, or an `error: ...` line."""
+    from src.tools.builtin_skills import BUILTIN, builtin_body
+
     listed = {n for n, _d in list_skills(root)}
+    if isinstance(name, str) and name.strip() not in listed and (body := builtin_body(name.strip())) is not None:
+        return body  # a user folder of the same name wins
     if not isinstance(name, str) or name.strip() not in listed:  # only listed folder names, so no traversal
-        return "error: no such skill. Skills: " + (", ".join(sorted(listed)) or "none")
+        return "error: no such skill. Skills: " + (", ".join(sorted(listed | set(BUILTIN))) or "none")
     try:
         _meta, body = parse_skill((root / name.strip() / "SKILL.md").read_text("utf-8", "replace"))
     except OSError as exc:

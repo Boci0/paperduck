@@ -217,8 +217,7 @@ def test_parse_skill_frontmatter() -> None:
 
 def test_skills_list_is_capped_and_lands_in_the_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     root = skills_dir()
-    assert skills_prompt(root) == "" and "load_skill" not in chat_messages([{"role": "user", "content": "hi"}])[0][
-        "content"]
+    assert skills_prompt(root).startswith("Skills built into Paperduck") and "The user wrote" not in skills_prompt(root)
     for i in range(MAX_SKILLS + 5):
         _skill(root, f"s{i:02d}", f"---\ndescription: does {i} " + "x" * 500 + "\n---\nbody")
     (root / "no_md").mkdir()
@@ -237,8 +236,8 @@ def test_load_skill_returns_listed_bodies_only(tmp_path: Path) -> None:
     assert load_skill(root, " tidy ") == "Sort imports."
     assert load_skill(root, "huge").endswith("(skill cut off)") and len(load_skill(root, "huge")) < MAX_SKILL_CHARS + 30
     for bad in ("../secret", "..", str(tmp_path / "secret"), "tidy/../../secret", None, 3):
-        assert load_skill(root, bad).startswith("error: no such skill. Skills: huge, tidy")
-    assert load_skill(tmp_path / "missing", "tidy") == "error: no such skill. Skills: none"
+        assert load_skill(root, bad).startswith("error: no such skill. Skills: excel-sheets, huge, slides, tidy, word-docs")
+    assert load_skill(tmp_path / "missing", "tidy") == "error: no such skill. Skills: excel-sheets, slides, word-docs"
     assert any(s["function"]["name"] == "load_skill" for s in TOOL_SPECS)
 
 

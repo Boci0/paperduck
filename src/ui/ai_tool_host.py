@@ -36,6 +36,7 @@ from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BAT
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
 from src.tools.errands import describe as describe_errand
 from src.tools.clip_vault import clipboard_is_private
+from src.tools.doc_preview import preview_document
 from src.tools.file_forge import scrub_metadata
 from src.tools.macros import parse_recipe
 from src.tools.mcp_client import SEP, McpHub, add_server, env_summary, find_servers, safe_name
@@ -426,6 +427,17 @@ class AiToolHost(QObject):
             return self._computer(name, args)
         if name == "computer_batch":
             return self._batch(args.get("steps"))
+        if name == "preview_document":  # reads a private copy in a hidden Office instance, so it needs no approval
+            try:
+                path = resolve(self._project(), args.get("path"))
+            except (OSError, ValueError):
+                return "error: bad path"
+            text, sheet = preview_document(path, args.get("pages"))
+            if sheet is not None:
+                from src.ui.chat_widgets import image_data_url
+
+                self._shot = image_data_url(sheet)  # sent like screen_map's screenshot (dropped for blind models)
+            return text
         if name == "clean_metadata":  # only blanks metadata in a PDF/PNG/JPEG, so it needs no approval
             try:
                 path = resolve(self._project(), args.get("path"))
