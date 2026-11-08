@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDialog, QGridLayout, QHBoxLayout, QLabe
                              QVBoxLayout, QWidget)
 
 from src.tools.macros import MAX_NAME, MAX_RECIPE, STEPS, describe, parse_recipe
-from src.ui.ai_chat import _BUTTON_CSS, _FIELD_CSS, _Frosted
+from src.ui.chat_widgets import _BUTTON_CSS, _FIELD_CSS, _Frosted
 from src.ui.quick_tools import HOTKEY_LABEL
 from src.ui.theme import ACCENT_HEX, DANGER_HEX, TEXT_DIM_HEX, TEXT_HEX, ui_font
 

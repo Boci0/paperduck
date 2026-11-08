@@ -508,7 +508,7 @@ class AiToolHost(QObject):
             controls = pool.submit(computer.ui_elements, hwnd)
             lines = pool.submit(self._ocr, image, True).result()
             elements = controls.result()
-        from src.ui.ai_chat import MAX_IMAGE_SIDE, image_data_url
+        from src.ui.chat_widgets import MAX_IMAGE_SIDE, image_data_url
 
         side = max(image.width(), image.height())
         self._shot = image_data_url(image)

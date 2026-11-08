@@ -38,7 +38,9 @@ def test_dragging_the_chat_header_moves_it_and_keeps_it_there(
     from src.tools.ai_assist import AiAssistPlugin
     from src.ui.ai_chat import AiChat
 
-    monkeypatch.setattr("src.ui.ai_chat.load_key", lambda _url: "k")
+    for mod in ("ai_chat", "chat_setup"):  # the chat and its Setup page both read the key
+
+        monkeypatch.setattr(f"src.ui.{mod}.load_key", lambda _url: "k")
     monkeypatch.setattr(AiAssistPlugin, "has_key", lambda self: True)
     plugin = AiAssistPlugin()
     plugin.base_url, plugin.model = "https://api.example/v1", "m"

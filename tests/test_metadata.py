@@ -87,7 +87,7 @@ def test_web_drops_forge_outputs_and_ai_images_carry_no_metadata(tagged: list[Pa
         image = QImage(str(src))
         assert image.textKeys()  # Qt does carry the tags in: this is what must not come out
         assert _leaks(save_clean_png(image, tmp_path / "drops", "drop").read_bytes()) == []
-        from src.ui.ai_chat import image_data_url
+        from src.ui.chat_widgets import image_data_url
 
         assert _leaks(base64.b64decode(image_data_url(image).split(",", 1)[1])) == []
         for fmt in ("png", "jpg", "webp", "bmp", "ico"):
