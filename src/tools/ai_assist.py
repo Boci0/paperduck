@@ -1189,8 +1189,9 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + said}
                 if shots and (base_url, model) not in _NO_VISION:
                     messages.append({"role": "user", "content": [
-                        {"type": "text", "text": "Image from that tool (screen_map or preview_document):"},
-                        {"type": "image_url", "image_url": {"url": shots[-1]}}]})
+                        {"type": "text", "text": "Image from that tool (screen_map, preview_document or view_image):"
+                         if len(shots) == 1 else f"The {len(shots)} images from those tools, in call order:"},
+                        *({"type": "image_url", "image_url": {"url": u}} for u in shots)]})
                     shot_at.append(len(messages) - 1)
                     if len(shot_at) > KEEP_SHOTS:  # old ones go in one batch, so the prompt cache holds in between
                         for i in shot_at[:-1]:
@@ -1566,6 +1567,9 @@ def _run_tool_raw(name: str, arguments: Any, host: ToolHost | None = None, seen:
     param = {"web_search": "query", "fetch_page": "url"}.get(name)
     if param is None:
         return f"error: there is no tool named {name}; use one of the tools offered"
+    # the web tools never reach host.run, so a sub-agent's host counts and shows them here (ReadOnlyHost.tick)
+    if (tick := getattr(host, "tick", None)) is not None and (over := tick(name, args)):
+        return over
     value = args.get(param)
     if not isinstance(value, str) or not value.strip():
         return f"error: {name} needs a non-empty '{param}' string"

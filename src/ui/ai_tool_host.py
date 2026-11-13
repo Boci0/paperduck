@@ -41,6 +41,7 @@ from src.tools.file_forge import scrub_metadata
 from src.tools.macros import parse_recipe
 from src.tools.mcp_client import SEP, McpHub, add_server, env_summary, find_servers, safe_name
 from src.tools.watch import MESSAGE_APPS, READERS
+from src.tools.web_drop import load_image_file
 from src.ui.quick_tools import ocr_image_file
 
 GUI_TIMEOUT_S = 15.0
@@ -55,6 +56,7 @@ OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edi
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
 MAX_CLIP_CHARS = 12000
 MAX_SCREEN_CHARS = 8000
+MAX_OCR_SIDE = 4096  # longer sides are scaled down for OCR (Windows OCR refuses very large bitmaps)
 
 
 def _rel_name(path: Path, base: Path) -> str:
@@ -302,7 +304,8 @@ class AiToolHost(QObject):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
             return self.agents.spawn(args.get("task"), args.get("effort"), self._project(), self.cancel,
-                                     args.get("_local") is True)
+                                     args.get("_local") is True, self._shared_images(args.get("share_images") is True),
+                                     self.see_image)
         if name == "wait_agents":
             return self.agents.wait(args.get("timeout_s"), self.cancel)
         if name == "calculate":  # pure arithmetic, nothing to allow
@@ -446,6 +449,9 @@ class AiToolHost(QObject):
                 from src.ui.chat_widgets import image_data_url
 
                 self._shot = image_data_url(sheet)  # sent like screen_map's screenshot (dropped for blind models)
+            return text
+        if name == "view_image":  # a read, so no approval; the picture rides along like screen_map's screenshot
+            text, self._shot = self.see_image(self._project(), args)
             return text
         if name == "clean_metadata":  # only blanks metadata in a PDF/PNG/JPEG, so it needs no approval
             try:
@@ -661,13 +667,21 @@ class AiToolHost(QObject):
 
         QTimer.singleShot(180 if hidden else 0, lambda: threading.Thread(target=work, daemon=True).start())
 
+    def _shared_images(self, share: bool) -> list[str]:
+        """The pictures of the newest user turn that has any (data URLs, at most MAX_ATTACHMENTS), when asked for."""
+        from src.ui.chat_widgets import MAX_ATTACHMENTS
+
+        turns = list(self._win._ai_chat._history) if share else []
+        return next((t["images"][:MAX_ATTACHMENTS] for t in reversed(turns) if t["role"] == "user" and t.get("images")), [])
+
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:
         """A sub-agent's thread: one ask() with the chat's provider and model at the agent's own thinking level."""
         plugin = self._win._ai_chat._plugin
         url, model = plugin.base_url, plugin.model
         where = f"the Project Folder {host.root}" if host.root else f"the home folder {Path.home()}"
         messages = [{"role": "system", "content": AGENT_PROMPT.format(calls=MAX_AGENT_CALLS, where=where, today=date.today())},
-                    {"role": "user", "content": task}]
+                    {"role": "user", "content": [{"type": "text", "text": task}, *(
+                        {"type": "image_url", "image_url": {"url": u}} for u in host.images)] if host.images else task}]
         return ask(url, load_key(url), model, messages, thinking=fit_thinking(url, effort, model), host=host,
                    cancel=cancel).text
 
@@ -723,6 +737,22 @@ class AiToolHost(QObject):
         return self._allowed("link", f"The model wants to {verb} after reading your files, clipboard or screen. "
                              f"Check the address does not carry your data:\n\n{url[:2000]}", "links",
                              "new link after reading your data")
+
+    def see_image(self, root: Path | None, args: dict[str, Any]) -> tuple[str, str]:
+        """view_image for this chat and its sub-agents: (text with size and OCR, data URL for a model that sees)."""
+        from src.ui.chat_widgets import image_data_url
+
+        try:
+            path = resolve(root, args.get("path"))
+            if is_secret(path):
+                return "error: that looks like a secrets file and view_image does not open those", ""
+            image = load_image_file(path)
+        except (OSError, ValueError) as exc:
+            return f"error: {exc}", ""
+        small = image if max(image.width(), image.height()) <= MAX_OCR_SIDE else image.scaled(
+            MAX_OCR_SIDE, MAX_OCR_SIDE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        text = self._ocr(small, empty="no text found in it")
+        return f"{path.name}: {image.width()}x{image.height()} px. Text in it (OCR):\n{text}", image_data_url(image)
 
     def take_image(self) -> str:
         """The screenshot (data URL) of the last screen_map, once: the request loop sends it to a model that sees."""
@@ -830,7 +860,7 @@ class AiToolHost(QObject):
     # ------------------------------------------------------------------ worker-thread OCR
 
     @staticmethod
-    def _ocr(image: QImage, boxes: bool = False) -> str:
+    def _ocr(image: QImage, boxes: bool = False, empty: str = "no text found on screen") -> str:
         tmp = Path(tempfile.mkdtemp(prefix="paperduck_ocr_"))
         png = tmp / "screen.png"
         try:
@@ -842,4 +872,4 @@ class AiToolHost(QObject):
             tmp.rmdir()
         if boxes:
             return text.strip()[:MAX_SCREEN_CHARS * 2]
-        return text.strip()[:MAX_SCREEN_CHARS] or "no text found on screen"
+        return text.strip()[:MAX_SCREEN_CHARS] or empty

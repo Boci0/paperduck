@@ -1485,3 +1485,53 @@ def test_bad_request_on_a_replayed_answer_retries_without_its_tool_turns(monkeyp
     assert ask("https://api.deepseek.com/v1", KEY, "m", msgs, web=False).text == "ok"
     assert bodies[-1] == [{"role": "user", "content": "a"}, {"role": "assistant", "content": "answer"},
                           {"role": "user", "content": "b"}]
+
+
+class _TwoPictureHost:
+    """Two view_image calls in one round, each leaving its own picture on the host."""
+
+    specs = [{"type": "function", "function": {"name": "view_image", "description": "", "parameters": {}}}]
+
+    def __init__(self) -> None:
+        self.shot = ""
+
+    def run(self, name: str, args: dict) -> str:
+        self.shot = f"data:image/png;base64,{args['n']}AAA"
+        return f"image {args['n']}"
+
+    def take_image(self) -> str:
+        shot, self.shot = self.shot, ""
+        return shot
+
+
+def test_two_pictures_from_one_round_both_reach_an_openai_style_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[list[dict]] = []
+
+    def fake(base_url, key, path, body, timeout, progress=None, patient=False):  # noqa: ANN001
+        sent.append([dict(m) for m in body["messages"]])
+        if len(sent) > 1:
+            return {"usage": {"total_tokens": 1}, "choices": [{"message": {"content": "done"}}]}
+        return {"usage": {"total_tokens": 1}, "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{n}", "function": {"name": "view_image", "arguments": json.dumps({"n": n})}} for n in (1, 2)]}}]}
+
+    monkeypatch.setattr(ai_assist, "_request", fake)
+    ask("https://api.example/v1", KEY, "m-two", T, host=_TwoPictureHost(), web=False)
+    follow = sent[1][-1]["content"]
+    assert [p["image_url"]["url"] for p in follow[1:]] == ["data:image/png;base64,1AAA", "data:image/png;base64,2AAA"]
+    assert "2 images" in follow[0]["text"]
+
+
+def test_two_pictures_from_one_round_both_reach_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[list[dict]] = []
+
+    def fake(base_url, key, path, body, timeout, progress=None, patient=False):  # noqa: ANN001
+        sent.append(body["messages"])
+        if len(sent) > 1:
+            return {"usage": {}, "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}
+        return {"usage": {}, "stop_reason": "tool_use", "content": [
+            {"type": "tool_use", "id": f"t{n}", "name": "view_image", "input": {"n": n}} for n in (1, 2)]}
+
+    monkeypatch.setattr(ai_assist, "_request", fake)
+    ask("https://api.anthropic.com/v1", KEY, "claude-sonnet-5-5", T, host=_TwoPictureHost(), web=False)
+    results = sent[1][-1]["content"]
+    assert [r["content"][1]["source"]["data"] for r in results[:2]] == ["1AAA", "2AAA"]

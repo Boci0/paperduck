@@ -82,7 +82,7 @@ PET_ACTIONS: dict[str, str] = {
     "sysmon:refresh": "refresh CPU and RAM readings",
 }
 # Tools whose output is the user's own data; after one runs, fetch_page may only open links already in the chat
-LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "preview_document", "mouse_click", "computer_batch", "pet_status",
+LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "preview_document", "view_image", "mouse_click", "computer_batch", "pet_status",
                     "run_command", "run_powershell", "read_background"}
 
 
@@ -116,6 +116,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "(e.g. 3 or 13-20) to see one page larger or later pages.",
         {"path": _PATH, "pages": {"type": "string", "description": "A page number or range; default the first 12"}},
         ("path",)),
+    _fn("view_image", "Look at an image file (png, jpg, gif, webp, bmp) anywhere on the PC, such as a screenshot or "
+        "photo the user mentions. You see the picture when you can see images; the result also gives its size and the "
+        "text found in it (OCR). Secret-looking files are refused.", {"path": _PATH}, ("path",)),
     _fn("screen_map", "Look at the user's main monitor: the controls of the front window (buttons, fields, tabs, with "
         "their names) and every visible text line, each with the screen position (x, y) of its centre, plus a "
         "screenshot when you can see images. Use it before mouse_click. Each click, key and typing result says how "

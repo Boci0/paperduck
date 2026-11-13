@@ -145,6 +145,20 @@ def decode_image_bytes(data: bytes) -> QImage:
     return image
 
 
+def load_image_file(path: Path) -> QImage:
+    """An image file for a model to look at: size capped, known formats only, decode allocation limited.
+    Raises ValueError with a short reason."""
+    if not path.is_file():
+        raise ValueError("not a file")
+    if path.stat().st_size > MAX_WEB_IMAGE_BYTES:
+        raise ValueError("image larger than 20 MB")
+    with path.open("rb") as fh:
+        data = fh.read(MAX_WEB_IMAGE_BYTES + 1)
+    if sniff_image_format(data[:16]) is None:
+        raise ValueError("not a png, jpg, gif, webp or bmp image")
+    return decode_image_bytes(data)
+
+
 class WebImageJob(QObject):
     """Fetches and sanitizes a dropped web image on a worker thread.
 

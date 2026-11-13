@@ -936,6 +936,10 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     def new_chat(self) -> None:
         """Fresh start: drops a pending reply, the thread, the draft and any attachments."""
         self.stop()
+        if (agents := getattr(self._tool_host, "agents", None)) is not None:
+            agents.stop_all()  # an agent can outlive its answer; its report must not land in the next chat
+        with self._branch_lock:
+            self._branch_q.clear()
         self._sheets.close_all()
         self._sid = None
         self._history.clear()

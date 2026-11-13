@@ -1262,3 +1262,63 @@ def test_a_screen_read_showing_a_browser_arms_the_outside_guard(monkeypatch: pyt
         AiToolHost._grab_screen(host, got.append)
         assert host.outside is armed
     assert got == ["image", "image"]  # the grab still reaches the caller
+
+
+def test_view_image_loads_only_real_images_and_counts_as_local_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt6.QtGui import QColor, QImage
+
+    from src.tools import web_drop
+    from src.tools.ai_tools import APPROVED_TOOLS, LOCAL_DATA_TOOLS
+    from src.ui.ai_tool_host import AiToolHost
+
+    assert "view_image" in LOCAL_DATA_TOOLS and "view_image" not in APPROVED_TOOLS
+    assert any(s["function"]["name"] == "view_image" for s in TOOL_SPECS)
+    img = QImage(40, 20, QImage.Format.Format_RGB32)
+    img.fill(QColor("red"))
+    img.save(str(tmp_path / "a.png"), "PNG")
+    (tmp_path / "notes.png").write_text("not an image", encoding="utf-8")
+    (tmp_path / ".env.png").write_bytes((tmp_path / "a.png").read_bytes())
+    fake = SimpleNamespace(_ocr=lambda image, empty="": f"ocr {image.width()}x{image.height()}")
+    text, shot = AiToolHost.see_image(fake, tmp_path, {"path": "a.png"})
+    assert text == "a.png: 40x20 px. Text in it (OCR):\nocr 40x20" and shot.startswith("data:image/png;base64,")
+    assert AiToolHost.see_image(fake, tmp_path, {"path": "notes.png"})[0].startswith("error: not a png")
+    assert AiToolHost.see_image(fake, tmp_path, {"path": ".env.png"}) == (
+        "error: that looks like a secrets file and view_image does not open those", "")
+    assert AiToolHost.see_image(fake, tmp_path, {"path": "missing.png"})[0] == "error: not a file"
+    assert AiToolHost.see_image(fake, tmp_path, {"path": ""})[1] == ""  # a folder
+    monkeypatch.setattr(web_drop, "MAX_WEB_IMAGE_BYTES", 10)
+    assert AiToolHost.see_image(fake, tmp_path, {"path": "a.png"})[0] == "error: image larger than 20 MB"
+
+
+def test_agent_gets_the_newest_pictures_of_the_chat_only_when_it_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from src.tools.agents import ReadOnlyHost
+    from src.ui import ai_tool_host
+    from src.ui.ai_tool_host import AiToolHost
+
+    urls = [f"data:image/png;base64,AAA{n}" for n in range(6)]
+    chat = SimpleNamespace(_history=[
+        {"role": "user", "content": "old", "images": ["data:image/png;base64,old"]},
+        {"role": "user", "content": "new", "images": urls}, {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "no pictures", "images": []}], _plugin=SimpleNamespace(base_url="u", model="m"))
+    fake = SimpleNamespace(_win=SimpleNamespace(_ai_chat=chat))
+    assert AiToolHost._shared_images(fake, False) == []
+    assert AiToolHost._shared_images(fake, True) == urls[:4]
+    sent = []
+    monkeypatch.setattr(ai_tool_host, "ask", lambda url, key, model, messages, **kw: sent.append(messages) or SimpleNamespace(text="r"))
+    monkeypatch.setattr(ai_tool_host, "load_key", lambda url: "k")
+    monkeypatch.setattr(ai_tool_host, "fit_thinking", lambda url, effort, model: "off")
+    AiToolHost._run_agent(fake, "task", "low", ReadOnlyHost(None, images=urls[:2]), None)
+    AiToolHost._run_agent(fake, "task", "low", ReadOnlyHost(None), None)
+    assert sent[0][1]["content"] == [{"type": "text", "text": "task"},
+                                     *({"type": "image_url", "image_url": {"url": u}} for u in urls[:2])]
+    assert sent[1][1]["content"] == "task"
+    # a request path that takes list content: Claude gets base64 blocks, a blind model the task text alone
+    from src.tools import ai_assist
+    system, turns = ai_assist.claude_messages(sent[0])
+    assert turns[0]["content"][0] == {"type": "text", "text": "task"} and turns[0]["content"][1]["type"] == "image"
+    assert ai_assist._text_only(sent[0])[1]["content"] == "task"
+    assert not ai_assist.read_local_data(sent[0][1])
