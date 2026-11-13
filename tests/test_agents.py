@@ -190,7 +190,7 @@ def test_agent_sheets_deal_like_a_deck_and_move_together() -> None:
         stack.on_event(1, "done", "src/parse.py:12")
         one, two, three = stack.sheets
         assert [w.pos() for w in stack.order] == [slot(0), slot(1), slot(2), slot(3)] and stack.order[0] is card
-        assert one.calls == 1 and one.status == "done" and "src/parse.py:12" in one.log.toPlainText()
+        assert one.calls == 1 and one.status == "done" and "src/parse.py:12" in one.report_text.toPlainText()
         stack.clicked(two)  # the middle sheet: dealt to the front, the rest keep their order behind it
         app.processEvents()
         assert stack.order == [two, card, one, three] and stack.front is two
@@ -227,3 +227,118 @@ def test_screen_tools_leave_out_and_click_through_the_agent_sheets() -> None:
     card._sheets = SimpleNamespace(sheets=[sheet, hidden_sheet])
     pet._ai_chat = card
     assert _ours(pet) == [pet, card, sheet]
+
+
+def test_agent_host_views_images_and_hands_the_picture_over_once(tmp_path: Path) -> None:
+    seen: list[tuple[Path | None, dict]] = []
+
+    def view(root, args):
+        seen.append((root, args))
+        return "a.png: 2x2 px", "data:image/png;base64,AAAA"
+
+    assert "view_image" not in {s["function"]["name"] for s in ReadOnlyHost(tmp_path).specs}
+    assert ReadOnlyHost(tmp_path).run("view_image", {"path": "a.png"}).startswith("error")
+    host = ReadOnlyHost(tmp_path, images=["data:image/png;base64,BBBB"], view=view)
+    assert "view_image" in {s["function"]["name"] for s in host.specs} and host.images == ["data:image/png;base64,BBBB"]
+    assert host.take_image() == ""
+    assert host.run("view_image", {"path": "a.png"}) == "a.png: 2x2 px"
+    assert seen == [(tmp_path, {"path": "a.png"})]
+    assert host.take_image() == "data:image/png;base64,AAAA" and host.take_image() == ""
+
+
+def test_spawn_hands_shared_pictures_and_the_viewer_to_the_agent_host() -> None:
+    got = []
+    agents, _posts = _agents(lambda task, effort, host, cancel: got.append(host) or "ok")
+    view = lambda root, args: ("", "")  # noqa: E731
+    assert agents.spawn("look", "low", None, threading.Event(), False, ["data:image/png;base64,AA"], view).startswith("started")
+    agents.wait(None, threading.Event())
+    for _ in range(200):
+        if got:
+            break
+        time.sleep(0.01)
+    assert got[0].images == ["data:image/png;base64,AA"] and got[0]._view is view
+
+
+def test_spawn_spec_offers_share_images_and_the_prompt_names_view_image() -> None:
+    from src.tools.agents import AGENT_PROMPT, SPAWN_SPEC
+    props = SPAWN_SPEC["function"]["parameters"]["properties"]
+    assert props["share_images"]["type"] == "boolean" and "share_images" not in SPAWN_SPEC["function"]["parameters"]["required"]
+    assert "view_image" in AGENT_PROMPT and "share_images" in SPAWN_SPEC["function"]["description"]
+
+
+def test_web_calls_count_against_the_agent_budget_and_show_on_its_sheet(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools import ai_assist
+    from src.tools.agents import BUDGET_NOTE, MAX_AGENT_CALLS
+
+    monkeypatch.setattr(ai_assist, "web_search", lambda q: f"results for {q}")
+    seen: list[str] = []
+    host = ReadOnlyHost(None, seen.append)
+    outs = [ai_assist._run_tool_raw("web_search", {"query": "ducks"}, host, None) for _ in range(MAX_AGENT_CALLS + 1)]
+    assert outs[0] == outs[MAX_AGENT_CALLS - 1] == "results for ducks" and outs[-1] == BUDGET_NOTE
+    assert len(seen) == host.calls == MAX_AGENT_CALLS + 1 and "ducks" in seen[0]
+
+
+def test_stop_all_ends_running_agents_drops_their_reports_and_restarts_the_count() -> None:
+    def slow(task, effort, host, cancel):
+        if not cancel.wait(5):
+            return "late"
+        raise ValueError("stopped")
+
+    agents, posts = _agents(slow)
+    old = threading.Event()
+    assert agents.spawn("old chat", "low", None, old).startswith("started sub-agent 1")
+    agents.stop_all()
+    assert old.is_set() and not agents.running() and agents.blocked("read_file") is None
+    time.sleep(0.2)
+    assert posts == []  # nothing of the old chat reaches the next one
+    assert agents.spawn("new chat", "low", None, threading.Event()).startswith("started sub-agent 1")
+    agents.stop_all()
+
+
+def test_new_chat_stops_agents_and_empties_the_branch_inbox() -> None:
+    from types import SimpleNamespace
+
+    from PyQt6.QtWidgets import QApplication
+
+    from src.tools import ai_assist
+    from src.ui import ai_chat
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    stopped: list[bool] = []
+    host = SimpleNamespace(specs=[], run=lambda n, a: "", procs=None, agents=SimpleNamespace(stop_all=lambda: stopped.append(True)))
+    chat = ai_chat.AiChat(ai_assist.AiAssistPlugin(), tool_host=host)
+    try:
+        chat.add_branch_note("task: x, report: old", "agent 1")
+        assert chat._branch_q
+        chat.new_chat()
+        assert stopped == [True] and chat._branch_q == []
+    finally:
+        chat.deleteLater()
+
+
+def test_an_edit_refills_the_check_reads_but_only_for_an_answer_with_agents() -> None:
+    from src.tools.agents import MAX_CHECK_CALLS
+
+    agents, _posts = _agents(lambda *_a: "found it")
+    mine, other = threading.Event(), threading.Event()
+    agents.spawn("find the parser", "low", None, mine)
+    agents.wait(5, mine)
+    assert all(agents.blocked("read_file", mine) is None for _ in range(MAX_CHECK_CALLS))
+    assert "check reads" in agents.blocked("read_file", mine)
+    assert agents.blocked("edit_file", mine) is None  # reads after an edit are implementation work
+    assert all(agents.blocked("read_file", mine) is None for _ in range(MAX_CHECK_CALLS))
+    assert "check reads" in agents.blocked("read_file", mine)
+    assert agents.blocked("edit_files", mine) is None and agents.blocked("read_file", mine) is None
+    assert agents.blocked("edit_file", other) is None and other not in agents._checks  # no entry is made
+
+
+def test_a_long_report_keeps_its_head_and_its_tail() -> None:
+    from src.tools.agents import MAX_REPORT_CHARS
+
+    agents, posts = _agents(lambda *_a: "H" * 6000 + "M" * 6000 + "OPEN: the tail")
+    cancel = threading.Event()
+    agents.spawn("t", "low", None, cancel)
+    agents.wait(5, cancel)
+    text = posts[0][1].split("report: ", 1)[1]
+    assert len(text) <= MAX_REPORT_CHARS and text.startswith("H" * 5500) and text.endswith("OPEN: the tail")
+    assert "[...cut...]" in text

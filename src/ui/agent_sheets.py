@@ -7,23 +7,42 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer
-from PyQt6.QtGui import QMouseEvent, QPainter
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer
+from PyQt6.QtGui import QColor, QMouseEvent, QPainter
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget
 
-from src.ui.theme import (ACCENT_HEX, DANGER_HEX, FONT_FAMILY, GLASS_RGBA, SHADOW, TEXT_DIM_HEX, TEXT_HEX,
-                          paint_panel, qcolor)
+from src.ui.chat_widgets import ChatText, _Separator, _ThinkingDots
+from src.ui.theme import (ACCENT_HEX, DANGER_HEX, FONT_FAMILY, GLASS_RAISED_RGBA, GLASS_RGBA, SHADOW, TEXT_DIM_HEX,
+                          TEXT_HEX, paint_panel, qcolor, rgba_css, ui_font)
 
 PEEK = 28  # px of each sheet's header strip showing above the sheet in front of it
 STEP_X = 10  # each sheet further back sits this much to the right
 MAX_LOG_LINES = 400
 CLICK_SLOP = 4  # px a press may move and still count as a click (front / back), not a drag
+LOG_DONE_H = 76  # px the tool log shrinks to once the report is in
 FRONT_MIN_H = 360  # a sheet in front grows to at least this tall, so its log is readable over a short card
 
 
+class _Marker(QWidget):
+    """The 6px round status marker of the chat card's rows; stands in for the thinking dots once an agent stops."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.color = QColor(TEXT_DIM_HEX)
+        self.setFixedSize(26, 16)  # the size of _ThinkingDots, which it replaces
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.color)
+        painter.drawEllipse(QPointF(7, 8), 3, 3)
+        painter.end()
+
+
 class AgentSheet(QWidget):
-    """One sub-agent's live view: title (number, effort, status, calls, time), its task, then each tool call and the
-    report."""
+    """One sub-agent's live view: a header strip (status marker, number, status, effort, calls, time), its task, a
+    compact tool log, then the report. The strip alone says running, done or failed when the sheet is at the back."""
 
     def __init__(self, stack: AgentSheets, n: int, effort: str, task: str) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
@@ -37,8 +56,13 @@ class AgentSheet(QWidget):
         self._moved = False
         box = QVBoxLayout(self)
         box.setContentsMargins(14, 8, 14 + SHADOW, 12 + SHADOW)
-        box.setSpacing(4)
+        box.setSpacing(6)
         top = QHBoxLayout()
+        top.setSpacing(2)
+        self.dots = _ThinkingDots()  # while it runs; a still marker once it has stopped
+        self.marker = _Marker()
+        top.addWidget(self.dots)
+        top.addWidget(self.marker)
         self.title = QLabel()
         self.title.setTextFormat(Qt.TextFormat.RichText)
         self.title.setStyleSheet(f"color: {TEXT_HEX}; font-family: '{FONT_FAMILY}'; font-size: 9.5pt;")
@@ -55,14 +79,39 @@ class AgentSheet(QWidget):
         self.task.setWordWrap(True)
         self.task.setStyleSheet(f"color: {TEXT_DIM_HEX}; font-family: '{FONT_FAMILY}'; font-size: 8.5pt;")
         box.addWidget(self.task)
-        self.log = QPlainTextEdit()
+        box.addWidget(_Separator())
+        self.log = QPlainTextEdit()  # a raised Consolas panel in dim ink, so the calls never outweigh the report
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(MAX_LOG_LINES)
         self.log.setFrameShape(QPlainTextEdit.Shape.NoFrame)
-        self.log.setStyleSheet(f"QPlainTextEdit {{ background: transparent; color: {TEXT_HEX}; "
-                               f"font-family: '{FONT_FAMILY}'; font-size: 8.5pt; }}")
+        self.log.setPlaceholderText("Waiting for its first tool call")
+        self.log.setStyleSheet(f"QPlainTextEdit {{ background: {rgba_css(GLASS_RAISED_RGBA)}; color: {TEXT_DIM_HEX}; "
+                               f"border-radius: 6px; padding: 2px 4px; font-family: 'Cascadia Mono', Consolas; "
+                               f"font-size: 8pt; }}")
         box.addWidget(self.log, 1)
+        self.report_head = QLabel()
+        self.report_head.setFont(ui_font(8))
+        self.report_head.setStyleSheet(f"color: {TEXT_DIM_HEX};")
+        self.report = QScrollArea()  # the final report, rendered like a chat reply
+        self.report.setWidgetResizable(True)
+        self.report.setFrameShape(QFrame.Shape.NoFrame)
+        self.report.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.report.setStyleSheet("QScrollArea { background: transparent; }")
+        self.report.viewport().setAutoFillBackground(False)
+        self.report_text: ChatText | None = None
+        box.addWidget(self.report_head)
+        box.addWidget(self.report, 1)
+        self.report_head.hide()
+        self.report.hide()
+        self._wave = QTimer(self)  # the thinking dots' beat, only while running
+        self._wave.setInterval(60)
+        self._wave.timeout.connect(self._beat)
+        self._wave.start()
         self.refresh()
+
+    def _beat(self) -> None:
+        self.dots.phase += 0.06
+        self.dots.update()
 
     def add(self, kind: str, text: str) -> None:
         if kind == "tool":
@@ -70,19 +119,34 @@ class AgentSheet(QWidget):
             self.log.appendPlainText(f"- {text}")
         else:
             self.status, self.ended = kind, time.monotonic()
-            self.log.appendPlainText(f"\n{'Report' if kind == 'done' else 'Failed'}:\n{text}")
+            failed = kind == "failed"
+            self.report_text = ChatText(text, markdown=not failed, color=DANGER_HEX if failed else TEXT_HEX, pt=9.5)
+            self.report.setWidget(self.report_text)
+            self.report_head.setText("Failed" if failed else "Report")
+            self.report_head.show()
+            self.report.show()
+            self.log.setMaximumHeight(LOG_DONE_H)  # the report takes the room; the log keeps its newest lines
+            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+            self._wave.stop()
         self.refresh()
 
     def refresh(self) -> None:
         seconds = int((self.ended or time.monotonic()) - self.started)
         color = {"running": ACCENT_HEX, "failed": DANGER_HEX}.get(self.status, TEXT_DIM_HEX)
-        self.title.setText(f"<b>Agent {self.n}</b> &nbsp;<span style='color:{TEXT_DIM_HEX}'>{self.effort} effort"
-                           f"</span> &nbsp;<span style='color:{color}'>{self.status}</span> &nbsp;<span style='color:"
-                           f"{TEXT_DIM_HEX}'>{self.calls} calls, {seconds} s</span>")
+        running = self.status == "running"
+        self.dots.setVisible(running)
+        self.marker.setVisible(not running)
+        self.marker.color = QColor(color)
+        self.marker.update()
+        self.title.setText(f"<b>Agent {self.n}</b> &nbsp;<span style='color:{color}'>{self.status}</span> &nbsp;"
+                           f"<span style='color:{TEXT_DIM_HEX}'>{self.effort} effort, {self.calls} calls, "
+                           f"{seconds} s</span>")
+        self.update()
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
-        paint_panel(painter, self.rect(), qcolor(GLASS_RGBA), shadow=SHADOW)
+        failed = self.status == "failed"  # a vermilion edge, like the chat card's error rows: visible on the strip
+        paint_panel(painter, self.rect(), qcolor(GLASS_RGBA), QColor(DANGER_HEX) if failed else None, shadow=SHADOW)
         painter.end()
 
     def mousePressEvent(self, event: QMouseEvent | None) -> None:

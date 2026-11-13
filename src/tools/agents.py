@@ -16,21 +16,27 @@ from typing import Any
 from src.tools.ai_assist import THINKING_LEVELS, tool_note
 from src.tools.ai_tools import FILE_TOOLS, TOOL_SPECS, _fn, calculate, run_file_tool
 
+# (root, {"path": ...}) -> (text for the model, picture data URL or ""); the UI host supplies it (see AiToolHost.see_image)
+ImageViewer = Callable[[Path | None, dict[str, Any]], tuple[str, str]]
+
 MAX_RUNNING = 4
 MAX_TASK_CHARS = 4000
 MAX_REPORT_CHARS = 8000
+REPORT_HEAD, REPORT_TAIL = 5500, 2400  # a cut report keeps both ends; with the marker it stays within MAX_REPORT_CHARS
 MAX_WAIT_S = 600.0
 MAX_AGENT_CALLS = 20  # tool calls per sub-agent (live: open questions use them all); after that each says "report now"
-READ_TOOLS = FILE_TOOLS | {"calculate"}
+READ_TOOLS = FILE_TOOLS | {"calculate"}  # plus view_image when the host can show pictures (ReadOnlyHost)
 # What the main answer may not do while its agents research: live, it redid their reading instead of waiting
 RESEARCH_TOOLS = FILE_TOOLS | {"web_search", "fetch_page", "run_command", "run_powershell"}
 # After its agents report, an answer gets this many reads to check them (live it re-read everything: 25 calls)
 MAX_CHECK_CALLS = 8
+EDIT_TOOLS = {"edit_file", "edit_files"}  # running one refills the check reads
 CHECK_TOOLS = FILE_TOOLS | {"web_search", "fetch_page"}  # commands stay free, so tests after an edit still run
 AGENT_PROMPT = (
     "You are a sub-agent of Paperduck's chat assistant. You get one focused task, and your final answer is a report "
     "read by the main assistant, not by the user. Tools: read-only files (list_files, find_files, search_text, "
-    "read_file), calculate, and the web. You cannot edit, run commands or ask anyone, so never ask a question: "
+    "read_file), calculate, view_image (an image file on disk; you see it when your model can) and the web. Pictures "
+    "the user attached may come inside your task message, with their text: use those, they are not files.You cannot edit, run commands or ask anyone, so never ask a question: "
     "decide and go. Look before concluding; call independent searches together, they run at the same time. Report "
     "the findings first, with exact file paths and line numbers, names, numbers and URLs, then anything you could "
     "not settle. Keep the report short: facts, not narration. Work fast: most tasks need 3 to 10 tool calls, so "
@@ -46,13 +52,17 @@ SPAWN_SPEC = _fn(
     "round, or call wait_agents to wait for it. Use it unasked: a request with two or more independent parts gets "
     "one agent per part, all started in the same turn. It works in the "
     "same Project Folder as you (relative paths work), but does not see this chat, so put everything else it "
-    "needs in the task.",
+    "needs in the task. It can look at image files with view_image; set share_images when it must see the pictures "
+    "the user attached to this chat (up to 4, from the newest message that has any): they arrive in its message "
+    "with their OCR text, so do not tell it to open them.",
     {"task": {"type": "string", "description": "The whole task: what to find, where to look, what the report must hold"},
      "effort": {"type": "string", "enum": list(THINKING_LEVELS),
                 "description": "The agent's thinking level for its whole run; pick the lowest that fits the task. off "
                                "or low (default): finding and reading code or pages, fast and cheap; medium or high: "
                                "analysis that needs reasoning (tracing a bug, comparing designs); max: only the "
-                               "hardest problems"}}, ("task",))
+                               "hardest problems"},
+     "share_images": {"type": "boolean", "description": "true: the agent's first message carries the pictures the "
+                      "user attached to this chat, so it can see them. Default false"}}, ("task",))
 WAIT_SPEC = _fn(
     "wait_agents", f"Wait until your running sub-agents finish (at most {MAX_WAIT_S:g} s); their reports arrive "
     "with this tool's result.", {"timeout_s": {"type": "number", "description": f"Most seconds to wait, default {MAX_WAIT_S:g}"}})
@@ -67,24 +77,40 @@ class ReadOnlyHost:
     its own results. An agent spawned before any local read browses freely, as before."""
 
     def __init__(self, root: Path | None, on_call: Callable[[str], None] | None = None,
-                 local_data: bool = False) -> None:
+                 local_data: bool = False, images: list[str] | None = None, view: ImageViewer | None = None) -> None:
         self.root = root
         self.local_data = local_data
-        self.specs = [s for s in TOOL_SPECS if s["function"]["name"] in READ_TOOLS]
+        self.images = images or []  # data URLs shared from the chat: the agent's first message carries them
+        self._view = view
+        self._shot = ""
+        self.specs = [s for s in TOOL_SPECS if s["function"]["name"] in READ_TOOLS | ({"view_image"} if view else set())]
         self.calls = 0
         self._on_call = on_call
 
-    def run(self, name: str, args: dict[str, Any]) -> str:
+    def tick(self, name: str, args: dict[str, Any]) -> str:
+        """Counts one tool call and shows it on the sheet; BUDGET_NOTE once the agent's calls are used up, else ''.
+        ask() calls it for web_search and fetch_page, which never reach run()."""
         self.calls += 1
         if self._on_call is not None:
             self._on_call(tool_note(name, args))
-        if self.calls > MAX_AGENT_CALLS:
-            return BUDGET_NOTE
+        return BUDGET_NOTE if self.calls > MAX_AGENT_CALLS else ""
+
+    def run(self, name: str, args: dict[str, Any]) -> str:
+        if over := self.tick(name, args):
+            return over
         if name == "calculate":
             return calculate(args.get("expression"))
         if name in FILE_TOOLS:
             return run_file_tool(self.root, name, args)
+        if name == "view_image" and self._view is not None:
+            text, self._shot = self._view(self.root, args)
+            return text
         return f"error: {name} is not available to a sub-agent"
+
+    def take_image(self) -> str:
+        """The picture view_image left, once: the request loop sends it to a model that sees."""
+        shot, self._shot = self._shot, ""
+        return shot
 
 
 @dataclass
@@ -92,7 +118,9 @@ class Agent:
     n: int
     task: str
     effort: str
+    cancel: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
+    dropped: bool = False  # its chat was closed (stop_all): the report is thrown away
 
 
 class Agents:
@@ -115,7 +143,13 @@ class Agents:
 
     def blocked(self, name: str, cancel: threading.Event | None = None) -> str | None:
         """The refusal for a research tool the main answer (`cancel` is its own) calls while sub-agents still run,
-        or past its MAX_CHECK_CALLS reads after its agents reported; else None. A new spawn_agent resets the reads."""
+        or past its MAX_CHECK_CALLS reads after its agents reported; else None. A new spawn_agent or an edit resets
+        the reads (reads after an edit are implementation work, not re-research)."""
+        if name in EDIT_TOOLS and cancel is not None:
+            with self._lock:
+                if cancel in self._checks:
+                    self._checks[cancel] = MAX_CHECK_CALLS
+            return None
         if name not in RESEARCH_TOOLS:
             return None
         left = self.running()
@@ -136,7 +170,8 @@ class Agents:
             self._checks[cancel] = reads - 1
         return None
 
-    def spawn(self, task: Any, effort: Any, root: Path | None, cancel: threading.Event, local_data: bool = False) -> str:
+    def spawn(self, task: Any, effort: Any, root: Path | None, cancel: threading.Event, local_data: bool = False,
+              images: list[str] | None = None, view: ImageViewer | None = None) -> str:
         """Starts one agent; `cancel` is the answer's own, so Stop on that answer stops its agents too."""
         if not isinstance(task, str) or not task.strip():
             return "error: give the sub-agent a task"
@@ -144,11 +179,11 @@ class Agents:
         with self._lock:
             if sum(not a.done.is_set() for a in self._all) >= MAX_RUNNING:
                 return f"error: {MAX_RUNNING} sub-agents are already running; wait_agents for them first"
-            agent = Agent(len(self._all) + 1, task.strip()[:MAX_TASK_CHARS], level)
+            agent = Agent(len(self._all) + 1, task.strip()[:MAX_TASK_CHARS], level, cancel)
             self._all.append(agent)
             self._checks[cancel] = MAX_CHECK_CALLS
         self._notify(agent.n, "start", f"{level}\n{agent.task}")
-        host = ReadOnlyHost(root, lambda note: self._notify(agent.n, "tool", note), local_data)
+        host = ReadOnlyHost(root, lambda note: self._notify(agent.n, "tool", note), local_data, images, view)
         threading.Thread(target=self._work, args=(agent, host, cancel), daemon=True).start()
         return (f"started sub-agent {agent.n} ({level} effort). Its report arrives as a background branch note "
                 f"'agent {agent.n}'. Do not research this part yourself: once all agents are started, call "
@@ -163,11 +198,24 @@ class Agents:
         except Exception as exc:  # a bug must not leave wait_agents hanging on this agent
             kind, report = "failed", f"(failed: {type(exc).__name__})"
         try:
+            if agent.dropped:  # New chat: nothing of the old chat may reach the new one's inbox or sheets
+                return
             self._notify(agent.n, kind, report)
-            cut = " [cut]" if len(report) > MAX_REPORT_CHARS else ""
-            self._post(f"task: {agent.task[:200]}\nreport: {report[:MAX_REPORT_CHARS]}{cut}", f"agent {agent.n}")
+            if len(report) > MAX_REPORT_CHARS:  # the tail holds what the agent could not settle (AGENT_PROMPT): keep it
+                report = report[:REPORT_HEAD] + "\n[...cut...]\n" + report[-REPORT_TAIL:]
+            self._post(f"task: {agent.task[:200]}\nreport: {report}", f"agent {agent.n}")
         finally:
             agent.done.set()  # after the post, so a waiter's next tool round already holds the report; even if it raised
+
+    def stop_all(self) -> None:
+        """New chat: stops every running agent, drops its report and forgets them all, so the next chat starts at
+        agent 1 with nothing running. An agent may outlive its answer, whose Stop no longer reaches it."""
+        with self._lock:
+            for agent in self._all:
+                if not agent.done.is_set():
+                    agent.dropped = True
+                    agent.cancel.set()
+            self._all = []
 
     def wait(self, timeout_s: Any, cancel: threading.Event) -> str:
         try:

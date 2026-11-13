@@ -37,6 +37,8 @@ import threading
 import time
 import unicodedata
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,7 +84,7 @@ PET_ACTIONS: dict[str, str] = {
     "sysmon:refresh": "refresh CPU and RAM readings",
 }
 # Tools whose output is the user's own data; after one runs, fetch_page may only open links already in the chat
-LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "preview_document", "mouse_click", "computer_batch", "pet_status",
+LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "preview_document", "view_image", "mouse_click", "computer_batch", "pet_status",
                     "run_command", "run_powershell", "read_background"}
 
 
@@ -95,7 +97,7 @@ _PATH = {"type": "string", "description": "Any absolute path on the PC, or a pat
          "(the home folder when none is set); empty for that folder itself. ~ is the home folder."}
 TOOL_SPECS: list[dict[str, Any]] = [
     _fn("list_files", "List a folder anywhere on the user's PC (folders end with /).", {"path": _PATH}),
-    _fn("read_file", "Read a text file anywhere on the PC, with line numbers. Secret-looking files (.env, keys) "
+    _fn("read_file", "Read a text file anywhere on the PC, with line numbers (also Word, PowerPoint and Excel files, as text). Secret-looking files (.env, keys) "
         "ask the user first.",
         {"path": _PATH, "start_line": {"type": "integer", "description": "First line to show, default 1"}}, ("path",)),
     _fn("find_files", "Find files by name pattern, e.g. *.py or *config*, or by path pattern with a /, e.g. "
@@ -116,6 +118,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "(e.g. 3 or 13-20) to see one page larger or later pages.",
         {"path": _PATH, "pages": {"type": "string", "description": "A page number or range; default the first 12"}},
         ("path",)),
+    _fn("view_image", "Look at an image file (png, jpg, gif, webp, bmp) anywhere on the PC, such as a screenshot or "
+        "photo the user mentions. You see the picture when you can see images; the result also gives its size and the "
+        "text found in it (OCR). Secret-looking files are refused.", {"path": _PATH}, ("path",)),
     _fn("screen_map", "Look at the user's main monitor: the controls of the front window (buttons, fields, tabs, with "
         "their names) and every visible text line, each with the screen position (x, y) of its centre, plus a "
         "screenshot when you can see images. Use it before mouse_click. Each click, key and typing result says how "
@@ -366,6 +371,84 @@ def _text(path: Path) -> str | None:
     return None if b"\0" in raw[:8192] else raw.decode("utf-8", "replace")
 
 
+OFFICE_EXTS = (".docx", ".pptx", ".xlsx")
+MAX_OFFICE_PARTS = 400  # XML parts read from one Office zip
+_W, _A, _S = ("{http://schemas.openxmlformats.org/%s/2006/main}" % n for n in ("wordprocessingml", "drawingml", "spreadsheetml"))
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _col(ref: str) -> int:
+    n = 0
+    for ch in ref.rstrip("0123456789"):
+        n = n * 26 + ord(ch.upper()) - 64
+    return n
+
+
+def _office_text(path: Path) -> str:
+    """Text of a .docx/.pptx/.xlsx using only zipfile and ElementTree; ValueError/BadZipFile/ParseError on bad input.
+    Nothing is extracted to disk. ElementTree's expat never fetches external entities, and a DOCTYPE/ENTITY part is
+    refused outright so entity expansion bombs cannot run. Reads are capped by total uncompressed bytes and part count."""
+    budget, parts = [MAX_READ_BYTES], [0]
+    with zipfile.ZipFile(path) as zf:
+        def xml(name: str) -> ET.Element:
+            parts[0] += 1
+            if parts[0] > MAX_OFFICE_PARTS:
+                raise ValueError(f"more than {MAX_OFFICE_PARTS} parts read")
+            with zf.open(name) as f:
+                data = f.read(budget[0] + 1)  # bounded: a lying header cannot make this read more
+            budget[0] -= len(data)
+            if budget[0] < 0:
+                raise ValueError("expands to more than 32 MB")
+            if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
+                raise ValueError(f"{name} has a DOCTYPE or entities")
+            return ET.fromstring(data)
+
+        def paras(root: ET.Element, p: str, t: str) -> list[str]:
+            return ["".join(x.text or "" for x in para.iter(t)) for para in root.iter(p)]
+
+        kind, names = path.suffix.lower(), zf.namelist()
+        if kind == ".docx":
+            return "\n".join(paras(xml("word/document.xml"), _W + "p", _W + "t"))
+        if kind == ".pptx":
+            slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                            key=lambda n: int(re.findall(r"\d+", n)[0]))  # file number, not presentation.xml order
+            return "\n".join(f"Slide {i}\n" + "\n".join(paras(xml(n), _A + "p", _A + "t"))
+                             for i, n in enumerate(slides, 1))
+        shared = [("".join(t.text or "" for t in si.iter(_S + "t")))
+                  for si in xml("xl/sharedStrings.xml").iter(_S + "si")] if "xl/sharedStrings.xml" in names else []
+        rels = {r.get("Id"): r.get("Target", "") for r in xml("xl/_rels/workbook.xml.rels")}
+        out = []
+        for sheet in xml("xl/workbook.xml").iter(_S + "sheet"):
+            target = rels.get(sheet.get(_R + "id"), "").lstrip("/")
+            member = target if target.startswith("xl/") else "xl/" + target
+            if member not in names:
+                continue
+            out.append(f"Sheet: {sheet.get('name')}")
+            for row in xml(member).iter(_S + "row"):
+                cells: list[str] = []
+                for c in row.iter(_S + "c"):
+                    v = c.find(_S + "v")
+                    if c.get("t") == "inlineStr":
+                        val = "".join(t.text or "" for t in c.iter(_S + "t"))
+                    elif v is None or v.text is None:
+                        val = ""
+                    elif c.get("t") == "s":
+                        val = shared[int(v.text)] if v.text.isdigit() and int(v.text) < len(shared) else ""
+                    else:
+                        val = v.text
+                    at = min(_col(c.get("r") or "") or len(cells) + 1, 16384)  # Excel's last column: a forged ref pads no further
+                    cells += [""] * (at - 1 - len(cells)) + [val.replace("\t", " ").replace("\n", " ")]
+                out.append("\t".join(cells))
+                budget[0] -= len(out[-1])  # padding counts too: a far-right cell in every row is a bomb of tabs
+                if budget[0] < 0:
+                    raise ValueError("expands to more than 32 MB")
+        return "\n".join(out)
+
+
+_BINARY_HINT = {".pdf": "preview_document", **dict.fromkeys((".doc", ".ppt", ".xls"), "preview_document"),
+                **dict.fromkeys((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"), "view_image")}
+
+
 def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: bool = False) -> str:
     """One file tool's output for the model; every failure is a short `error: ...` line, never raised.
     `secrets` True: the user allowed reading a secret-looking file."""
@@ -388,9 +471,15 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
                 return "error: not a file"
             if is_secret(path) and not secrets:
                 return "error: that looks like a secrets file and the user did not allow reading it"
-            text = _text(path)
+            if path.stat().st_size > MAX_READ_BYTES:
+                return "error: larger than 32 MB"
+            try:
+                text = _office_text(path) if path.suffix.lower() in OFFICE_EXTS else _text(path)
+            except (zipfile.BadZipFile, ET.ParseError, ValueError, KeyError) as exc:
+                return f"error: could not read this {path.suffix.lower()[1:]} file ({exc})"
             if text is None:
-                return "error: binary or larger than 32 MB"
+                use = _BINARY_HINT.get(path.suffix.lower())
+                return "error: binary file" + (f"; use {use} instead" if use else "")
             start = args.get("start_line")
             start = start if isinstance(start, int) and start > 0 else 1
             out, size = [], 0
@@ -770,6 +859,21 @@ def powershell_file(script: Any) -> tuple[Path, str]:
     path = scratch_dir() / f"ps_{uuid.uuid4().hex[:10]}.ps1"
     path.write_text("\r\n".join(script.splitlines()) + "\r\n", encoding="utf-8-sig", newline="")
     return path, f'powershell -NoProfile -ExecutionPolicy Bypass -File "{path}"'
+
+
+def powershell_error_note(out: str, script: str, file_name: str) -> str:
+    """A `[Paperduck: ...]` note quoting the script lines that PowerShell's `<file>:<line> char:<col>` errors point at
+    (first 3 distinct), or "". powershell_file adds no prologue and the BOM is not a line, so line N is splitlines()[N-1]."""
+    lines = script.splitlines()
+    found: list[int] = []
+    for m in re.finditer(re.escape(file_name) + r":(\d+) char:\d+", out):
+        n = int(m.group(1))
+        if 1 <= n <= len(lines) and n not in found:
+            found.append(n)
+    if not found:
+        return ""
+    quoted = "; ".join(f"line {n}: {lines[n - 1].strip()[:200]}" for n in found[:3])
+    return f"\n[Paperduck: the script failed at {quoted}. Fix that line and re-run; do not rewrite the whole script.]"
 
 
 def command_timeout(value: Any) -> float:

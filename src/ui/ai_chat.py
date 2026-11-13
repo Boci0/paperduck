@@ -400,11 +400,14 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._draft.clear()
         self._add_bubble("user", text, attachments=usable)
         self._clear_attachments()
-        self._ask(content, [a.image_url for a in usable if a.image_url])
+        self._ask(content, [a.image_url for a in usable if a.image_url],
+                  [a.as_prompt() for a in usable if a.image_url])
 
-    def _ask(self, content: str, images: list[str] | None = None) -> None:
-        """Start an answer to `content`, whose bubble is already in the thread."""
-        self._history.append({"role": "user", "content": content, "images": images or []})
+    def _ask(self, content: str, images: list[str] | None = None, image_notes: list[str] | None = None) -> None:
+        """Start an answer to `content`, whose bubble is already in the thread. `image_notes` (each image's name and
+        OCR text, already part of `content`) are kept apart so spawn_agent can share them with the pictures."""
+        self._history.append({"role": "user", "content": content, "images": images or [],
+                              **({"image_notes": image_notes} if image_notes else {})})
         self._thinking_label = self._status_line
         self._think_dots.phase = 0.0
         self._status_row.show()
@@ -936,6 +939,10 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     def new_chat(self) -> None:
         """Fresh start: drops a pending reply, the thread, the draft and any attachments."""
         self.stop()
+        if (agents := getattr(self._tool_host, "agents", None)) is not None:
+            agents.stop_all()  # an agent can outlive its answer; its report must not land in the next chat
+        with self._branch_lock:
+            self._branch_q.clear()
         self._sheets.close_all()
         self._sid = None
         self._history.clear()
