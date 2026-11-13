@@ -259,6 +259,23 @@ def test_spawn_hands_shared_pictures_and_the_viewer_to_the_agent_host() -> None:
     assert got[0].images == ["data:image/png;base64,AA"] and got[0]._view is view
 
 
+def test_agent_host_auto_mode_allows_secrets_and_new_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools import ai_assist
+
+    (tmp_path / ".env").write_text("TOKEN=abc", encoding="utf-8")
+    monkeypatch.setattr(ai_assist, "fetch_page", lambda url: f"fetched {url}")
+
+    safe = ReadOnlyHost(tmp_path, local_data=True)
+    assert "secrets file" in safe.run("read_file", {"path": ".env"})
+    assert "only opens links already" in ai_assist._run_tool_raw(
+        "fetch_page", {"url": "https://docs.example/new"}, safe, seen="local data")
+
+    auto_host = ReadOnlyHost(tmp_path, local_data=True, auto=True)
+    assert "TOKEN=abc" in auto_host.run("read_file", {"path": ".env"})
+    assert ai_assist._run_tool_raw(
+        "fetch_page", {"url": "https://docs.example/new"}, auto_host, seen="local data") == "fetched https://docs.example/new"
+
+
 def test_spawn_spec_offers_share_images_and_the_prompt_names_view_image() -> None:
     from src.tools.agents import AGENT_PROMPT, SPAWN_SPEC
     props = SPAWN_SPEC["function"]["parameters"]["properties"]

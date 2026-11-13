@@ -108,10 +108,7 @@ from src.ui.theme import (
     ui_font,
 )
 
-# Auto mode answers these approvals itself, unless the action looks destructive (`danger`) or the chat read web,
-# MCP or agent content (`untrusted`). Secrets, links, mouse control, MCP calls, installs, skills and errands
-# always ask: they leak data, act on the desktop or other services, or persist past this chat.
-AUTO_KEYS = frozenset({"edit_file", "run_command", "start_background", "memory"})
+# Auto mode (`self._plugin.auto`) answers all approval prompts itself, logging an "Auto-approved" card.
 
 class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     """The chat bar. `thinking_changed` lets the pet animate while a reply is pending."""
@@ -798,6 +795,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         this chat and Deny; without, Allow (for this chat) and Deny. A `danger` (what looks destructive) is never
         remembered and always asks: a red card with Allow once and Deny only. `untrusted` (the chat read web, MCP or
         agent content, which could have steered the model) asks even when allowed for this chat: Allow once and Deny.
+        When auto mode is on, every confirmation approves and logs itself immediately without prompting.
         """
         if key in self._allowed and not danger and not untrusted:
             done(True)
@@ -815,8 +813,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             code.document().setDocumentMargin(6)
             code.setStyleSheet(f"QTextBrowser {{ background: {rgba_css(GLASS_RAISED_RGBA)}; color: {TEXT_HEX}; }}")
             card.body.addWidget(code)
-        if self._plugin.auto and key in AUTO_KEYS and not danger and not untrusted:
-            card.set_header(f"Auto-approved  -  {what}", TEXT_DIM_HEX)  # still shown, so the user sees what ran
+        if self._plugin.auto:
+            note = f" ({danger[:30]})" if danger else ""
+            card.set_header(f"Auto-approved  -  {what}{note}", DANGER_HEX if danger else TEXT_DIM_HEX)
             self._append(card)
             done(True)
             return

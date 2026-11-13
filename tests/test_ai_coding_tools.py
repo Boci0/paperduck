@@ -160,9 +160,8 @@ def test_edits_outside_the_project_folder_ask_under_their_own_key(repo: Path, tm
     skill.parent.mkdir(parents=True, exist_ok=True)
     _run_on_thread(app, work)
     assert keys == ["edit_file", "edit_outside", "edit_outside", "edit_outside"]  # one file outside: the whole batch
-    from src.ui.ai_chat import AUTO_KEYS
     from src.ui.ai_tool_host import OUTSIDE_GUARDED
-    assert "edit_outside" not in AUTO_KEYS and "edit_outside" in OUTSIDE_GUARDED
+    assert "edit_outside" in OUTSIDE_GUARDED
 
 
 def _py(code: str) -> str:

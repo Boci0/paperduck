@@ -77,11 +77,15 @@ class ReadOnlyHost:
     its own results. An agent spawned before any local read browses freely, as before."""
 
     def __init__(self, root: Path | None, on_call: Callable[[str], None] | None = None,
-                 local_data: bool = False, images: list[str] | None = None, view: ImageViewer | None = None) -> None:
+                 local_data: bool = False, images: list[str] | None = None, view: ImageViewer | None = None,
+                 auto: bool = False) -> None:
         self.root = root
         self.local_data = local_data
         self.images = images or []  # data URLs shared from the chat: the agent's first message carries them
         self._view = view
+        self._auto = auto
+        if auto:
+            self.allow_link = lambda _name, _url: True
         self._shot = ""
         self.specs = [s for s in TOOL_SPECS if s["function"]["name"] in READ_TOOLS | ({"view_image"} if view else set())]
         self.calls = 0
@@ -101,7 +105,7 @@ class ReadOnlyHost:
         if name == "calculate":
             return calculate(args.get("expression"))
         if name in FILE_TOOLS:
-            return run_file_tool(self.root, name, args)
+            return run_file_tool(self.root, name, args, secrets=self._auto)
         if name == "view_image" and self._view is not None:
             text, self._shot = self._view(self.root, args)
             return text
@@ -171,7 +175,7 @@ class Agents:
         return None
 
     def spawn(self, task: Any, effort: Any, root: Path | None, cancel: threading.Event, local_data: bool = False,
-              images: list[str] | None = None, view: ImageViewer | None = None) -> str:
+              images: list[str] | None = None, view: ImageViewer | None = None, auto: bool = False) -> str:
         """Starts one agent; `cancel` is the answer's own, so Stop on that answer stops its agents too."""
         if not isinstance(task, str) or not task.strip():
             return "error: give the sub-agent a task"
@@ -183,7 +187,7 @@ class Agents:
             self._all.append(agent)
             self._checks[cancel] = MAX_CHECK_CALLS
         self._notify(agent.n, "start", f"{level}\n{agent.task}")
-        host = ReadOnlyHost(root, lambda note: self._notify(agent.n, "tool", note), local_data, images, view)
+        host = ReadOnlyHost(root, lambda note: self._notify(agent.n, "tool", note), local_data, images, view, auto)
         threading.Thread(target=self._work, args=(agent, host, cancel), daemon=True).start()
         return (f"started sub-agent {agent.n} ({level} effort). Its report arrives as a background branch note "
                 f"'agent {agent.n}'. Do not research this part yourself: once all agents are started, call "

@@ -291,7 +291,7 @@ class AiToolHost(QObject):
             else:
                 diffs = "\n\n".join(f"{'new file' if e.before is None else 'edit'} {e.rel}\n{e.diff}" for e in edits)
                 ask = f"The model wants to change {len(edits)} files, all or none:\n\n{diffs}"
-            # Only edits wholly inside the Project Folder share the "edit_file" approval (the one auto mode answers):
+            # Only edits wholly inside the Project Folder share the "edit_file" approval:
             # elsewhere (Startup, secrets, Paperduck's own skills and MCP config) asks under its own key.
             root, app_data = self._project(), skills_dir().parent.resolve()
             inside = root is not None and all(
@@ -307,8 +307,9 @@ class AiToolHost(QObject):
             share, task = args.get("share_images") is True, args.get("task")
             if isinstance(task, str) and (notes := self._shared_notes(share)):
                 task += notes
+            auto = bool(getattr(getattr(getattr(self._win, "_ai_chat", None), "_plugin", None), "auto", False))
             return self.agents.spawn(task, args.get("effort"), self._project(), self.cancel,
-                                     args.get("_local") is True, self._shared_images(share), self.see_image)
+                                     args.get("_local") is True, self._shared_images(share), self.see_image, auto)
         if name == "wait_agents":
             return self.agents.wait(args.get("timeout_s"), self.cancel)
         if name == "calculate":  # pure arithmetic, nothing to allow

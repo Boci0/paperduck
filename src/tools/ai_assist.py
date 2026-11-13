@@ -1825,7 +1825,7 @@ class AiAssistPlugin:
         self.base_url = PRESETS["deepseek"][1]
         self.model = PRESETS["deepseek"][2]
         self.thinking = "off"
-        self.auto = False  # auto mode: routine approvals (AUTO_KEYS in ai_chat) answer themselves
+        self.auto = False  # auto mode: all chat confirmations in ai_chat answer themselves without asking
         self.asks = 0
         self.tokens = 0
         self._notice: tuple[str, str] | None = None

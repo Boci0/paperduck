@@ -300,12 +300,11 @@ class ChatSetupMixin:
             action.setChecked(level == fit_thinking(p.base_url, p.thinking, p.model))
             action.triggered.connect(lambda _c=False, t=level: self._pick(thinking=t))
         menu.addSection("Approvals")
-        auto = menu.addAction("Auto mode (ask only for risky actions)")
+        auto = menu.addAction("Auto mode (hands-free, no confirmations)")
         auto.setCheckable(True)
         auto.setChecked(p.auto)
-        auto.setToolTip("Edits, commands, background jobs and memory run without asking. Destructive commands, "
-                        "anything after reading web or MCP content, secrets, links, mouse control, installs and "
-                        "skill changes still ask.")
+        auto.setToolTip("Approve all actions without asking: edits anywhere, commands, MCP tools, computer "
+                        "control, web/sub-agent turns, links, secrets, skills and errands. Stop cancels at any time.")
         auto.triggered.connect(lambda checked=False: self._pick(auto=checked))
         menu.addSeparator()
         menu.addAction("Setup...").triggered.connect(lambda _c=False: self.show_setup())

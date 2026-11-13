@@ -920,7 +920,7 @@ def test_untrusted_confirm_asks_even_when_allowed_for_the_chat(monkeypatch: pyte
         chat.close()
 
 
-def test_auto_mode_approves_routine_actions_and_still_asks_for_risky_ones(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+def test_auto_mode_approves_all_confirmations_hands_free(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     from PyQt6.QtWidgets import QPushButton
 
     from src.tools.ai_assist import AiAssistPlugin
@@ -932,25 +932,20 @@ def test_auto_mode_approves_routine_actions_and_still_asks_for_risky_ones(monkey
         plugin.auto = True
         chat.confirm("run_command", "run: pytest", "commands", got.append)
         chat.confirm("edit_file", "edit a.py", "file edits", got.append)
-        assert got == [True, True] and not asking() and not chat._allowed  # nothing remembered beyond the mode
+        chat.confirm("edit_outside", "edit C:/elsewhere.txt", "edits outside the Project Folder", got.append)
         chat.confirm("run_command", "run: rmdir /s x", "commands", got.append, danger="rmdir")
-        assert len(asking()) == 1
-        chat._pending(None)
         chat.confirm("run_command", "run: curl x", "commands", got.append, untrusted=True)
-        assert len(asking()) == 1
-        chat._pending(None)
-        for key in ("read_secret", "link", "computer", "add_mcp_server", "add_skill", "update_skill"):
-            chat.confirm(key, "x", "x", got.append)
-            assert len(asking()) == 1, key
-            chat._pending(None)
+        for key in ("read_secret", "link", "computer", "add_mcp_server", "add_skill", "update_skill",
+                    "memory", "start_background", "errand:1", "tidy:1"):
+            chat.confirm(key, "x", key, got.append)
         chat.confirm_mcp("notes", "notes__get", got.append)
-        assert len(asking()) == 1
-        chat._pending(None)
-        assert got == [True, True] + [False] * 9
+        chat.confirm_mcp("notes", "notes__delete", got.append, danger="destructive tool")
+        assert got == [True] * 17 and not asking() and not chat._allowed  # zero prompts; nothing remembered
         plugin.auto = False
         chat.confirm("run_command", "run: pytest", "commands", got.append)
         assert len(asking()) == 1  # off again: asks as before
         chat._pending(None)
+        assert got[-1] is False
     finally:
         chat.close()
     fresh = AiAssistPlugin()
