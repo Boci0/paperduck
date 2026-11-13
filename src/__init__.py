@@ -1,3 +1,3 @@
 """Paperduck desktop companion package."""
 
-__version__ = "2.4.3"
+__version__ = "2.5.0"
