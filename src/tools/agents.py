@@ -22,6 +22,7 @@ ImageViewer = Callable[[Path | None, dict[str, Any]], tuple[str, str]]
 MAX_RUNNING = 4
 MAX_TASK_CHARS = 4000
 MAX_REPORT_CHARS = 8000
+REPORT_HEAD, REPORT_TAIL = 5500, 2400  # a cut report keeps both ends; with the marker it stays within MAX_REPORT_CHARS
 MAX_WAIT_S = 600.0
 MAX_AGENT_CALLS = 20  # tool calls per sub-agent (live: open questions use them all); after that each says "report now"
 READ_TOOLS = FILE_TOOLS | {"calculate"}  # plus view_image when the host can show pictures (ReadOnlyHost)
@@ -29,12 +30,13 @@ READ_TOOLS = FILE_TOOLS | {"calculate"}  # plus view_image when the host can sho
 RESEARCH_TOOLS = FILE_TOOLS | {"web_search", "fetch_page", "run_command", "run_powershell"}
 # After its agents report, an answer gets this many reads to check them (live it re-read everything: 25 calls)
 MAX_CHECK_CALLS = 8
+EDIT_TOOLS = {"edit_file", "edit_files"}  # running one refills the check reads
 CHECK_TOOLS = FILE_TOOLS | {"web_search", "fetch_page"}  # commands stay free, so tests after an edit still run
 AGENT_PROMPT = (
     "You are a sub-agent of Paperduck's chat assistant. You get one focused task, and your final answer is a report "
     "read by the main assistant, not by the user. Tools: read-only files (list_files, find_files, search_text, "
-    "read_file), calculate, view_image (an image file; you see it when your model can) and the web. Pictures "
-    "the user attached may come with your task: look at them. You cannot edit, run commands or ask anyone, so never ask a question: "
+    "read_file), calculate, view_image (an image file on disk; you see it when your model can) and the web. Pictures "
+    "the user attached may come inside your task message, with their text: use those, they are not files.You cannot edit, run commands or ask anyone, so never ask a question: "
     "decide and go. Look before concluding; call independent searches together, they run at the same time. Report "
     "the findings first, with exact file paths and line numbers, names, numbers and URLs, then anything you could "
     "not settle. Keep the report short: facts, not narration. Work fast: most tasks need 3 to 10 tool calls, so "
@@ -51,7 +53,8 @@ SPAWN_SPEC = _fn(
     "one agent per part, all started in the same turn. It works in the "
     "same Project Folder as you (relative paths work), but does not see this chat, so put everything else it "
     "needs in the task. It can look at image files with view_image; set share_images when it must see the pictures "
-    "the user attached to this chat (up to 4, from the newest message that has any).",
+    "the user attached to this chat (up to 4, from the newest message that has any): they arrive in its message "
+    "with their OCR text, so do not tell it to open them.",
     {"task": {"type": "string", "description": "The whole task: what to find, where to look, what the report must hold"},
      "effort": {"type": "string", "enum": list(THINKING_LEVELS),
                 "description": "The agent's thinking level for its whole run; pick the lowest that fits the task. off "
@@ -140,7 +143,13 @@ class Agents:
 
     def blocked(self, name: str, cancel: threading.Event | None = None) -> str | None:
         """The refusal for a research tool the main answer (`cancel` is its own) calls while sub-agents still run,
-        or past its MAX_CHECK_CALLS reads after its agents reported; else None. A new spawn_agent resets the reads."""
+        or past its MAX_CHECK_CALLS reads after its agents reported; else None. A new spawn_agent or an edit resets
+        the reads (reads after an edit are implementation work, not re-research)."""
+        if name in EDIT_TOOLS and cancel is not None:
+            with self._lock:
+                if cancel in self._checks:
+                    self._checks[cancel] = MAX_CHECK_CALLS
+            return None
         if name not in RESEARCH_TOOLS:
             return None
         left = self.running()
@@ -192,8 +201,9 @@ class Agents:
             if agent.dropped:  # New chat: nothing of the old chat may reach the new one's inbox or sheets
                 return
             self._notify(agent.n, kind, report)
-            cut = " [cut]" if len(report) > MAX_REPORT_CHARS else ""
-            self._post(f"task: {agent.task[:200]}\nreport: {report[:MAX_REPORT_CHARS]}{cut}", f"agent {agent.n}")
+            if len(report) > MAX_REPORT_CHARS:  # the tail holds what the agent could not settle (AGENT_PROMPT): keep it
+                report = report[:REPORT_HEAD] + "\n[...cut...]\n" + report[-REPORT_TAIL:]
+            self._post(f"task: {agent.task[:200]}\nreport: {report}", f"agent {agent.n}")
         finally:
             agent.done.set()  # after the post, so a waiter's next tool round already holds the report; even if it raised
 

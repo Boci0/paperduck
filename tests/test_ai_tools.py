@@ -1156,6 +1156,87 @@ def test_powershell_script_runs_from_a_file_with_quotes_intact(tmp_path: Path) -
             ai_tools.powershell_file(bad)
 
 
+def test_powershell_error_note_quotes_the_failing_lines() -> None:
+    from src.tools.ai_tools import powershell_error_note
+
+    script = "\n".join(f"Write-Output {n}" for n in range(1, 11)) + "\n"
+    err = "At C:\\t\\ps_ab12.ps1:3 char:5\nx\nAt C:\\t\\ps_ab12.ps1:3 char:9\nAt C:\\t\\ps_ab12.ps1:7 char:1"
+    note = powershell_error_note(err, script, "ps_ab12.ps1")
+    assert note.startswith("\n[Paperduck:") and "line 3: Write-Output 3; line 7: Write-Output 7" in note
+    assert note.count("line 3") == 1 and "re-run" in note
+    assert powershell_error_note("At C:\\t\\ps_ab12.ps1:11 char:1", script, "ps_ab12.ps1") == ""  # past the end
+    assert powershell_error_note("At C:\\t\\other.ps1:3 char:1", script, "ps_ab12.ps1") == ""
+    many = "".join(f"ps_ab12.ps1:{n} char:1\n" for n in (1, 2, 3, 4))
+    assert powershell_error_note(many, script, "ps_ab12.ps1").count("Write-Output") == 3
+    long = powershell_error_note("ps_ab12.ps1:1 char:1", "x" * 500, "ps_ab12.ps1")
+    assert "x" * 200 in long and "x" * 201 not in long
+    path, _ = ai_tools.powershell_file("a\r\nb\n\nc")  # numbering matches what was written
+    try:
+        assert path.read_bytes().decode("utf-8-sig").splitlines() == "a\r\nb\n\nc".splitlines()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _zip(path: Path, parts: dict[str, str]) -> Path:
+    import zipfile
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in parts.items():
+            zf.writestr(name, data)
+    return path
+
+
+def test_read_file_extracts_office_text(tmp_path: Path) -> None:
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    docx = _zip(tmp_path / "a.docx", {"word/document.xml": f"<w:document {w}><w:body><w:p><w:r><w:t>Hello</w:t></w:r>"
+                                      f"<w:r><w:t> world</w:t></w:r></w:p><w:p><w:r><w:t>Two</w:t></w:r></w:p></w:body></w:document>"})
+    assert run_file_tool(tmp_path, "read_file", {"path": docx.name}) == "1: Hello world\n2: Two"
+    a = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    slide = lambda t: f"<p {a}><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p>"  # noqa: E731
+    pptx = _zip(tmp_path / "a.pptx", {"ppt/slides/slide10.xml": slide("ten"), "ppt/slides/slide2.xml": slide("two"),
+                                      "ppt/slides/slide1.xml": slide("one")})
+    assert run_file_tool(tmp_path, "read_file", {"path": pptx.name}).splitlines() == [
+        "1: Slide 1", "2: one", "3: Slide 2", "4: two", "5: Slide 3", "6: ten"]
+    s = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    xlsx = _zip(tmp_path / "a.xlsx", {
+        "xl/workbook.xml": f'<workbook {s}><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+        "xl/sharedStrings.xml": f"<sst {s}><si><t>Name</t></si><si><t>Ann</t></si></sst>",
+        "xl/worksheets/sheet1.xml": f'<worksheet {s}><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1"><v>3.5</v></c></row>'
+                                    '<row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2"><v>42</v></c></row></sheetData></worksheet>'})
+    assert run_file_tool(tmp_path, "read_file", {"path": xlsx.name}).splitlines() == [
+        "1: Sheet: Data", "2: Name\t\t3.5", "3: Ann\t42"]
+    assert run_file_tool(tmp_path, "read_file", {"start_line": 2, "path": docx.name}) == "2: Two"
+
+
+def test_read_file_office_is_safe_on_hostile_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    bomb = _zip(tmp_path / "bomb.docx", {"word/document.xml": f"<w:document {w}>" + "<w:p/>" * 5000 + "</w:document>"})
+    monkeypatch.setattr(ai_tools, "MAX_READ_BYTES", 1000)
+    assert "more than 32 MB" in run_file_tool(tmp_path, "read_file", {"path": bomb.name})
+    monkeypatch.undo()
+    ent = _zip(tmp_path / "ent.docx", {"word/document.xml": '<!DOCTYPE d [<!ENTITY x SYSTEM "file:///c:/x">]><d/>'})
+    assert "DOCTYPE" in run_file_tool(tmp_path, "read_file", {"path": ent.name})
+    (tmp_path / "broken.xlsx").write_bytes(b"PK\x03\x04 not a zip")
+    assert run_file_tool(tmp_path, "read_file", {"path": "broken.xlsx"}).startswith("error: could not read this xlsx file")
+    bad_xml = _zip(tmp_path / "bad.docx", {"word/document.xml": "<w:document"})
+    assert run_file_tool(tmp_path, "read_file", {"path": bad_xml.name}).startswith("error: could not read this docx file")
+    empty = _zip(tmp_path / "empty.docx", {"x": "y"})
+    assert run_file_tool(tmp_path, "read_file", {"path": empty.name}).startswith("error: could not read")
+    monkeypatch.setattr(ai_tools, "MAX_OFFICE_PARTS", 1)
+    many = _zip(tmp_path / "many.pptx", {f"ppt/slides/slide{i}.xml": "<p/>" for i in (1, 2)})
+    assert "parts read" in run_file_tool(tmp_path, "read_file", {"path": many.name})
+
+
+def test_read_file_binary_errors_name_the_cause_and_the_alternative(tmp_path: Path) -> None:
+    (tmp_path / "a.pdf").write_bytes(b"%PDF\0")
+    (tmp_path / "a.png").write_bytes(b"\x89PNG\0")
+    (tmp_path / "a.bin").write_bytes(b"\0")
+    assert run_file_tool(tmp_path, "read_file", {"path": "a.pdf"}) == "error: binary file; use preview_document instead"
+    assert run_file_tool(tmp_path, "read_file", {"path": "a.png"}) == "error: binary file; use view_image instead"
+    assert run_file_tool(tmp_path, "read_file", {"path": "a.bin"}) == "error: binary file"
+
+
 def test_search_and_list_accept_a_file_as_the_path(tmp_path: Path) -> None:
     from src.tools.ai_tools import run_file_tool
 
@@ -1307,6 +1388,11 @@ def test_agent_gets_the_newest_pictures_of_the_chat_only_when_it_asks(monkeypatc
     fake = SimpleNamespace(_win=SimpleNamespace(_ai_chat=chat))
     assert AiToolHost._shared_images(fake, False) == []
     assert AiToolHost._shared_images(fake, True) == urls[:4]
+    assert AiToolHost._shared_notes(fake, True) == ""  # a turn without OCR notes adds nothing
+    chat._history[1]["image_notes"] = ["[Image (attached; its text read by OCR): a.png]\nROCKET 4821"]
+    said = AiToolHost._shared_notes(fake, True)
+    assert AiToolHost._shared_notes(fake, False) == "" and said.endswith("ROCKET 4821") and "not files" in said
+    del chat._history[1]["image_notes"]
     sent = []
     monkeypatch.setattr(ai_tool_host, "ask", lambda url, key, model, messages, **kw: sent.append(messages) or SimpleNamespace(text="r"))
     monkeypatch.setattr(ai_tool_host, "load_key", lambda url: "k")
@@ -1322,3 +1408,22 @@ def test_agent_gets_the_newest_pictures_of_the_chat_only_when_it_asks(monkeypatc
     assert turns[0]["content"][0] == {"type": "text", "text": "task"} and turns[0]["content"][1]["type"] == "image"
     assert ai_assist._text_only(sent[0])[1]["content"] == "task"
     assert not ai_assist.read_local_data(sent[0][1])
+
+
+def test_xlsx_forged_far_right_cells_cannot_pad_without_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zipfile
+
+    from src.tools import ai_tools
+
+    ns = ('xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"')
+    with zipfile.ZipFile(tmp_path / "b.xlsx", "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {ns}><sheets><sheet name="A" r:id="r1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="r1" Target="worksheets/s.xml"/></Relationships>')
+        z.writestr("xl/worksheets/s.xml", f'<worksheet {ns}><sheetData>' + '<row><c r="ZZZZZZZZZ1"><v>1</v></c></row>' * 3
+                   + '<row><c r="B2"><v>7</v></c></row></sheetData></worksheet>')
+    out = ai_tools.run_file_tool(tmp_path, "read_file", {"path": "b.xlsx"})
+    assert max(map(len, out.splitlines())) < 17000
+    assert ai_tools.run_file_tool(tmp_path, "read_file", {"path": "b.xlsx", "start_line": 5}).endswith("\t7")
+    monkeypatch.setattr(ai_tools, "MAX_READ_BYTES", 20000)
+    assert "32 MB" in ai_tools.run_file_tool(tmp_path, "read_file", {"path": "b.xlsx"})

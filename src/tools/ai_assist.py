@@ -807,6 +807,9 @@ def _read_stream(resp: Any, progress: Callable[[str], None]) -> dict[str, Any]:
 
 
 MAX_STREAM_BLOCKS = 256  # content blocks in one streamed Claude reply
+# result for every call of a reply that hit the token limit: none of them runs (which one was cut is a guess)
+CUT_CALL_NOTE = ("error: your reply hit the token limit before this call was complete, so it was not run; "
+                 "send a shorter call (split a long script into two calls)")
 
 
 def _read_anthropic_stream(resp: Any, progress: Callable[[str], None]) -> dict[str, Any]:
@@ -1020,16 +1023,23 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
             if data.get("stop_reason") == "pause_turn":  # send the paused turn back unchanged
                 turns = [*turns, {"role": "assistant", "content": blocks}]
                 continue
-            if data.get("stop_reason") == "tool_use" and host is not None and tool_rounds < MAX_TOOL_ROUNDS:
+            uses = [b for b in blocks if b.get("type") == "tool_use"]
+            cut = data.get("stop_reason") == "max_tokens" and bool(uses)  # a call was being written when the cap hit
+            if (data.get("stop_reason") == "tool_use" or cut) and host is not None and tool_rounds < MAX_TOOL_ROUNDS:
                 results = []
                 shots = False
                 bad = data.get("bad_input") or {}  # tool inputs that streamed in as broken JSON
-                uses = [b for b in blocks if b.get("type") == "tool_use"]
-                ready = [None] * len(uses) if bad else _run_calls(
+                if cut:  # every tool_use echoed back needs an object input
+                    blocks = [{**b, "input": b["input"] if isinstance(b.get("input"), dict) else {}} if b.get("type") == "tool_use" else b
+                              for b in blocks]
+                    uses = [b for b in blocks if b.get("type") == "tool_use"]
+                ready = [None] * len(uses) if bad or cut else _run_calls(
                     [(b["name"], b.get("input")) for b in uses], host, _grow_seen(seen_buf, turns) if read_local else None, progress)
                 for b, out in zip(uses, ready):
                     _check(cancel)
-                    if b.get("id") in bad:
+                    if cut:
+                        out = CUT_CALL_NOTE
+                    elif b.get("id") in bad:
                         out = (f"error: the arguments for {b['name']} were not valid JSON ({bad[b['id']]}); "
                                "send the call again with a JSON object")
                     elif out is None:
@@ -1161,15 +1171,22 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                      if usage.get("prompt_tokens") or usage.get("completion_tokens") else _int(usage.get("total_tokens")))
             calls = message.get("tool_calls") or []
             if calls and "tools" in body and "tool_choice" not in body:  # never run calls this round did not offer tools for (last round, stuck, budget)
+                cut = choice.get("finish_reason") == "length"  # the cap hit while a call was being written
+                if cut:  # the echoed arguments are broken JSON some providers refuse
+                    calls = [{**c, "function": {**c["function"], "arguments": "{}"}} for c in calls]
+                    message = {**message, "tool_calls": calls}
                 # echo the model's own turn (DeepSeek also wants its reasoning back), then answer each call
                 messages.append({"role": "assistant", **{k: v for k, v in message.items()
                                  if k in ("content", "tool_calls", "reasoning_content") and v is not None}})
                 named = [(c["function"]["name"], c["function"].get("arguments")) for c in calls]
-                ready = _run_calls(named, host, _grow_seen(seen_buf, messages) if read_local else None, progress)
+                ready = [None] * len(calls) if cut else _run_calls(
+                    named, host, _grow_seen(seen_buf, messages) if read_local else None, progress)
                 for call, result in zip(calls, ready):
                     _check(cancel)
                     fn = call["function"]
-                    if result is None:
+                    if cut:
+                        result = CUT_CALL_NOTE
+                    elif result is None:
                         seen = _grow_seen(seen_buf, messages) if read_local else None
                         if progress is not None:
                             progress(f"Running {fn['name']}")

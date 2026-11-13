@@ -314,3 +314,31 @@ def test_new_chat_stops_agents_and_empties_the_branch_inbox() -> None:
         assert stopped == [True] and chat._branch_q == []
     finally:
         chat.deleteLater()
+
+
+def test_an_edit_refills_the_check_reads_but_only_for_an_answer_with_agents() -> None:
+    from src.tools.agents import MAX_CHECK_CALLS
+
+    agents, _posts = _agents(lambda *_a: "found it")
+    mine, other = threading.Event(), threading.Event()
+    agents.spawn("find the parser", "low", None, mine)
+    agents.wait(5, mine)
+    assert all(agents.blocked("read_file", mine) is None for _ in range(MAX_CHECK_CALLS))
+    assert "check reads" in agents.blocked("read_file", mine)
+    assert agents.blocked("edit_file", mine) is None  # reads after an edit are implementation work
+    assert all(agents.blocked("read_file", mine) is None for _ in range(MAX_CHECK_CALLS))
+    assert "check reads" in agents.blocked("read_file", mine)
+    assert agents.blocked("edit_files", mine) is None and agents.blocked("read_file", mine) is None
+    assert agents.blocked("edit_file", other) is None and other not in agents._checks  # no entry is made
+
+
+def test_a_long_report_keeps_its_head_and_its_tail() -> None:
+    from src.tools.agents import MAX_REPORT_CHARS
+
+    agents, posts = _agents(lambda *_a: "H" * 6000 + "M" * 6000 + "OPEN: the tail")
+    cancel = threading.Event()
+    agents.spawn("t", "low", None, cancel)
+    agents.wait(5, cancel)
+    text = posts[0][1].split("report: ", 1)[1]
+    assert len(text) <= MAX_REPORT_CHARS and text.startswith("H" * 5500) and text.endswith("OPEN: the tail")
+    assert "[...cut...]" in text

@@ -32,7 +32,7 @@ from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents,
 from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
                                 computer_action, destructive_reason, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
-                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, run_file_tool, save_args,
+                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
 from src.tools.errands import describe as describe_errand
 from src.tools.clip_vault import clipboard_is_private
@@ -56,6 +56,7 @@ OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edi
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
 MAX_CLIP_CHARS = 12000
 MAX_SCREEN_CHARS = 8000
+MAX_SHARED_NOTE_CHARS = 1500  # OCR text of shared pictures added to a sub-agent's task (the task caps at 4000)
 MAX_OCR_SIDE = 4096  # longer sides are scaled down for OCR (Windows OCR refuses very large bitmaps)
 
 
@@ -303,9 +304,11 @@ class AiToolHost(QObject):
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
-            return self.agents.spawn(args.get("task"), args.get("effort"), self._project(), self.cancel,
-                                     args.get("_local") is True, self._shared_images(args.get("share_images") is True),
-                                     self.see_image)
+            share, task = args.get("share_images") is True, args.get("task")
+            if isinstance(task, str) and (notes := self._shared_notes(share)):
+                task += notes
+            return self.agents.spawn(task, args.get("effort"), self._project(), self.cancel,
+                                     args.get("_local") is True, self._shared_images(share), self.see_image)
         if name == "wait_agents":
             return self.agents.wait(args.get("timeout_s"), self.cancel)
         if name == "calculate":  # pure arithmetic, nothing to allow
@@ -331,7 +334,7 @@ class AiToolHost(QObject):
             if not self._allowed("run_command", f"The model wants to run{what} in {where}{limit}:\n\n{command.strip()}",
                                  "commands", risk):
                 return "error: the user declined this command"
-            script = None
+            script, source = None, command
             if ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
                 try:
                     script, command = powershell_file(command)
@@ -344,6 +347,8 @@ class AiToolHost(QObject):
             finally:
                 if script is not None:
                     script.unlink(missing_ok=True)
+            if script is not None:
+                out += powershell_error_note(out, source, script.name)
             for pdf, before in pdfs.items():  # headless Edge stamps HeadlessChrome, Skia and dates
                 # msedge.exe hands off to a child and returns before the PDF is written: wait for the new file
                 if wait_for_new_file(pdf, before, PDF_WAIT_S, self.cancel):
@@ -673,6 +678,16 @@ class AiToolHost(QObject):
 
         turns = list(self._win._ai_chat._history) if share else []
         return next((t["images"][:MAX_ATTACHMENTS] for t in reversed(turns) if t["role"] == "user" and t.get("images")), [])
+
+    def _shared_notes(self, share: bool) -> str:
+        """What a shared picture's task text adds: that the pictures are in the message, and their OCR text. Live,
+        a model that takes an image without an error but cannot read it searched the disk for the file instead."""
+        turns = list(self._win._ai_chat._history) if share else []
+        notes = next((t.get("image_notes") or [] for t in reversed(turns) if t["role"] == "user" and t.get("images")), [])
+        if not notes:
+            return ""
+        return ("\n\n[Paperduck: the user's pictures are attached to this message itself; they are not files, so do "
+                "not look for them on disk. Their text, read by OCR:]\n" + "\n".join(notes))[:MAX_SHARED_NOTE_CHARS]
 
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:
         """A sub-agent's thread: one ask() with the chat's provider and model at the agent's own thinking level."""
