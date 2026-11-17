@@ -41,7 +41,7 @@ from src.tools.file_forge import scrub_metadata
 from src.tools.macros import parse_recipe
 from src.tools.mcp_client import SEP, McpHub, add_server, env_summary, find_servers, safe_name
 from src.tools.watch import MESSAGE_APPS, READERS
-from src.tools.web_drop import load_image_file
+from src.tools.web_drop import decode_image_bytes, load_image_file
 from src.ui.quick_tools import ocr_image_file
 
 GUI_TIMEOUT_S = 15.0
@@ -286,7 +286,16 @@ class AiToolHost(QObject):
                 return "error: stopped"
             extra = {"review": review} if review else {}
             allowed = self._waiting(lambda done: chat.confirm_mcp(server, name, done, shown[:600], risk, **extra))
-            return self.mcp.call(name, args) if allowed is True else "error: the user did not allow this MCP server"
+            if allowed is not True:
+                return "error: the user did not allow this MCP server"
+            out = self.mcp.call(name, args)
+            if self.mcp.image:  # a browser screenshot rides along like screen_map's (dropped for blind models)
+                from src.ui.chat_widgets import image_data_url
+                try:
+                    self._shot = image_data_url(decode_image_bytes(self.mcp.image))
+                except ValueError:
+                    pass
+            return out
         if name in FILE_TOOLS:
             secrets = False
             if name == "read_file":

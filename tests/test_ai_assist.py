@@ -673,7 +673,7 @@ def test_screen_map_screenshot_follows_the_tool_results(api: str, monkeypatch: p
             return orig(self)
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         _Api.seen.append({"path": self.path, "body": body})
-        data = json.dumps({"usage": {"total_tokens": 10}, "choices": [{"message": {"content": None, "tool_calls": [
+        data = json.dumps({"usage": {"total_tokens": 10}, "choices": [{"message": {"tool_calls": [  # no "content": Gemini
             {"id": "c1", "function": {"name": "screen_map", "arguments": "{}"}}]}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))

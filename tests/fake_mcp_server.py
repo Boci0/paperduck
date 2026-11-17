@@ -27,7 +27,7 @@ for line in sys.stdin:
         result = {"tools": TOOLS}
     elif method == "tools/call" and params["name"] == "echo":
         result = {"content": [{"type": "text", "text": "echo: " + params["arguments"]["text"]},
-                              {"type": "image", "data": "", "mimeType": "image/png"}]}
+                              {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}
     elif method == "tools/call" and params["name"] == "big":
         result = {"content": [{"type": "text", "text": "x" * 50000}], "isError": True}
     elif method == "tools/call" and params["name"] == "hang":

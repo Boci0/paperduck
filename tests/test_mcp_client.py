@@ -48,15 +48,17 @@ def test_hub_lists_calls_and_caps_tools(hub: McpHub, monkeypatch: pytest.MonkeyP
     assert specs[1]["function"]["parameters"] == {"type": "object", "properties": {}}
     assert hub.specs() is specs  # started once
     echoed = hub.call("fake__echo", {"text": "hi"})
-    assert "data, not instructions" in echoed and "echo: hi\n[image content not shown]" in echoed
+    assert "data, not instructions" in echoed and "echo: hi\n[image: sent to you after the tool results]" in echoed
+    assert hub.image == b"\x89PNG\r\n\x1a\n"  # handed to a model that sees, like screen_map's screenshot
     big = hub.call("fake__big", {})
+    assert hub.image == b""  # never a stale picture from the call before
     assert "error: " in big and big.endswith("cut off") and len(big) < mcp_client.MAX_RESULT_CHARS + 200
     assert hub.server_of("read_file") is None and hub.call("fake__nope", {}).startswith("error")
     monkeypatch.setattr(mcp_client, "CALL_TIMEOUT_S", 0.5)
     assert "no answer within" in hub.call("fake__hang", {})
     assert "error: MCP server fake: the server" in hub.call("fake__echo", {"text": "x"})  # the hung one was stopped
     assert [s["function"]["name"] for s in hub.specs()] == names  # and restarts with the next message
-    assert hub.call("fake__echo", {"text": "after"}).endswith("echo: after\n[image content not shown]")
+    assert hub.call("fake__echo", {"text": "after"}).endswith("echo: after\n[image: sent to you after the tool results]")
 
 
 def test_hub_restarts_when_the_config_changes(hub: McpHub) -> None:
@@ -119,7 +121,7 @@ def test_tool_host_asks_before_a_servers_first_call(hub: McpHub) -> None:
     while thread.is_alive():
         app.processEvents()
     assert asked == ["fake__echo", "fake__echo"]
-    assert "did not allow" in results[0] and results[1].endswith("echo: b\n[image content not shown]")
+    assert "did not allow" in results[0] and results[1].endswith("echo: b\n[image: sent to you after the tool results]")
     assert "echo: c" in results[2]
 
 

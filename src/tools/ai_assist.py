@@ -1253,7 +1253,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
         try:
             choice = data["choices"][0]
             message = choice["message"]
-            content = message["content"]
+            content = message.get("content")  # Gemini leaves it out of a non-streamed reply that only calls tools
             usage = data.get("usage") or {}
             details = usage.get("completion_tokens_details") or {}
             hidden = _int(usage.get("total_tokens")) - _int(usage.get("prompt_tokens")) - _int(usage.get("completion_tokens"))
@@ -1313,7 +1313,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + said}
                 if shots and (base_url, model) not in _NO_VISION:
                     messages.append({"role": "user", "content": [
-                        {"type": "text", "text": "Image from that tool (screen_map, preview_document or view_image):"
+                        {"type": "text", "text": "Image from that tool:"
                          if len(shots) == 1 else f"The {len(shots)} images from those tools, in call order:"},
                         *({"type": "image_url", "image_url": {"url": u}} for u in shots)]})
                     shot_at.append(len(messages) - 1)

@@ -14,6 +14,7 @@ Security:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ PROTOCOL_VERSION = "2025-06-18"
 START_TIMEOUT_S = 60.0  # a first npx / uvx start downloads the package
 CALL_TIMEOUT_S = 60.0
 MAX_RESULT_CHARS = 30000
+MAX_IMAGE_B64 = 28 * 1024 * 1024  # about 20 MB decoded, the same cap view_image has
 MAX_TOOLS_PER_SERVER = 64
 IDLE_CLOSE_S = 300.0  # servers unused this long are closed (an npx server is two node processes, ~180 MB)
 NPX_REFRESH_S = 7 * 86400.0  # a cached npx server still starts through npx this often, so `@latest` updates
@@ -116,11 +118,24 @@ def result_text(result: Any) -> str:
     for item in result.get("content") or []:
         if isinstance(item, dict):
             parts.append(item["text"] if item.get("type") == "text" and isinstance(item.get("text"), str)
+                         else "[image: sent to you after the tool results]" if item.get("type") == "image"
                          else f"[{item.get('type', 'unknown')} content not shown]")
     text = "\n".join(parts) or "(no text)"
     if len(text) > MAX_RESULT_CHARS:
         text = text[:MAX_RESULT_CHARS] + "\n... cut off"
     return ("error: " + text) if result.get("isError") else text
+
+
+def result_image(result: Any) -> bytes:
+    """The first image in a tools/call result (a browser screenshot, say), decoded; b"" if none or too big."""
+    for item in (result.get("content") or []) if isinstance(result, dict) else []:
+        data = item.get("data") if isinstance(item, dict) and item.get("type") == "image" else None
+        if isinstance(data, str) and len(data) <= MAX_IMAGE_B64:
+            try:
+                return base64.b64decode(data, validate=True)
+            except ValueError:
+                return b""
+    return b""
 
 
 def _npx_cache() -> Path:
@@ -194,6 +209,7 @@ class McpServer:
         self.name = name
         self.tools: dict[str, str] = {}  # safe tool name -> the server's own name
         self.destructive: set[str] = set()  # safe names of tools that declare destructiveHint (and not readOnlyHint)
+        self.image = b""  # the last call's first image, for a model that sees
         self._lock = threading.Lock()
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._next_id = 0
@@ -272,9 +288,11 @@ class McpServer:
         return specs
 
     def call(self, tool: str, args: dict[str, Any]) -> str:
+        self.image = b""
         try:
-            return result_text(self.request("tools/call", {"name": self.tools[tool], "arguments": args},
-                                             CALL_TIMEOUT_S))
+            result = self.request("tools/call", {"name": self.tools[tool], "arguments": args}, CALL_TIMEOUT_S)
+            self.image = result_image(result)
+            return result_text(result)
         except (RuntimeError, OSError) as exc:  # OSError: the server's stdin closed while it asked us something
             return f"error: MCP server {self.name}: {exc}"
 
@@ -305,6 +323,7 @@ class McpHub:
         self._loaded: float | None = None  # config mtime the running servers came from
         self._used = time.monotonic()  # last specs() or call()
         self._lock = threading.Lock()
+        self.image = b""  # the last call's first image (see McpServer.image)
 
     def specs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -340,6 +359,7 @@ class McpHub:
 
     def call(self, name: str, args: dict[str, Any]) -> str:
         server, _sep, tool = name.partition(SEP)
+        self.image = b""
         if self.server_of(name) is None:
             return "error: unknown MCP tool"
         self._used = time.monotonic()
@@ -347,6 +367,7 @@ class McpHub:
         if running is None:
             return "error: the MCP server stopped; try again"
         out = running.call(tool, args)
+        self.image = running.image
         self._used = time.monotonic()
         if not running.alive:
             self._loaded = None  # restart the servers when the next message asks for tools
