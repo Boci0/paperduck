@@ -193,8 +193,8 @@ SYSTEM_PROMPT = (
     "scratch files you created; every PDF, PNG or JPEG you make for the user (script, headless browser, "
     "Playwright, Office export) gets clean_metadata before you hand it over. (5) Verify every change by reading the result back (tests, the "
     "file, the document's properties) and never say done without that evidence; a read is its own evidence, so "
-    "do not re-check what read_file already returned (it reads Word, PowerPoint in slide order, and Excel with "
-    "formulas). Never repeat a secret's value (key, password, token) in a reply or file unless the user asks for "
+    "do not re-check what read_file already returned (it reads Word, PowerPoint in slide order, Excel with "
+    "formulas, and text PDFs). Never repeat a secret's value (key, password, token) in a reply or file unless the user asks for "
     "that value; name it instead. (6) When a step fails, read "
     "the error and fix its cause; after two similar failures change approach, never repeat the same call. "
     "(7) Keep going until the job is done or truly blocked; do not stop to ask about steps the user already "
@@ -1442,8 +1442,9 @@ def _steer_note(name: str, call: str, result: str, state: list[Any], tokens: int
             state[4] += 1
     looped = 0
     if len(state) > 3:  # the calls alone, so a click that "works" 24 times in a row is still caught
-        state[3] = [*state[3], call][-LOOP_WINDOW:]
-        looped = state[3].count(call)
+        key = re.sub(r"\d+", "#", call) if name == "computer_batch" else call
+        state[3] = [*state[3], key][-LOOP_WINDOW:]
+        looped = state[3].count(key)
     if tokens >= MAX_ANSWER_TOKENS:
         return OVER_NOTE
     if _stuck(state):
@@ -1507,12 +1508,25 @@ def _trimmed(text: str) -> str | None:
     return None if text.endswith(TRIMMED) or len(text) <= TRIM_HEAD + len(TRIMMED) else text[:TRIM_HEAD] + TRIMMED
 
 
+def _is_screen_result(text: str, call_id: Any, screen_ids: set[Any]) -> bool:
+    return (call_id in screen_ids or (text.startswith("Screen ") and "All (x, y) are screen pixels:" in text[:160])) and (
+        not text.endswith(TRIMMED) and len(text) > TRIM_HEAD + len(TRIMMED))
+
+
 def _trim_results(messages: list[dict[str, Any]], start: int) -> None:
-    """Chat completions, in place: once this answer's tool results (from `start`) pass WORKING_CHARS, all but the
-    newest KEEP_RESULTS keep only their head. One trim makes room for several rounds, so the provider's prompt
-    cache breaks once per batch, not every round, and a long job never outgrows the context window."""
+    """Chat completions, in place: trim stale screen_map/read_screen outputs in batches past KEEP_SHOTS, and once
+    this answer's tool results (from `start`) pass WORKING_CHARS, keep only the head of all but the newest
+    KEEP_RESULTS. One trim makes room for several rounds, so the prompt cache breaks once per batch."""
     spots = [i for i in range(start, len(messages))
              if messages[i].get("role") == "tool" and isinstance(messages[i].get("content"), str)]
+    screen_ids = {c.get("id") for m in messages[start:] if m.get("role") == "assistant"
+                  for c in m.get("tool_calls") or []
+                  if isinstance(c, dict) and (c.get("function") or {}).get("name") in ("screen_map", "read_screen")}
+    screen_spots = [i for i in spots if _is_screen_result(messages[i]["content"], messages[i].get("tool_call_id"), screen_ids)]
+    if len(screen_spots) > KEEP_SHOTS:
+        for i in screen_spots[:-1]:
+            if (short := _trimmed(messages[i]["content"])) is not None:
+                messages[i] = {**messages[i], "content": short}
     if sum(len(messages[i]["content"]) for i in spots) <= WORKING_CHARS:
         return
     for i in spots[:-KEEP_RESULTS]:
@@ -1528,9 +1542,22 @@ def _trim_claude_results(turns: list[dict[str, Any]], start: int) -> list[dict[s
 
     spots = [(t, b) for t in range(start, len(turns)) if turns[t]["role"] == "user" and isinstance(turns[t]["content"], list)
              for b, block in enumerate(turns[t]["content"]) if block.get("type") == "tool_result"]
-    if sum(len(text(turns[t]["content"][b])) for t, b in spots) <= WORKING_CHARS:
-        return None
+    screen_ids = {b.get("id") for t in turns[start:] if t["role"] == "assistant" and isinstance(t["content"], list)
+                  for b in t["content"] if b.get("type") == "tool_use" and b.get("name") in ("screen_map", "read_screen")}
+    screen_spots = [(t, b) for t, b in spots if _is_screen_result(
+        text(turns[t]["content"][b]), turns[t]["content"][b].get("tool_use_id"), screen_ids)]
     out = list(turns)
+    changed = False
+    if len(screen_spots) > KEEP_SHOTS:
+        for t, b in screen_spots[:-1]:
+            block = out[t]["content"][b]
+            if (short := _trimmed(text(block))) is not None:
+                content = list(out[t]["content"])
+                content[b] = {**block, "content": short}
+                out[t] = {**out[t], "content": content}
+                changed = True
+    if sum(len(text(out[t]["content"][b])) for t, b in spots) <= WORKING_CHARS:
+        return _strip_thinking(out) if changed else None
     for t, b in spots[:-KEEP_RESULTS]:
         block = out[t]["content"][b]
         if (short := _trimmed(text(block))) is not None:

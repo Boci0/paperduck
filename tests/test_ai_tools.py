@@ -1483,3 +1483,84 @@ def test_xlsx_forged_far_right_cells_cannot_pad_without_limit(tmp_path: Path, mo
     assert ai_tools.run_file_tool(tmp_path, "read_file", {"path": "b.xlsx", "start_line": 5}).endswith("\t7")
     monkeypatch.setattr(ai_tools, "MAX_READ_BYTES", 20000)
     assert "32 MB" in ai_tools.run_file_tool(tmp_path, "read_file", {"path": "b.xlsx"})
+
+
+def test_read_file_extracts_pdf_text_and_respects_binary_and_bomb_guards(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zlib
+
+    cmap = zlib.compress(b"beginbfchar\n<0003> <0020>\n<0004> <0061>\nendbfchar\n")
+    page = zlib.compress(
+        b"BT\n/F1 12 Tf\n1 0 0 1 50 700 Tm\n(Hello) Tj\n"
+        b"1 0 0 1 50 680 Tm\n/F9 12 Tf\n<00030004> Tj\nET\n"
+    )
+    pdf = (
+        b"%PDF-1.4\n"
+        b"1 0 obj\n<</Type/Font/ToUnicode 2 0 R>>\nendobj\n"
+        b"2 0 obj\n<</Length " + str(len(cmap)).encode() + b">>stream\n" + cmap + b"\nendstream\nendobj\n"
+        b"3 0 obj\n<</Resources<</Font<</F9 1 0 R>>>>>>\nendobj\n"
+        b"4 0 obj\n<</Length " + str(len(page)).encode() + b">>stream\n" + page + b"\nendstream\nendobj\n"
+    )
+    (tmp_path / "notes.pdf").write_bytes(pdf)
+    assert run_file_tool(tmp_path, "read_file", {"path": "notes.pdf"}).splitlines() == [
+        "1: Page 1", "2: Hello", "3: a"]
+
+    (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4\n1 0 obj\n<</Subtype/Image>>\nendobj\n")
+    assert run_file_tool(tmp_path, "read_file", {"path": "scan.pdf"}) == "error: binary file; use preview_document instead"
+
+    big = zlib.compress(b"BT\n(" + b"x" * 5000 + b") Tj\nET\n")
+    (tmp_path / "bomb.pdf").write_bytes(b"%PDF-1.4\n1 0 obj\nstream\n" + big + b"\nendstream\nendobj\n")
+    monkeypatch.setattr(ai_tools, "MAX_READ_BYTES", 1000)
+    assert "32 MB" in run_file_tool(tmp_path, "read_file", {"path": "bomb.pdf"})
+
+
+def test_auto_mode_caches_computer_review_and_batches_skip_intermediate_grabs() -> None:
+    from src.ui.ai_tool_host import AiToolHost
+
+    reviews: list[str] = []
+    confirmed: list[dict] = []
+    reqs = ["make the cheat sheet"]
+    chat = SimpleNamespace(
+        _plugin=SimpleNamespace(auto=True),
+        _allowed=set(),
+        user_requests=lambda: list(reqs),
+        confirm=lambda key, text, what, done, **kw: confirmed.append(kw) or done(True),
+    )
+    fake = SimpleNamespace(
+        outside=True,
+        _win=SimpleNamespace(_ai_chat=chat),
+        cancel=threading.Event(),
+        _computer_review=None,
+        _review=lambda action: reviews.append(action) or (True, "user asked for UI work"),
+        _waiting=lambda ask: (box := []) or ask(box.append) or box[0],
+    )
+    assert AiToolHost._allowed(fake, "computer", "left-click at (10, 20)", "computer control") is True
+    assert AiToolHost._allowed(fake, "computer", "left-click at (30, 40)", "computer control") is True
+    assert len(reviews) == 1 and len(confirmed) == 2 and confirmed[1]["review"] == (True, "user asked for UI work")
+
+    reqs.append("also align title")
+    assert AiToolHost._allowed(fake, "computer", "left-click at (50, 60)", "computer control") is True
+    assert len(reviews) == 2
+
+    assert AiToolHost._allowed(fake, "computer", "press delete", "computer control", risk="delete") is True
+    assert len(reviews) == 3
+
+    seen_batch_flags: list[tuple[bool, bool]] = []
+    batch_fake = SimpleNamespace(
+        cancel=threading.Event(),
+        _allowed=lambda *_a, **_k: True,
+        _in_batch=False,
+        _batch_acted=False,
+        _computer=lambda _n, _a, approved=False: (
+            seen_batch_flags.append((batch_fake._in_batch, batch_fake._batch_acted)) or "ok"
+        ),
+    )
+    out = AiToolHost._batch(batch_fake, [
+        {"tool": "mouse_click", "x": 1, "y": 2},
+        {"tool": "type_text", "text": "hi"},
+        {"tool": "mouse_click", "x": 3, "y": 4},
+    ])
+    assert out == "1. ok\n2. ok\n3. ok"
+    assert seen_batch_flags == [(True, False), (True, True), (False, True)]
+    assert batch_fake._in_batch is False and batch_fake._batch_acted is False
+

@@ -40,6 +40,7 @@ import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -99,7 +100,7 @@ _PATH = {"type": "string", "description": "Any absolute path on the PC, or a pat
          "(the home folder when none is set); empty for that folder itself. ~ is the home folder."}
 TOOL_SPECS: list[dict[str, Any]] = [
     _fn("list_files", "List a folder anywhere on the user's PC (folders end with /).", {"path": _PATH}),
-    _fn("read_file", "Read a text file anywhere on the PC, with line numbers (also Word, PowerPoint and Excel files, as text). Secret-looking files (.env, keys) "
+    _fn("read_file", "Read a text file anywhere on the PC, with line numbers (also Word, PowerPoint, Excel and text PDF files, as text). Secret-looking files (.env, keys) "
         "ask the user first.",
         {"path": _PATH, "start_line": {"type": "integer", "description": "First line to show, default 1"},
          "end_line": {"type": "integer", "description": "Last line to show, default as far as one call fits"}}, ("path",)),
@@ -460,6 +461,151 @@ def _office_text(path: Path) -> str:
         return "\n".join(out)
 
 
+MAX_PDF_STREAMS = 4000
+_PDF_STREAM = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
+_PDF_BT = re.compile(rb"\bBT\b(.*?)\bET\b", re.S)
+_PDF_TOK = re.compile(
+    rb"(/[A-Za-z0-9._+-]+)\s+[\d.]+\s+Tf\b"
+    rb"|(-?(?:\d+(?:\.\d*)?|\.\d+))\s+(-?(?:\d+(?:\.\d*)?|\.\d+))\s+(Tm|Td|TD)\b"
+    rb"|\b(T\*)\b"
+    rb"|(\((?:\\.|[^\\()])*\))"
+    rb"|<([0-9A-Fa-f\s]+)>",
+    re.S,
+)
+_PDF_ESC = re.compile(rb"\\([nrtbf()\\]|[0-7]{1,3}|\r?\n)")
+
+
+def _pdf_cmap(data: bytes) -> dict[bytes, str]:
+    """Decode ToUnicode bfchar/bfrange tables into a glyph-bytes -> Unicode mapping."""
+    out: dict[bytes, str] = {}
+    for sec in re.findall(rb"beginbfchar\s+(.*?)\s+endbfchar", data, re.S):
+        for a, b in re.findall(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", sec):
+            if len(a) % 2 == 0 and len(b) % 2 == 0:
+                out[bytes.fromhex(a.decode())] = bytes.fromhex(b.decode()).decode("utf-16-be", "replace")
+    for sec in re.findall(rb"beginbfrange\s+(.*?)\s+endbfrange", data, re.S):
+        for m in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[(.*?)\])", sec, re.S):
+            lo, hi, n = int(m.group(1), 16), int(m.group(2), 16), len(m.group(1)) // 2
+            if n < 1 or hi < lo:
+                continue
+            if m.group(3):
+                dst = int(m.group(3), 16)
+                for c in range(lo, min(hi, lo + 1024) + 1):
+                    out[c.to_bytes(n, "big")] = chr(dst + (c - lo))
+            elif m.group(4):
+                for i, v in enumerate(re.findall(rb"<([0-9A-Fa-f]+)>", m.group(4))):
+                    if lo + i <= hi and len(v) % 2 == 0:
+                        out[(lo + i).to_bytes(n, "big")] = bytes.fromhex(v.decode()).decode("utf-16-be", "replace")
+    return out
+
+
+def _pdf_unescape(raw: bytes) -> bytes:
+    def sub(m: re.Match[bytes]) -> bytes:
+        g = m.group(1)
+        if g in (b"\n", b"\r\n", b"\r"):
+            return b""
+        if g[0:1].isdigit():
+            return bytes([int(g, 8) & 0xFF])
+        return {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}.get(g, g)
+    return _PDF_ESC.sub(sub, raw[1:-1])
+
+
+def _pdf_decode_bytes(data: bytes, cmap: dict[bytes, str] | None) -> str:
+    if cmap:
+        step = 2 if any(len(k) == 2 for k in cmap) else 1
+        if len(data) % step == 0:
+            chars = []
+            for i in range(0, len(data), step):
+                tok = data[i:i + step]
+                if tok in cmap:
+                    chars.append(cmap[tok])
+                elif step == 2 and tok[0] == 0:
+                    chars.append(chr(tok[1]))
+                else:
+                    chars.append(tok.decode("latin1", "replace"))
+            return "".join(chars)
+    return data.decode("utf-16-be", "replace") if data.startswith(b"\xfe\xff") else data.decode("latin1", "replace")
+
+
+def _pdf_text(path: Path) -> str | None:
+    """Extract text from a text-based PDF in pure Python; None when no text streams are found (image-only/binary).
+    Raises ValueError if decompressed streams exceed MAX_READ_BYTES."""
+    raw = path.read_bytes()
+    if not raw.startswith(b"%PDF"):
+        return None
+    budget = MAX_READ_BYTES
+    cmaps: dict[bytes, dict[bytes, str]] = {}
+    if b"/ToUnicode" in raw:
+        objs = {int(m.group(1)): m.start() for m in re.finditer(rb"(\d+)\s+\d+\s+obj\b", raw)}
+        for m in re.finditer(rb"/ToUnicode\s+(\d+)\s+\d+\s+R", raw):
+            f_ids = re.findall(rb"(\d+)\s+\d+\s+obj\b", raw[max(0, m.start() - 512):m.start()])
+            uid = int(m.group(1))
+            if f_ids and uid in objs:
+                sm = _PDF_STREAM.search(raw, objs[uid], min(len(raw), objs[uid] + 131072))
+                if sm:
+                    try:
+                        dec = zlib.decompressobj().decompress(sm.group(1), budget + 1)
+                    except zlib.error:
+                        dec = sm.group(1)
+                    budget -= len(dec)
+                    if budget < 0:
+                        raise ValueError("expands to more than 32 MB")
+                    if cm := _pdf_cmap(dec):
+                        for fm in re.finditer(rb"(/[A-Za-z0-9._+-]+)\s+" + f_ids[-1] + rb"\s+\d+\s+R", raw):
+                            cmaps.setdefault(fm.group(1), {}).update(cm)
+
+    pages: list[str] = []
+    for count, m in enumerate(_PDF_STREAM.finditer(raw), 1):
+        if count > MAX_PDF_STREAMS:
+            break
+        chunk = m.group(1)
+        try:
+            dec = zlib.decompressobj().decompress(chunk, budget + 1)
+        except zlib.error:
+            dec = chunk
+        budget -= len(dec)
+        if budget < 0:
+            raise ValueError("expands to more than 32 MB")
+        if b"BT" not in dec or (b"Tj" not in dec and b"TJ" not in dec):
+            continue
+        lines: list[str] = []
+        cur: list[str] = []
+        last_y: float | None = None
+        cmap: dict[bytes, str] | None = None
+        for bt in _PDF_BT.finditer(dec):
+            for tok in _PDF_TOK.finditer(bt.group(1)):
+                if tok.group(1) is not None:
+                    cmap = cmaps.get(tok.group(1))
+                elif tok.group(4) is not None:
+                    val, op = float(tok.group(3)), tok.group(4)
+                    if op == b"Tm":
+                        if last_y is not None and abs(val - last_y) > 4:
+                            if line := "".join(cur).strip():
+                                lines.append(line)
+                            cur = []
+                        last_y = val
+                    else:
+                        if abs(val) > 4:
+                            if line := "".join(cur).strip():
+                                lines.append(line)
+                            cur = []
+                        last_y = (last_y or 0.0) + val
+                elif tok.group(5) is not None:
+                    if line := "".join(cur).strip():
+                        lines.append(line)
+                    cur = []
+                elif tok.group(6) is not None:
+                    cur.append(_pdf_decode_bytes(_pdf_unescape(tok.group(6)), cmap))
+                elif tok.group(7) is not None:
+                    hx = re.sub(rb"\s+", b"", tok.group(7))
+                    if len(hx) >= 2 and len(hx) % 2 == 0:
+                        cur.append(_pdf_decode_bytes(bytes.fromhex(hx.decode("ascii")), cmap))
+        if line := "".join(cur).strip():
+            lines.append(line)
+        if lines:
+            pages.append(f"Page {len(pages) + 1}\n" + "\n".join(lines))
+    return "\n\n".join(pages) or None
+
+
 _BINARY_HINT = {".pdf": "preview_document", **dict.fromkeys((".doc", ".ppt", ".xls"), "preview_document"),
                 **dict.fromkeys((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"), "view_image")}
 
@@ -489,7 +635,8 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
             if path.stat().st_size > MAX_READ_BYTES:
                 return "error: larger than 32 MB"
             try:
-                text = _office_text(path) if path.suffix.lower() in OFFICE_EXTS else _text(path)
+                ext = path.suffix.lower()
+                text = _office_text(path) if ext in OFFICE_EXTS else _pdf_text(path) if ext == ".pdf" else _text(path)
             except (zipfile.BadZipFile, ET.ParseError, ValueError, KeyError) as exc:
                 return f"error: could not read this {path.suffix.lower()[1:]} file ({exc})"
             if text is None:

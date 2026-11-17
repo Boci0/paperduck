@@ -117,7 +117,7 @@ def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
     _send(_mouse(_WHEEL, -max(-MAX_SCROLL, min(MAX_SCROLL, amount)) * 120))
 
 
-def type_text(text: str, delay: float = 0.02, stop: threading.Event | None = None) -> int:
+def type_text(text: str, delay: float = 0.008, stop: threading.Event | None = None) -> int:
     """Types `text`; returns how many characters went out (fewer once `stop` is set: Stop ends it mid-text)."""
     chars = text.replace("\r\n", "\n")[:MAX_TYPE_CHARS]  # one Enter per line break, not two
     for n, char in enumerate(chars):

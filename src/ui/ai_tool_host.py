@@ -235,6 +235,9 @@ class AiToolHost(QObject):
         self._ref: QImage | None = None  # the screen as the model last saw it: screen_map, then after each action
         self._maps = 0
         self._refused: tuple[int, int, int] | None = None  # (x, y, map) of the last click refused as stale
+        self._in_batch = False
+        self._batch_acted = False
+        self._computer_review: tuple[tuple[tuple[str, ...], bool], tuple[bool, str]] | None = None
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
@@ -566,10 +569,11 @@ class AiToolHost(QObject):
                 if isinstance(found, str):  # an error, or pressed without the mouse
                     return found
                 args = {**args, "x": found[0], "y": found[1]}
-            note, x, y = self._stale_click(args["x"], args["y"])
-            if note.startswith("error"):
-                return note
-            args = {**args, "x": x, "y": y}
+            if not getattr(self, "_batch_acted", False):
+                note, x, y = self._stale_click(args["x"], args["y"])
+                if note.startswith("error"):
+                    return note
+                args = {**args, "x": x, "y": y}
         out = self._on_gui(lambda done: self._act(done, name, args), 90.0)  # up to 2000 chars at 20 ms
         return note + out if isinstance(out, str) else "error: the action did not finish in time"
 
@@ -658,25 +662,33 @@ class AiToolHost(QObject):
                              "computer control", ", ".join(risks)):
             return "error: the user declined these actions"
         cancel, lines = self.cancel, []
-        for i, step in enumerate(steps, 1):
-            if cancel.is_set():
-                return "\n".join([*lines, "error: stopped by the user"])
-            out = self._computer(step["tool"], {k: v for k, v in step.items() if k != "tool"}, approved=True)
-            lines.append(f"{i}. {out}")
-            if out.startswith("error"):
-                return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
-        return "\n".join(lines)
+        self._batch_acted = False
+        try:
+            for i, step in enumerate(steps, 1):
+                if cancel.is_set():
+                    return "\n".join([*lines, "error: stopped by the user"])
+                self._in_batch = i < len(steps)
+                out = self._computer(step["tool"], {k: v for k, v in step.items() if k != "tool"}, approved=True)
+                self._batch_acted = True
+                lines.append(f"{i}. {out}")
+                if out.startswith("error"):
+                    return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
+            return "\n".join(lines)
+        finally:
+            self._in_batch = False
+            self._batch_acted = False
 
     def _act(self, done: Callable[[Any], None], name: str, args: dict[str, Any]) -> None:
         """Make the pet and the chat click-through (hidden only where Windows cannot), give the keyboard to the
         app under them, act, then restore them."""
+        in_batch = getattr(self, "_in_batch", False)
         shown = _ours(self._win)
         hidden = [w for w in shown if not computer.click_through(int(w.winId()), True)]
         for w in hidden:
             w.hide()
         before = [("", False)]
 
-        def act() -> str:  # on a worker thread: typing takes 20 ms a character and must not freeze the pet
+        def act() -> str:  # on a worker thread: typing takes 8 ms a character and must not freeze the pet
             computer.focus_front_app()  # the chat has the keyboard after the user pressed Enter
             before[0] = computer.front_state()
             try:
@@ -703,9 +715,10 @@ class AiToolHost(QObject):
                     show_quietly(w)
                 else:
                     computer.click_through(int(w.winId()), False)
-            text = (result + "." + computer.front_note(before[0], computer.front_state()) + " Call screen_map for details."
+            tail = "" if in_batch else " Call screen_map for details."
+            text = (result + "." + computer.front_note(before[0], computer.front_state()) + tail
                     if not result.startswith("error") else result)
-            if self._ref is None:
+            if self._ref is None or in_batch:
                 done(text)
                 return
 
@@ -719,7 +732,8 @@ class AiToolHost(QObject):
         def work() -> None:
             result = act()
             # back on the Qt thread; the app needs a moment to react before the next look
-            self._call.emit((lambda _done: QTimer.singleShot(250, lambda: finish(result)),
+            delay = 50 if in_batch else 250
+            self._call.emit((lambda _done: QTimer.singleShot(delay, lambda: finish(result)),
                              {"event": threading.Event(), "result": None}))
 
         QTimer.singleShot(180 if hidden else 0, lambda: threading.Thread(target=work, daemon=True).start())
@@ -787,9 +801,22 @@ class AiToolHost(QObject):
         extra: dict[str, Any] = {"danger": risk} if risk else {"untrusted": True} if (
             self.outside and key in OUTSIDE_GUARDED) else {}
         if auto_mode(self._win) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
-            extra["review"] = self._review(text)
-            if self.cancel.is_set():
-                return False
+            if key == "computer" and not risk:
+                cache_key = (tuple(chat.user_requests()), bool(extra.get("untrusted")))
+                cached = getattr(self, "_computer_review", None)
+                if cached is not None and cached[0] == cache_key and cached[1][0]:
+                    extra["review"] = cached[1]
+                else:
+                    verdict = self._review(text)
+                    if self.cancel.is_set():
+                        return False
+                    extra["review"] = verdict
+                    if verdict[0]:
+                        self._computer_review = (cache_key, verdict)
+            else:
+                extra["review"] = self._review(text)
+                if self.cancel.is_set():
+                    return False
         ask = lambda done: chat.confirm(key, text, what, done, **extra)  # noqa: E731
         return self._waiting(ask) is True
 

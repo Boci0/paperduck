@@ -259,3 +259,46 @@ def test_a_stale_checklist_gets_a_reminder_until_it_is_finished() -> None:
     assert [i for i, n in enumerate(notes) if "checklist" in n] == [4, 9]
     ai_assist._steer("plan_tasks", "p2", "task list shown (3 of 3 done)", state)  # all done: no more reminders
     assert all(ai_assist._steer("t", f"d{i}", "ok", state) == "" for i in range(10))
+
+
+def test_stale_screen_maps_are_trimmed_in_batches_even_under_working_chars() -> None:
+    from src.tools import ai_assist
+
+    map_text = "Screen 1920x1080. All (x, y) are screen pixels: click exactly there.\n" + ("ctrl line\n" * 60)
+    msgs: list[dict] = [{"role": "user", "content": "go"}]
+    for i in range(4):
+        msgs.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"s{i}", "function": {"name": "screen_map", "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"s{i}", "content": map_text})
+        if i == 2:
+            ai_assist._trim_results(msgs, 1)
+            assert all(not m["content"].endswith(ai_assist.TRIMMED) for m in msgs if m["role"] == "tool")
+    ai_assist._trim_results(msgs, 1)
+    tools = [m["content"] for m in msgs if m["role"] == "tool"]
+    assert all(c.endswith(ai_assist.TRIMMED) for c in tools[:3]) and tools[3] == map_text
+
+    turns: list[dict] = [{"role": "user", "content": "go"}]
+    for i in range(4):
+        turns.append({"role": "assistant", "content": [{"type": "tool_use", "id": f"c{i}", "name": "screen_map", "input": {}}]})
+        turns.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"c{i}", "content": map_text}]})
+    trimmed = ai_assist._trim_claude_results(turns, 1)
+    assert trimmed is not None
+    res = [t["content"][0]["content"] for t in trimmed if t["role"] == "user" and isinstance(t["content"], list)]
+    assert all(c.endswith(ai_assist.TRIMMED) for c in res[:3]) and res[3] == map_text
+
+
+def test_computer_batch_loop_with_varying_coordinates_is_flagged() -> None:
+    from src.tools import ai_assist
+
+    state = [0, 0, None, []]
+    notes = [
+        ai_assist._steer(
+            "computer_batch",
+            f'computer_batch{{"steps": [{{"tool": "mouse_click", "x": {100 + i * 10}, "y": {200 + i * 5}}}]}}',
+            f"1. clicked {i}",
+            state,
+        )
+        for i in range(ai_assist.LOOP_CALLS)
+    ]
+    assert all(n == "" for n in notes[:-1]) and "8 times" in notes[-1]
+
