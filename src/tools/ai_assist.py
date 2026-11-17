@@ -288,6 +288,7 @@ class AiReply:
     cut_off: bool = False  # hit max_tokens
     compacted: int = 0  # oldest history turns replaced by `summary` before this answer (auto-compact)
     summary: str = ""
+    archive: str = ""  # the file holding the summarized turns in full ("" when none was written)
     tools: list[tuple[str, str]] = field(default_factory=list)  # (call note, output), e.g. ("web_search(rust)", "...")
     # Chat completions: this answer's own messages as last sent (tool calls, results, reasoning) plus the final one.
     # The chat replays them word for word next time, so the provider's prefix cache still covers this answer.
@@ -494,8 +495,11 @@ def compact_split(history: list[dict[str, Any]]) -> int:
 
 
 def compact_history(base_url: str, key: str, model: str, history: list[dict[str, Any]],
-                    cancel: threading.Event | None = None) -> tuple[list[dict[str, Any]], int, str]:
-    """(history to send, turns summarized, summary). Any failure sends the history as it was: nothing is lost."""
+                    cancel: threading.Event | None = None, archive: Callable[[list[dict[str, Any]]], Any] | None = None,
+                    tasks: list[tuple[str, str]] | None = None) -> tuple[list[dict[str, Any]], int, str]:
+    """(history to send, turns summarized, summary). Any failure sends the history as it was: nothing is lost.
+    `archive` saves the summarized turns and returns their file, which the summary names (as do `tasks`), so the
+    answer sent with it can already search them."""
     split = compact_split(history)
     if not split:
         return history, 0, ""
@@ -507,7 +511,8 @@ def compact_history(base_url: str, key: str, model: str, history: list[dict[str,
         return history, 0, ""
     if not summary:
         return history, 0, ""
-    return [*summary_turns(summary), *history[split:]], split, summary
+    saved = archive(history[:split]) if archive is not None else None
+    return [*summary_turns(summary, str(saved or ""), tasks), *history[split:]], split, summary
 
 
 REVIEW_PROMPT = (
@@ -727,9 +732,9 @@ def _request_once(base_url: str, key: str, path: str, body: dict[str, Any] | Non
             if progress is not None and "event-stream" in (resp.headers.get("Content-Type") or ""):
                 return (_read_anthropic_stream if is_anthropic(base_url) else _read_stream)(resp, progress)
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:  # its body may echo the request, so it is never shown
-        if is_anthropic(base_url) and exc.code in (400, 422):  # ...except Anthropic's own error text, which names the cause
-            raise ValueError(_anthropic_error(exc)) from None
+    except urllib.error.HTTPError as exc:  # its body may echo the request, so it is never shown (see _http_400)
+        if exc.code in (400, 422):
+            raise ValueError(_http_400(exc, base_url)) from None
         message = _HTTP_ERRORS.get(exc.code, f"http {exc.code}")
         if exc.code in _RETRY_CODES:
             raise _Transient(message, _retry_after(exc.headers)) from None
@@ -985,13 +990,24 @@ def _int(value: Any) -> int:
 _DATA_URL = re.compile(r"^data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$")
 
 
-def _anthropic_error(exc: urllib.error.HTTPError) -> str:
-    """Anthropic's 400 text says what is wrong (tool not enabled, bad effort); it never contains the key."""
+_TOO_LONG = re.compile(r"context[ _-]?(length|window)|maximum context|prompt is too long|input token count|"
+                       r"too many (input )?tokens|reduce the length of the (messages|input)", re.I)
+
+
+def _http_400(exc: urllib.error.HTTPError, base_url: str) -> str:
+    """A 400/422 as a short reason. "too long" when the provider says the context overflowed, so `ask` never takes
+    it for missing thinking or tool support. Anthropic's own text names the cause (tool not enabled, bad effort) and
+    is shown; another provider's body may echo the request, so only its verdict is used, never its text."""
     try:
-        message = json.loads(exc.read(4096))["error"]["message"]
+        error = json.loads(exc.read(4096))["error"]
+        message = f"{error.get('message', '')} {error.get('code', '')}" if isinstance(error, dict) else str(error)
     except (ValueError, KeyError, TypeError, OSError):
         return "bad request"
-    return " ".join(message.split())[:200] if isinstance(message, str) and message.strip() else "bad request"
+    if _TOO_LONG.search(message):
+        return "too long"
+    if is_anthropic(base_url) and isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"].strip():
+        return " ".join(error["message"].split())[:200]
+    return "bad request"
 
 
 def claude_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:

@@ -960,7 +960,7 @@ def run_command(root: Path | None, command: Any, cancel: threading.Event | None 
                 head += " (an Office app is probably waiting on an open dialog: read_screen, press esc, retry)"
         sink.seek(0)
         raw = sink.read()
-    out = console_text(raw).replace("\r\n", "\n").strip()
+    out = clean_output(console_text(raw)).strip()
     if len(out) > MAX_COMMAND_CHARS:  # the end usually holds the verdict (test summary, error)
         half = MAX_COMMAND_CHARS // 2
         out = f"{out[:half]}\n... {len(out) - MAX_COMMAND_CHARS} characters cut ...\n{out[-half:]}"
@@ -1008,6 +1008,16 @@ def shell_hint(command: str, out: str) -> str:
     if "Input redirection is not supported" in out:  # commands get no console input, which timeout needs
         return 'timeout cannot run here; wait with powershell -NoProfile -Command "Start-Sleep -Seconds N"'
     return ""
+
+
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()*+][0-9A-Za-z]|[@-Z\\-_])")  # CSI, OSC, charset, 2-char
+
+
+def clean_output(text: str) -> str:
+    """Console text as the user would see it: colour and cursor codes removed, and a line redrawn with \\r (a
+    progress bar) reduced to its last state, so spinners do not fill the output cap."""
+    lines = _ANSI.sub("", text.replace("\r\n", "\n")).split("\n")
+    return "\n".join(next((p for p in reversed(line.split("\r")) if p), "") for line in lines)
 
 
 def console_text(raw: bytes) -> str:
@@ -1182,6 +1192,8 @@ class BackgroundProcs:
             lost = max(0, proc.dropped - proc.read_to)
             new = proc.text[max(0, proc.read_to - proc.dropped):]
             proc.read_to = proc.dropped + len(proc.text)
+        # shortcut: a code or \r redraw split across two reads is left partly in; buffer the tail if that shows up
+        new = clean_output(new)
         if len(new) > MAX_COMMAND_CHARS:
             lost += len(new) - MAX_COMMAND_CHARS
             new = new[-MAX_COMMAND_CHARS:]
@@ -1201,7 +1213,7 @@ class BackgroundProcs:
         with proc.lock:
             end = proc.dropped + len(proc.text)
             text = proc.text[max(0, since - proc.dropped):]
-        return code, proc.stopped, text, end
+        return code, proc.stopped, clean_output(text), end
 
     def snapshot(self) -> list[tuple[str, str]]:
         """(name, command) of the running processes, for the chat to list."""

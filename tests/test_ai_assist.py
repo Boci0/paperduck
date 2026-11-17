@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from src.tools import ai_assist
+from src.tools import ai_assist, ai_sessions
 from src.tools.ai_assist import (MAX_INPUT_CHARS, AiAssistPlugin, ask, chat_messages, credential_target,
                                  list_models, thinking_params, validate_base_url, valid_key, valid_model)
 
@@ -37,6 +37,13 @@ class _Api(BaseHTTPRequestHandler):
         if _Api.mode == "no-vision" and any(isinstance(m["content"], list) for m in body["messages"]):
             self.send_response(400)
             self.end_headers()
+            return
+        if _Api.mode == "too-long":  # DeepSeek's context overflow, echoing part of the prompt
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": {"message": "This model's maximum context length is 131072 tokens. "
+                                                   f"However, you requested 140000 tokens. {KEY}",
+                                                   "type": "invalid_request_error"}}).encode())
             return
         if _Api.mode == "garbage":  # not an HTTP response at all
             self.wfile.write(b"NOT-HTTP\r\n\r\n")
@@ -230,6 +237,14 @@ def test_images_go_as_parts_and_fall_back_to_text(api: str) -> None:
     assert len(_Api.seen) == 3 and _Api.seen[-1]["body"]["messages"][1]["content"] == "help [Image: x]\nC6H12O6"
     ask(api, KEY, "text-only", msgs)
     assert len(_Api.seen) == 4
+
+
+def test_a_context_overflow_is_too_long_not_missing_thinking_or_tools(api: str) -> None:
+    _Api.mode = "too-long"
+    with pytest.raises(ValueError, match="^too long$") as caught:  # the echoed prompt (and key) never shows
+        ask(api, KEY, "m", T, thinking="high", host=None)
+    assert KEY not in str(caught.value) and len(_Api.seen) == 1  # no retries without thinking or tools
+    assert (api, "m") not in ai_assist._NO_THINK and (api, "m") not in ai_assist._NO_TOOLS
 
 
 def test_ask_maps_broken_http_replies_to_network(api: str) -> None:
@@ -910,10 +925,29 @@ def test_chat_confirm_offers_once_or_for_this_chat(monkeypatch: pytest.MonkeyPat
         click("Deny")
         chat.confirm_mcp("notes", "notes__get", got.append)
         assert not [b for b in chat.findChildren(QPushButton) if b.text() == "Allow once" and not b.isHidden()]
-        chat._pending(None)  # what Stop does while the worker waits
+        chat._pending[0](None)  # what Stop does while the worker waits
         assert got == [True, True, True, False, False]
         chat.new_chat()
         assert not chat._allowed
+    finally:
+        chat.close()
+
+
+def test_two_open_approvals_both_stay_answerable(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    app, _plugin, chat = _chat(monkeypatch, api)
+    got: list[tuple[str, bool]] = []
+    try:  # two parallel fetch_page calls each asking for a new link
+        chat.confirm("link", "fetch a", "links", lambda ok: got.append(("a", ok)))
+        chat.confirm("link", "fetch b", "links", lambda ok: got.append(("b", ok)))
+        first = [b for b in chat.findChildren(QPushButton) if b.text() == "Allow once" and not b.isHidden()][0]
+        first.click()  # the older card still works after a newer one opened
+        app.processEvents()
+        assert got == [("a", True)] and len(chat._pending) == 1
+        for answer in list(chat._pending):  # Stop declines every open card
+            answer(None)
+        assert got == [("a", True), ("b", False)] and chat._pending == []
     finally:
         chat.close()
 
@@ -960,7 +994,7 @@ def test_auto_mode_approves_all_confirmations_hands_free(monkeypatch: pytest.Mon
         plugin.auto = False
         chat.confirm("run_command", "run: pytest", "commands", got.append)
         assert len(asking()) == 1  # off again: asks as before
-        chat._pending(None)
+        chat._pending[0](None)
         assert got[-1] is False
     finally:
         chat.close()
@@ -1049,11 +1083,17 @@ def test_chat_auto_compacts_long_history(monkeypatch: pytest.MonkeyPatch, api: s
     try:
         chat._history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"old {i} " * 10}
                          for i in range(10)]
+        chat._tasks = [("ship it", "in_progress")]
         chat.insert_text("next question")
         chat.send()
         _wait(app, lambda: chat._job is None and chat._history[-1]["role"] == "assistant")
         assert len(_Api.seen) == 2  # one summary request, then the real one
         assert chat._history[0]["content"].startswith(ai_assist.COMPACT_MARK)
+        sent = next(m["content"] for m in _Api.seen[1]["body"]["messages"] if ai_assist.COMPACT_MARK in str(m["content"]))
+        archive = ai_sessions.archive_path(chat._sid)  # the answer sent with the summary can already search it
+        assert str(archive) in sent and "- [in_progress] ship it" in sent and "old 0" in archive.read_text("utf-8")
+        assert chat._history[0]["content"] == sent  # the chat keeps what was sent: no second archive write
+        assert archive.read_text("utf-8").count("## user\nold 0") == 1
         # 11 turns: the split backs up from 5 to the user turn at 4, so 4 are summarized and 7 kept word for word
         assert chat._history[-2]["content"] == "next question" and len(chat._history) == 2 + 7 + 1
         assert [t for t in chat.findChildren(ChatText) if t.toPlainText().startswith("Compacted 4 earlier")]
@@ -1634,7 +1674,7 @@ def test_auto_mode_card_follows_the_reviewer(monkeypatch: pytest.MonkeyPatch, ap
         assert got == [True, True] and not asking() and chat._allowed == {"mcp:notes"}  # MCP: like Allow for chat
         chat.confirm("read_secret", "read .env", "secret files", got.append, review=(False, "not needed"))
         assert len(asking()) == 1 and got == [True, True]  # the reviewer sent it back to the user
-        chat._pending(None)
+        chat._pending[0](None)
         assert got[-1] is False
     finally:
         chat.close()

@@ -145,7 +145,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._job: AiJob | None = None
         self._auto_send = False  # a macro's `ask` step: send once images are read and no reply is pending
         self._allowed: set[str] = set()  # what the user allowed for this chat: "mcp:<server>", "edit_file", ...
-        self._pending: Callable[[str | None], None] | None = None  # the open Allow/Deny prompt
+        self._pending: list[Callable[[str | None], None]] = []  # open Allow/Deny prompts (parallel calls can ask at once)
         self._models_job: AiJob | None = None
         self._models: dict[str, list[ModelInfo]] = {}  # base URL -> its /models list, fetched on first open
         self._balance_job: AiJob | None = None
@@ -433,8 +433,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             return
         with self._branch_lock:  # so a dying worker cannot take branch notes after this (see _take_steer)
             self._cancel.set()  # no further request or tool runs; a running command is killed
-        if self._pending is not None:  # the worker is waiting on it
-            self._pending(None)
+        for answer in list(self._pending):  # workers are waiting on them
+            answer(None)
         job, self._job = self._job, None
         job.finished.disconnect(self._on_done)
         job.finished.connect(job.deleteLater)  # its thread still emits: deleting it now races that emit
@@ -458,15 +458,22 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             if self._job is job:  # a stopped answer's worker may still be talking
                 self._progress = text
 
+        long = history is not None and history_chars(history) > COMPACT_AT
+        sid, tasks, saved = self.ensure_sid() if long else "", list(self._tasks), [""]
+
+        def keep(turns: list[dict]) -> str:  # worker thread; only file writes. shortcut: a failed answer rewrites them next time
+            saved[0] = str(archive_turns(sid, turns) or "")
+            return saved[0]
+
         def run() -> AiReply:
             if history is None:
                 return ask(url, key, model, messages or [], thinking=thinking, host=host, steer=lambda: self._take_steer(cancel), cancel=cancel)
-            sent, n, summary = (compact_history(url, key, model, history, cancel) if history_chars(history) > COMPACT_AT
+            sent, n, summary = (compact_history(url, key, model, history, cancel, keep, tasks) if long
                                 else (history, 0, ""))
             # shortcut: Claude still gets earlier answers in note form (its turns are built in another shape)
             reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url)), thinking=thinking, host=host, progress=note,
                          steer=lambda: self._take_steer(cancel), cancel=cancel)
-            reply.compacted, reply.summary = n, summary
+            reply.compacted, reply.summary, reply.archive = n, summary, saved[0]
             return reply
 
         job.start(run)
@@ -523,8 +530,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             self._history.append({"role": "user", "content": f"(sent while you worked) {text}",
                                   **({"said": words} if words else {})})
         if reply.compacted:
-            saved = archive_turns(self.ensure_sid(), self._history[:reply.compacted])  # before they are replaced
-            self._history[:reply.compacted] = summary_turns(reply.summary, str(saved or ""), self._tasks)
+            # the worker already archived the turns and sent this summary; the task list is the latest one
+            self._history[:reply.compacted] = summary_turns(reply.summary, reply.archive, self._tasks)
             self._add_row("note", f"Compacted {reply.compacted} earlier messages into a summary to keep the chat "
                                   "within its context budget.")
         self._accept_reply(reply)
@@ -850,9 +857,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         btns: list[QPushButton] = []
 
         def answer(choice: str | None) -> None:
-            if self._pending is not answer:
+            if answer not in self._pending:
                 return
-            self._pending = None
+            self._pending.remove(answer)
             if choice == "chat":
                 self._allowed.add(key)
             if choice is None:
@@ -873,11 +880,11 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         buttons.addStretch(1)
         card.body.addLayout(buttons)
         self._append(card)
-        self._pending = answer
+        self._pending.append(answer)
 
         def expire() -> None:
-            if self._pending is answer:  # the worker stopped waiting (declined): the card must not look answerable
-                self._pending = None
+            if answer in self._pending:  # the worker stopped waiting (declined): the card must not look answerable
+                self._pending.remove(answer)
                 card.set_header(f"Timed out  -  {what}", TEXT_DIM_HEX)
                 for btn in btns:
                     btn.hide()

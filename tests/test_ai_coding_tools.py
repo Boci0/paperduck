@@ -137,7 +137,7 @@ def test_host_edit_files_asks_once_with_every_diff_and_task_list_reaches_the_cha
 
 
 def test_edits_outside_the_project_folder_ask_under_their_own_key(repo: Path, tmp_path: Path) -> None:
-    from src.tools.ai_tools import skills_dir
+    from src.tools.ai_tools import scratch_dir, skills_dir
 
     keys: list[str] = []
 
@@ -156,12 +156,18 @@ def test_edits_outside_the_project_folder_ask_under_their_own_key(repo: Path, tm
         host.run("edit_file", {"path": str(skill), "old_text": "", "new_text": "x"})
         host.run("edit_files", {"edits": [{"path": "a2.txt", "old_text": "", "new_text": "x"},
                                           {"path": str(tmp_path / "b2.txt"), "old_text": "", "new_text": "x"}]})
+        host.run("edit_file", {"path": str(helper), "old_text": "", "new_text": "x"})
 
+    helper = scratch_dir() / f"test_{tmp_path.name}.py"
     skill.parent.mkdir(parents=True, exist_ok=True)
-    _run_on_thread(app, work)
-    assert keys == ["edit_file", "edit_outside", "edit_outside", "edit_outside"]  # one file outside: the whole batch
-    from src.ui.ai_tool_host import OUTSIDE_GUARDED
-    assert "edit_outside" in OUTSIDE_GUARDED
+    try:
+        _run_on_thread(app, work)
+    finally:
+        helper.unlink(missing_ok=True)
+    # one file outside: the whole batch; a scratch helper never shares the key that covers Startup and the rest
+    assert keys == ["edit_file", "edit_outside", "edit_outside", "edit_outside", "edit_scratch"]
+    from src.ui.ai_tool_host import AUTO_INSTANT, OUTSIDE_GUARDED
+    assert {"edit_outside", "edit_scratch"} <= OUTSIDE_GUARDED and "edit_scratch" not in AUTO_INSTANT
 
 
 def _py(code: str) -> str:
