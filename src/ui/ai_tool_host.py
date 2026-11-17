@@ -27,7 +27,7 @@ from PyQt6.QtGui import QCursor, QGuiApplication, QImage
 from PyQt6.QtWidgets import QFileDialog
 
 from src.tools import computer
-from src.tools.ai_assist import ask, fit_thinking, load_key, review_action
+from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool_note
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
                                 computer_action, destructive_reason, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
@@ -238,6 +238,7 @@ class AiToolHost(QObject):
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
+        self.ran: list[tuple[str, str]] = []  # (tool note, output) this answer ran; a fresh list per answer, kept on Stop
         self.approve_s = APPROVE_TIMEOUT_S  # the chat raises it for an errand's answer
         self.outside = False  # ask() sets it while the chat holds web, MCP or agent content (see _allowed)
         self.agents = Agents(self._run_agent, lambda text, source: self._win._ai_chat.add_branch_note(text, source),
@@ -268,9 +269,12 @@ class AiToolHost(QObject):
         """One tool call; the pet acts it out meanwhile (`activity`)."""
         self._tool = name  # what the pet goes back to acting out after an approval
         self.activity.emit(name)
+        ran, out = self.ran, "error: did not finish"  # this answer's list: a stopped worker's late tool stays in it
         try:
-            return self._run(name, args)
+            out = self._run(name, args)
+            return out
         finally:
+            ran.append((tool_note(name, args), out))
             self.activity.emit("")
 
     def _run(self, name: str, args: dict[str, Any]) -> str:
@@ -288,7 +292,7 @@ class AiToolHost(QObject):
             allowed = self._waiting(lambda done: chat.confirm_mcp(server, name, done, shown[:600], risk, **extra))
             if allowed is not True:
                 return "error: the user did not allow this MCP server"
-            out = self.mcp.call(name, args)
+            out = self.mcp.call(name, args, self.cancel)
             if self.mcp.image:  # a browser screenshot rides along like screen_map's (dropped for blind models)
                 from src.ui.chat_widgets import image_data_url
                 try:
@@ -680,8 +684,9 @@ class AiToolHost(QObject):
                     computer.click(args["x"], args["y"], args.get("button") or "left", bool(args.get("double")))
                     result = "clicked"
                 elif name == "type_text":
-                    computer.type_text(args["text"])
-                    result = f"typed {min(len(args['text']), computer.MAX_TYPE_CHARS)} characters"
+                    typed = computer.type_text(args["text"], stop=self.cancel)
+                    result = (f"error: stopped by the user after {typed} characters" if self.cancel.is_set()
+                              else f"typed {typed} characters")
                 elif name == "press_key":
                     computer.press(computer.parse_keys(args["keys"]))
                     result = f"pressed {args['keys']}"

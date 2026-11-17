@@ -550,6 +550,23 @@ def test_chat_stop_drops_the_pending_reply(monkeypatch: pytest.MonkeyPatch, api:
         chat.close()
 
 
+def test_chat_stop_keeps_the_tools_that_already_ran(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
+    from types import SimpleNamespace
+
+    _app, _plugin, chat = _chat(monkeypatch, api)
+    try:
+        chat.insert_text("fix the layout")
+        chat.send()
+        ran = [("edit_file(index.html)", "ok: 1 change")]
+        chat._tool_host = SimpleNamespace(ran=ran)  # what AiToolHost.run recorded before Stop
+        chat._send_or_stop()
+        last = chat._history[-1]
+        assert last["tools"] is ran and last["content"].startswith("(stopped by the user after the tools above ran")
+    finally:
+        chat._tool_host = None
+        chat.close()
+
+
 def test_chat_stop_keeps_the_job_alive_until_its_thread_is_done(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     """Stop used to deleteLater() the AiJob while its thread was still waiting on the reply."""
     import time

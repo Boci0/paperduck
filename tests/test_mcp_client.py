@@ -61,6 +61,17 @@ def test_hub_lists_calls_and_caps_tools(hub: McpHub, monkeypatch: pytest.MonkeyP
     assert hub.call("fake__echo", {"text": "after"}).endswith("echo: after\n[image: sent to you after the tool results]")
 
 
+def test_stop_ends_a_waiting_call_at_once(hub: McpHub) -> None:
+    import time
+    hub.specs()
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    began = time.monotonic()
+    out = hub.call("fake__hang", {}, stop)  # the server would sit on it for 30 s
+    assert "stopped by the user" in out and time.monotonic() - began < 1.5
+    assert hub._servers["fake"].alive  # Stop is not a hang: the server keeps running for the next message
+
+
 def test_hub_restarts_when_the_config_changes(hub: McpHub) -> None:
     assert hub.specs()
     hub.path.write_text('{"mcpServers": {}}', encoding="utf-8")

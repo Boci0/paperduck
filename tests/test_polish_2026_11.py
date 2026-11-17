@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -145,5 +146,12 @@ def test_typed_crlf_is_one_enter(monkeypatch: pytest.MonkeyPatch) -> None:
     sent = []
     monkeypatch.setattr(computer, "_send", lambda *inputs: sent.append(inputs[0].ki.vk))
     monkeypatch.setattr(computer.time, "sleep", lambda _s: None)
-    computer.type_text("a\r\nb")
+    assert computer.type_text("a\r\nb") == 3
     assert sent.count(0x0D) == 1
+
+
+def test_stop_ends_typing_mid_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    stop, sent = threading.Event(), []
+    monkeypatch.setattr(computer, "_send", lambda *inputs: sent.append(1) if len(sent) < 4 else stop.set())
+    monkeypatch.setattr(computer.time, "sleep", lambda _s: None)
+    assert computer.type_text("abcdefgh", stop=stop) == 5  # the 5th key went out as Stop landed

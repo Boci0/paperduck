@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import time
 from ctypes import wintypes
 
@@ -116,8 +117,12 @@ def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
     _send(_mouse(_WHEEL, -max(-MAX_SCROLL, min(MAX_SCROLL, amount)) * 120))
 
 
-def type_text(text: str, delay: float = 0.02) -> None:
-    for char in text.replace("\r\n", "\n")[:MAX_TYPE_CHARS]:  # one Enter per line break, not two
+def type_text(text: str, delay: float = 0.02, stop: threading.Event | None = None) -> int:
+    """Types `text`; returns how many characters went out (fewer once `stop` is set: Stop ends it mid-text)."""
+    chars = text.replace("\r\n", "\n")[:MAX_TYPE_CHARS]  # one Enter per line break, not two
+    for n, char in enumerate(chars):
+        if stop is not None and stop.is_set():
+            return n
         if char in "\r\n":
             _send(_key(0x0D), _key(0x0D, flags=_KEYUP))
         elif char == "\t":
@@ -128,6 +133,7 @@ def type_text(text: str, delay: float = 0.02) -> None:
                 unit = int.from_bytes(data[i:i + 2], "little")
                 _send(_key(0, unit, _UNICODE), _key(0, unit, _UNICODE | _KEYUP))
         time.sleep(delay)
+    return len(chars)
 
 
 def press(codes: list[int]) -> None:

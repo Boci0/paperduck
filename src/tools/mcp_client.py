@@ -43,7 +43,8 @@ PROTOCOL_VERSION = "2025-06-18"
 START_TIMEOUT_S = 60.0  # a first npx / uvx start downloads the package
 CALL_TIMEOUT_S = 60.0
 MAX_RESULT_CHARS = 30000
-MAX_IMAGE_B64 = 28 * 1024 * 1024  # about 20 MB decoded, the same cap view_image has
+STOP_POLL_S = 0.2  # how often a waiting call looks at Stop
+MAX_IMAGE_B64 =28 * 1024 * 1024  # about 20 MB decoded, the same cap view_image has
 MAX_TOOLS_PER_SERVER = 64
 IDLE_CLOSE_S = 300.0  # servers unused this long are closed (an npx server is two node processes, ~180 MB)
 NPX_REFRESH_S = 7 * 86400.0  # a cached npx server still starts through npx this often, so `@latest` updates
@@ -232,8 +233,9 @@ class McpServer:
         self._proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
         self._proc.stdin.flush()
 
-    def request(self, method: str, params: dict[str, Any], timeout: float) -> Any:
-        """The result of one JSON-RPC call; RuntimeError on an error reply, exit or timeout."""
+    def request(self, method: str, params: dict[str, Any], timeout: float,
+                cancel: threading.Event | None = None) -> Any:
+        """The result of one JSON-RPC call; RuntimeError on an error reply, exit, timeout or `cancel` (Stop)."""
         with self._lock:
             self._next_id += 1
             rid = self._next_id
@@ -241,10 +243,20 @@ class McpServer:
                 self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             except OSError:
                 raise RuntimeError("the server is not running") from None
+            end = time.monotonic() + timeout
             while True:
                 try:
-                    line = self._lines.get(timeout=timeout)
+                    line = self._lines.get(timeout=max(0.0, min(STOP_POLL_S, end - time.monotonic())))
                 except queue.Empty:
+                    if cancel is not None and cancel.is_set():  # its late answer has an old id and is skipped
+                        try:
+                            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                        "params": {"requestId": rid, "reason": "stopped by the user"}})
+                        except OSError:
+                            pass
+                        raise RuntimeError("stopped by the user") from None
+                    if time.monotonic() < end:
+                        continue
                     self.close()  # a hung server would stall every later call
                     raise RuntimeError(f"no answer within {timeout:.0f}s") from None
                 if line is None:
@@ -287,10 +299,10 @@ class McpServer:
             specs.append(spec)
         return specs
 
-    def call(self, tool: str, args: dict[str, Any]) -> str:
+    def call(self, tool: str, args: dict[str, Any], cancel: threading.Event | None = None) -> str:
         self.image = b""
         try:
-            result = self.request("tools/call", {"name": self.tools[tool], "arguments": args}, CALL_TIMEOUT_S)
+            result = self.request("tools/call", {"name": self.tools[tool], "arguments": args}, CALL_TIMEOUT_S, cancel)
             self.image = result_image(result)
             return result_text(result)
         except (RuntimeError, OSError) as exc:  # OSError: the server's stdin closed while it asked us something
@@ -357,7 +369,7 @@ class McpHub:
         server, _sep, tool = name.partition(SEP)
         return tool in getattr(self._servers.get(server), "destructive", ())
 
-    def call(self, name: str, args: dict[str, Any]) -> str:
+    def call(self, name: str, args: dict[str, Any], cancel: threading.Event | None = None) -> str:
         server, _sep, tool = name.partition(SEP)
         self.image = b""
         if self.server_of(name) is None:
@@ -366,7 +378,7 @@ class McpHub:
         running = self._servers.get(server)  # specs() or close_idle() may have stopped it meanwhile
         if running is None:
             return "error: the MCP server stopped; try again"
-        out = running.call(tool, args)
+        out = running.call(tool, args, cancel)
         self.image = running.image
         self._used = time.monotonic()
         if not running.alive:

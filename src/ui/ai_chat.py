@@ -452,7 +452,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         host = None if self._testing else self._tool_host
         cancel = self._cancel = threading.Event()
         if host is not None:
-            host.cancel = cancel
+            host.cancel, host.ran = cancel, []
 
         def note(text: str) -> None:
             if self._job is job:  # a stopped answer's worker may still be talking
@@ -520,9 +520,14 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
                 self._add_bubble("error", friendly_error(error) + top_up)
             else:
                 self._add_row("note", "Stopped")
+            # what already ran stays in the chat, so the next message knows what changed before the stop or failure
+            # the live list, not a copy: a tool still running at Stop adds its own line once it ends
+            ran = getattr(self._tool_host, "ran", None) or []
             if self._history and self._history[-1]["role"] == "user":
-                self._history.append({"role": "assistant", "content": "(stopped by the user before answering)"
-                                      if error == "stopped" else f"(the answer failed: {friendly_error(error)})"})
+                why = "stopped by the user" if error == "stopped" else f"the answer failed: {friendly_error(error)}"
+                self._history.append({"role": "assistant", **({"tools": ran} if ran else {}), "content":
+                                      f"({why} after the tools above ran; check what they changed before redoing them)"
+                                      if ran else f"({why} before answering)" if error == "stopped" else f"({why})"})
             self._save_session()  # the turn and any steer text survive a quit before the next answer
             self._relayout()
             return
