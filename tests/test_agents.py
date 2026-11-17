@@ -259,23 +259,6 @@ def test_spawn_hands_shared_pictures_and_the_viewer_to_the_agent_host() -> None:
     assert got[0].images == ["data:image/png;base64,AA"] and got[0]._view is view
 
 
-def test_agent_host_auto_mode_allows_secrets_and_new_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.tools import ai_assist
-
-    (tmp_path / ".env").write_text("TOKEN=abc", encoding="utf-8")
-    monkeypatch.setattr(ai_assist, "fetch_page", lambda url: f"fetched {url}")
-
-    safe = ReadOnlyHost(tmp_path, local_data=True)
-    assert "secrets file" in safe.run("read_file", {"path": ".env"})
-    assert "only opens links already" in ai_assist._run_tool_raw(
-        "fetch_page", {"url": "https://docs.example/new"}, safe, seen="local data")
-
-    auto_host = ReadOnlyHost(tmp_path, local_data=True, auto=True)
-    assert "TOKEN=abc" in auto_host.run("read_file", {"path": ".env"})
-    assert ai_assist._run_tool_raw(
-        "fetch_page", {"url": "https://docs.example/new"}, auto_host, seen="local data") == "fetched https://docs.example/new"
-
-
 def test_spawn_spec_offers_share_images_and_the_prompt_names_view_image() -> None:
     from src.tools.agents import AGENT_PROMPT, SPAWN_SPEC
     props = SPAWN_SPEC["function"]["parameters"]["properties"]
@@ -359,3 +342,28 @@ def test_a_long_report_keeps_its_head_and_its_tail() -> None:
     text = posts[0][1].split("report: ", 1)[1]
     assert len(text) <= MAX_REPORT_CHARS and text.startswith("H" * 5500) and text.endswith("OPEN: the tail")
     assert "[...cut...]" in text
+
+
+def test_agent_host_auto_mode_asks_the_reviewer_for_secrets_and_new_links(tmp_path: Path,
+                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools import ai_assist
+
+    (tmp_path / ".env").write_text("TOKEN=abc", encoding="utf-8")
+    monkeypatch.setattr(ai_assist, "fetch_page", lambda url: f"fetched {url}")
+    asked: list[str] = []
+    verdict = [False]
+
+    def review(action: str) -> tuple[bool, str]:
+        asked.append(action)
+        return verdict[0], "reason"
+
+    host = ReadOnlyHost(tmp_path, local_data=True, review=review)
+    assert "secrets file" in host.run("read_file", {"path": ".env"}) and ".env" in asked[-1]
+    assert "did not allow this link" in ai_assist._run_tool_raw(
+        "fetch_page", {"url": "https://docs.example/new"}, host, seen="local data")
+    assert "https://docs.example/new" in asked[-1]
+    verdict[0] = True
+    assert "TOKEN=abc" in host.run("read_file", {"path": ".env"})
+    assert ai_assist._run_tool_raw(
+        "fetch_page", {"url": "https://docs.example/new"}, host, seen="local data") == "fetched https://docs.example/new"
+    assert len(asked) == 4

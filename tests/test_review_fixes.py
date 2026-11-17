@@ -45,7 +45,8 @@ def test_tool_calls_without_an_index_stay_separate() -> None:
         return _event({"tool_calls": [{"id": call_id, "function": {"name": name, "arguments": args}}]})
 
     lines = [whole("a", "foo", "{}"), whole("b", "bar", '{"x":1}'),
-             _event({"tool_calls": [{"function": {"arguments": ""}}]})]  # an id-less fragment joins the last call
+             _event({"tool_calls": [{"function": {"arguments": ""}}]}),  # an id-less fragment joins the last call
+             b"data: [DONE]\n"]
     calls = ai_assist._read_stream(lines, lambda _s: None)["choices"][0]["message"]["tool_calls"]
     assert [(c["id"], c["function"]["name"], c["function"]["arguments"]) for c in calls] == [
         ("a", "foo", "{}"), ("b", "bar", '{"x":1}')]

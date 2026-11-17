@@ -982,17 +982,31 @@ def test_computer_batch_runs_steps_in_order_and_stops_at_an_error() -> None:
 
     from src.ui.ai_tool_host import AiToolHost
 
-    done: list[tuple[str, dict]] = []
-    fake = SimpleNamespace(cancel=threading.Event(),
-                           _computer=lambda n, a: done.append((n, a)) or ("error: no" if a.get("keys") == "bad" else "ok"))
-    steps = [{"tool": "mouse_click", "x": 1, "y": 2}, {"tool": "type_text", "text": "hi"}, {"tool": "press_key", "keys": "enter"}]
+    done: list[tuple[str, dict, bool]] = []
+    asked: list[tuple[str, str]] = []
+    allow = [True]
+    fake = SimpleNamespace(
+        cancel=threading.Event(),
+        _allowed=lambda key, text, what, risk="": asked.append((text, risk)) or allow[0],
+        _computer=lambda n, a, approved=False: done.append((n, a, approved)) or ("error: no" if a.get("keys") == "f5" else "ok"))
+    steps = [{"tool": "mouse_click", "x": 1, "y": 2, "name": None}, {"tool": "type_text", "text": "hi"},
+             {"tool": "press_key", "keys": "enter"}]
     assert AiToolHost._batch(fake, steps) == "1. ok\n2. ok\n3. ok"
-    assert done[0] == ("mouse_click", {"x": 1, "y": 2})
+    assert len(asked) == 1 and "1. left-click at (1, 2)\n2. type: hi\n3. press enter" in asked[0][0]  # one approval
+    assert done[0] == ("mouse_click", {"x": 1, "y": 2, "name": None}, True)  # null name: an omitted argument
     done.clear()
-    out = AiToolHost._batch(fake, [{"tool": "press_key", "keys": "bad"}, {"tool": "press_key", "keys": "enter"}])
+    out = AiToolHost._batch(fake, [{"tool": "press_key", "keys": "f5"}, {"tool": "press_key", "keys": "enter"}])
     assert out.endswith("stopped at step 1 of 2") and len(done) == 1
+    asked.clear()
+    AiToolHost._batch(fake, [{"tool": "press_key", "keys": "enter"}, {"tool": "press_key", "keys": "alt+f4"}])
+    assert asked[0][1] == "alt+f4"  # one risky step makes the whole batch a risky approval
+    allow[0] = False
+    done.clear()
+    assert AiToolHost._batch(fake, steps).startswith("error: the user declined") and not done
     assert AiToolHost._batch(fake, [{"tool": "run_command"}]).startswith("error: step 1")
+    assert AiToolHost._batch(fake, [{"tool": "scroll", "amount": "x"}]).startswith("error: step 1")
     assert AiToolHost._batch(fake, []).startswith("error")
+    allow[0] = True
     fake.cancel.set()
     assert AiToolHost._batch(fake, steps) == "error: stopped by the user"
 

@@ -15,7 +15,8 @@ def _data(obj) -> bytes:
 
 
 def _call_events(*parts) -> list[bytes]:
-    return [_data({"choices": [{"delta": {"tool_calls": [part]}}]}) for part in parts]
+    """A whole stream: the call deltas, then the end marker (a stream cut off before it is retried)."""
+    return [*(_data({"choices": [{"delta": {"tool_calls": [part]}}]}) for part in parts), b"data: [DONE]\n"]
 
 
 def _calls(lines) -> list[tuple[str, str, str]]:

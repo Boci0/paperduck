@@ -22,6 +22,7 @@ Security:
 from __future__ import annotations
 
 import ast
+import bisect
 import codecs
 import math
 import operator
@@ -66,7 +67,8 @@ MAX_BACKGROUND_CHARS = 100000  # output kept per background process (the newest)
 COMMAND_TIMEOUT_S = 120
 MAX_COMMAND_TIMEOUT_S = 900  # what the model may ask for with timeout_s
 MAX_COMMAND_CHARS = 30000  # command output returned to the model (head and tail kept)
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+             ".next", "target", ".cache", "coverage"}
 _SECRET = re.compile(r"^\.env|\.(pem|key|pfx|p12|kdbx|ppk)$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret",
                      re.I)
 
@@ -99,7 +101,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
     _fn("list_files", "List a folder anywhere on the user's PC (folders end with /).", {"path": _PATH}),
     _fn("read_file", "Read a text file anywhere on the PC, with line numbers (also Word, PowerPoint and Excel files, as text). Secret-looking files (.env, keys) "
         "ask the user first.",
-        {"path": _PATH, "start_line": {"type": "integer", "description": "First line to show, default 1"}}, ("path",)),
+        {"path": _PATH, "start_line": {"type": "integer", "description": "First line to show, default 1"},
+         "end_line": {"type": "integer", "description": "Last line to show, default as far as one call fits"}}, ("path",)),
     _fn("find_files", "Find files by name pattern, e.g. *.py or *config*, or by path pattern with a /, e.g. "
         "tests/*.py, under a folder (default the Project Folder or home).",
         {"pattern": {"type": "string"}, "path": _PATH}, ("pattern",)),
@@ -178,12 +181,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "load_skill the one that fits.", {"query": {"type": "string"}}, ("query",)),
     _fn("load_skill", "Load one of the user's skills (listed in the system prompt) and follow its instructions.",
         {"name": {"type": "string"}}, ("name",)),
-    _fn("edit_file", "Change a text file in the Project Folder by replacing old_text, which must appear exactly once "
+    _fn("edit_file", "Change a text file (any path; relative paths start in the Project Folder) by replacing old_text, which must appear exactly once "
         "(copy it from read_file without the line numbers, with enough lines around it to be unique). An empty "
         "old_text creates a new file. The user sees the diff and allows or declines it.",
         {"path": _PATH, "old_text": {"type": "string"}, "new_text": {"type": "string"}},
         ("path", "old_text", "new_text")),
-    _fn("edit_files", "Change several files in the Project Folder as one change: the user sees every diff in a single "
+    _fn("edit_files", "Change several files (any paths) as one change: the user sees every diff in a single "
         "approval and all edits are written, or none. Each edit works like edit_file (old_text must appear exactly "
         "once; an empty old_text creates a file). Several edits to one file apply in order, each to the text the "
         "one before left.",
@@ -486,7 +489,9 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
             lines = text.splitlines()
             if start > len(lines) > 0:
                 return f"error: the file has only {len(lines)} lines"
-            for n, line in enumerate(lines[start - 1:], start):
+            end = args.get("end_line")
+            end = end if isinstance(end, int) and not isinstance(end, bool) and start <= end < len(lines) else len(lines)
+            for n, line in enumerate(lines[start - 1:end], start):
                 row = f"{n}: {line}"
                 if size + len(row) > MAX_FILE_CHARS:
                     if not out:  # one line longer than a whole call (minified code): show its start, move on
@@ -497,6 +502,9 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
                     break
                 out.append(row)
                 size += len(row) + 1
+            else:
+                if end < len(lines):
+                    out.append(f"... more from line {end + 1} (of {len(lines)})")
             return "\n".join(out) or "(empty file)"
         pattern = args.get("pattern") if isinstance(args.get("pattern"), str) and args["pattern"].strip() else "*"
         if name in ("find_files", "search_text"):
@@ -591,7 +599,7 @@ def plan_edit(root: Path | None, args: dict[str, Any], prior: Edit | None = None
     if prior is not None:
         before, crlf, bom = prior.before, prior.crlf, prior.after.startswith("\ufeff")
         text = prior.after.removeprefix("\ufeff")
-        after = _replace_once(text, old.replace("\r\n", "\n"), new)
+        after = (_replace_mixed if "\r\n" in text else _replace_once)(text, old.replace("\r\n", "\n"), new)
     elif not old and path.is_file() and path.stat().st_size == 0:  # an empty file has no text to match: fill it
         before, after, crlf = "", new, False
     elif not old:
@@ -611,7 +619,7 @@ def plan_edit(root: Path | None, args: dict[str, Any], prior: Edit | None = None
         bom = before.startswith("\ufeff")  # read_file shows line 1 without it, so match without it
         text = before.removeprefix("\ufeff")
         text = text.replace("\r\n", "\n") if crlf else text
-        after = _replace_once(text, old.replace("\r\n", "\n"), new)
+        after = (_replace_mixed if "\r\n" in text else _replace_once)(text, old.replace("\r\n", "\n"), new)
     lines = list(difflib.unified_diff(
         (before or "").removeprefix("\ufeff").replace("\r\n", "\n").splitlines(keepends=True),
         after.replace("\r\n", "\n").splitlines(keepends=True), f"a/{rel}", f"b/{rel}", n=2))
@@ -635,6 +643,19 @@ def _replace_once(text: str, old: str, new: str) -> str:
     if after == text:
         raise ValueError("new_text is the same as old_text; nothing would change")
     return after
+
+
+def _replace_mixed(text: str, old: str, new: str) -> str:
+    """_replace_once for a file mixing CRLF and LF lines: old_text (from read_file's LF view) is matched with line
+    endings ignored, then spliced into the original, so every other line keeps its own ending byte for byte and the
+    new lines take the ending of the lines they replace."""
+    norm = text.replace("\r\n", "\n")
+    _replace_once(norm, old, new)  # the same checks: found once, a real change
+    first = norm.find(old)
+    pairs = [m.start() - i for i, m in enumerate(re.finditer("\r\n", text))]  # each CRLF's offset in `norm`
+    start, end = (p + bisect.bisect_left(pairs, p) for p in (first, first + len(old)))  # offsets in `text`
+    nl = "\r\n" if "\r\n" in text[start:end] else "\n"
+    return text[:start] + new.replace("\r\n", "\n").replace("\n", nl) + text[end:]
 
 
 def plan_edits(root: Path | None, args: dict[str, Any]) -> list[Edit]:
