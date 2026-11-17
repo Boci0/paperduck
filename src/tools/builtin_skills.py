@@ -367,7 +367,16 @@ function Set-Print($Sheet, [int]$Wide = 1, [switch]$Landscape) {
 
 # Save as .xlsx (a plain "..." path, not a Join-Path result) and report what a reader can check
 function Save-Book([string]$Path) {
-    $book.SaveAs([string]$Path, 51)  # xlOpenXMLWorkbook
+    # As Save-Doc: close exactly the last run's copy of this file if an Excel still holds it, never a whole Excel
+    if ((Test-Path -LiteralPath $Path) -and $book.FullName -ne $Path) {
+        $locked = try { [IO.File]::Open($Path, 'Open', 'ReadWrite', 'None').Close(); $false } catch { $true }
+        if ($locked) {
+            try { [Runtime.InteropServices.Marshal]::BindToMoniker($Path).Close($false) } catch { }
+        }
+    }
+    $alerts = $book.Application.DisplayAlerts
+    $book.Application.DisplayAlerts = $false  # else saving over the old file waits on a hidden "Replace it?" box
+    try { $book.SaveAs([string]$Path, 51) } finally { $book.Application.DisplayAlerts = $alerts }  # xlOpenXMLWorkbook
     "Saved $Path : $($book.Worksheets.Count) sheets, used range $($book.Worksheets.Item(1).UsedRange.Address(0, 0))"
 }
 """
@@ -403,6 +412,7 @@ column 51, bar 57, line 4, pie 5, scatter -4169; options title color legend grid
   ([datetime] for dates), never as text, or formats, sorting and charts break. Formulas: $sh.Range('C7').Formula = '=SUM(C3:C6)'.
 - One rule colour per meaning: header fill, one accent for charts and bars, a pale band. No rainbow series.
 - Quit only an instance you started hidden; a visible workbook is the user's result, leave it open.
+- Save-Book closes the last run's copy of the same file before saving over it, so a rebuild needs no clean-up.
 
 ## 3. Check with preview_document
 Set-Print first (so the sheet fits one page wide), save, then preview_document on the .xlsx. Fix everything you

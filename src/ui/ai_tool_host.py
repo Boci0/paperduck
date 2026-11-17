@@ -30,7 +30,7 @@ from src.tools import computer
 from src.tools.ai_assist import ask, fit_thinking, load_key, review_action
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
-                                computer_action, destructive_reason, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
+                                computer_action, destructive_reason, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
                                 PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
@@ -51,7 +51,7 @@ APPROVE_TIMEOUT_S = 300.0  # the user reads the MCP confirm, a diff or a command
 # instruction could use to act on the PC. MCP calls stay allowed (a browser server would ask on every click).
 # Apps whose window on screen shows content from outside the PC: a screen read with one visible arms the guard too
 OUTSIDE_APPS = READERS | MESSAGE_APPS
-OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "edit_outside", "memory", "add_skill",
+OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "edit_outside", "edit_scratch", "memory", "add_skill",
                              "update_skill", "add_mcp_server"})
 # Auto mode approves these at once (edits inside the Project Folder, memory notes) unless they look destructive or the
 # chat holds outside content; every other approval goes to the reviewer (`review_action`) first.
@@ -316,8 +316,13 @@ class AiToolHost(QObject):
             inside = root is not None and all(
                 e.path.resolve().is_relative_to(root.resolve()) and not e.path.resolve().is_relative_to(app_data)
                 and not is_secret(e.path) for e in edits)
-            if not self._allowed("edit_file" if inside else "edit_outside", ask,
-                                 "file edits" if inside else "edits outside the Project Folder"):
+            # Helper scripts in the scratch folder get a key of their own, so allowing them never allows Startup or
+            # other folders; still reviewed, since a later `run_command` card shows only the script's name
+            scratch = not inside and all(e.path.resolve().is_relative_to(scratch_dir().resolve())
+                                         and not is_secret(e.path) for e in edits)
+            key, what = (("edit_file", "file edits") if inside else ("edit_scratch", "helper scripts in the scratch folder")
+                         if scratch else ("edit_outside", "edits outside the Project Folder"))
+            if not self._allowed(key, ask, what):
                 return "error: the user declined this edit"
             return apply_edits(edits)
         if name in ("set_errand", "cancel_errand"):

@@ -101,6 +101,9 @@ MAX_NATIVE_ROUNDS = 5  # pause_turn continuations of one Claude answer
 # Added to the last tool output before the answer-only round, so a long job ends with a report, not an error
 BUDGET_NOTE = (f"\n\n[Paperduck: that was the last of this message's {MAX_TOOL_ROUNDS} tool rounds. Answer now "
                "without tools: say what is done and what is left; the user can send another message to continue.]")
+# Sent once when a reply came back empty because thinking used the whole token budget; that round has no thinking
+WRAP_NOTE = ("\n\n[Paperduck: your last reply hit the token limit while thinking and said nothing. Answer now "
+             "without tools or more thinking: what is done, how you checked it, and what is left.]")
 PACE_AT = MAX_TOOL_ROUNDS * 7 // 10  # rounds used when the model is told to stop polishing and finish
 PACE_NOTE = (f"\n\n[Paperduck: {PACE_AT} of this message's {MAX_TOOL_ROUNDS} tool rounds are used. Stop polishing: fix "
              "only what is broken, verify the result, remove your scratch files, then give the final answer.]")
@@ -244,8 +247,11 @@ SEARCH_TOOL = {"type": "function", "function": {
 }}
 FETCH_TOOL = {"type": "function", "function": {
     "name": "fetch_page",
-    "description": "Read the text of a public https web page, e.g. a search result.",
-    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    "description": ("Read the text of a public https web page, e.g. a search result, with its links as [url]. "
+                    "A long page ends with the offset to pass for the next part."),
+    "parameters": {"type": "object", "properties": {
+        "url": {"type": "string"},
+        "offset": {"type": "integer", "description": "character to start from (default 0)"}}, "required": ["url"]},
 }}
 # Where each preset hands out API keys (fixed links, opened only from the setup page)
 KEY_PAGES: dict[str, str] = {
@@ -282,6 +288,7 @@ class AiReply:
     cut_off: bool = False  # hit max_tokens
     compacted: int = 0  # oldest history turns replaced by `summary` before this answer (auto-compact)
     summary: str = ""
+    archive: str = ""  # the file holding the summarized turns in full ("" when none was written)
     tools: list[tuple[str, str]] = field(default_factory=list)  # (call note, output), e.g. ("web_search(rust)", "...")
     # Chat completions: this answer's own messages as last sent (tool calls, results, reasoning) plus the final one.
     # The chat replays them word for word next time, so the provider's prefix cache still covers this answer.
@@ -488,8 +495,11 @@ def compact_split(history: list[dict[str, Any]]) -> int:
 
 
 def compact_history(base_url: str, key: str, model: str, history: list[dict[str, Any]],
-                    cancel: threading.Event | None = None) -> tuple[list[dict[str, Any]], int, str]:
-    """(history to send, turns summarized, summary). Any failure sends the history as it was: nothing is lost."""
+                    cancel: threading.Event | None = None, archive: Callable[[list[dict[str, Any]]], Any] | None = None,
+                    tasks: list[tuple[str, str]] | None = None) -> tuple[list[dict[str, Any]], int, str]:
+    """(history to send, turns summarized, summary). Any failure sends the history as it was: nothing is lost.
+    `archive` saves the summarized turns and returns their file, which the summary names (as do `tasks`), so the
+    answer sent with it can already search them."""
     split = compact_split(history)
     if not split:
         return history, 0, ""
@@ -501,7 +511,8 @@ def compact_history(base_url: str, key: str, model: str, history: list[dict[str,
         return history, 0, ""
     if not summary:
         return history, 0, ""
-    return [*summary_turns(summary), *history[split:]], split, summary
+    saved = archive(history[:split]) if archive is not None else None
+    return [*summary_turns(summary, str(saved or ""), tasks), *history[split:]], split, summary
 
 
 REVIEW_PROMPT = (
@@ -721,9 +732,9 @@ def _request_once(base_url: str, key: str, path: str, body: dict[str, Any] | Non
             if progress is not None and "event-stream" in (resp.headers.get("Content-Type") or ""):
                 return (_read_anthropic_stream if is_anthropic(base_url) else _read_stream)(resp, progress)
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:  # its body may echo the request, so it is never shown
-        if is_anthropic(base_url) and exc.code in (400, 422):  # ...except Anthropic's own error text, which names the cause
-            raise ValueError(_anthropic_error(exc)) from None
+    except urllib.error.HTTPError as exc:  # its body may echo the request, so it is never shown (see _http_400)
+        if exc.code in (400, 422):
+            raise ValueError(_http_400(exc, base_url)) from None
         message = _HTTP_ERRORS.get(exc.code, f"http {exc.code}")
         if exc.code in _RETRY_CODES:
             raise _Transient(message, _retry_after(exc.headers)) from None
@@ -979,13 +990,24 @@ def _int(value: Any) -> int:
 _DATA_URL = re.compile(r"^data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$")
 
 
-def _anthropic_error(exc: urllib.error.HTTPError) -> str:
-    """Anthropic's 400 text says what is wrong (tool not enabled, bad effort); it never contains the key."""
+_TOO_LONG = re.compile(r"context[ _-]?(length|window)|maximum context|prompt is too long|input token count|"
+                       r"too many (input )?tokens|reduce the length of the (messages|input)", re.I)
+
+
+def _http_400(exc: urllib.error.HTTPError, base_url: str) -> str:
+    """A 400/422 as a short reason. "too long" when the provider says the context overflowed, so `ask` never takes
+    it for missing thinking or tool support. Anthropic's own text names the cause (tool not enabled, bad effort) and
+    is shown; another provider's body may echo the request, so only its verdict is used, never its text."""
     try:
-        message = json.loads(exc.read(4096))["error"]["message"]
+        error = json.loads(exc.read(4096))["error"]
+        message = f"{error.get('message', '')} {error.get('code', '')}" if isinstance(error, dict) else str(error)
     except (ValueError, KeyError, TypeError, OSError):
         return "bad request"
-    return " ".join(message.split())[:200] if isinstance(message, str) and message.strip() else "bad request"
+    if _TOO_LONG.search(message):
+        return "too long"
+    if is_anthropic(base_url) and isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"].strip():
+        return " ".join(error["message"].split())[:200]
+    return "bad request"
 
 
 def claude_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -1157,14 +1179,15 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     shot_at: list[int] = []  # indexes in `messages` of the screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
     fails: list[Any] = [0, 0, None, [], None, set()]
-    blind_told = False
-    for round_ in range(MAX_TOOL_ROUNDS + 1):
+    blind_told = wrapped = False
+    for round_ in range(MAX_TOOL_ROUNDS + 2):  # the extra round is only the wrap-up after a cut-off (WRAP_NOTE)
         _check(cancel)
         shots: list[str] = []
         body: dict[str, Any] = {"model": model, "messages": messages,
                                 "max_tokens": MAX_THINKING_TOKENS if thinks else MAX_REPLY_TOKENS,
                                 **thinking_params(base_url, thinking)}
-        offer = tools and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS
+        offer = (tools and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS
+                 and not wrapped)
         if offer or (tools and used and is_deepseek(base_url)):
             body["tools"] = [*((SEARCH_TOOL, FETCH_TOOL) if web else ()), *(host.specs if host else [])]
             if not offer:  # same tools, answer only: dropping them would change DeepSeek's cached prefix (a full miss)
@@ -1279,8 +1302,20 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                 reply.wire = []  # a screenshot is still in it (never kept), or too big to carry: the note form
         except (KeyError, IndexError, TypeError, AttributeError):
             raise ValueError("bad reply") from None
+        if not reply.text and reply.cut_off and not wrapped:
+            # thinking ate the budget: one more round, thinking off, no tools, so the job still ends with a report
+            wrapped, thinks = True, False
+            thinking = fit_thinking(base_url, "off", model) if thinking in THINKING_LEVELS else thinking
+            last = messages[-1]
+            if last.get("role") in ("tool", "user") and isinstance(last.get("content"), str):
+                messages[-1] = {**last, "content": last["content"] + WRAP_NOTE}
+            else:
+                messages.append({"role": "user", "content": WRAP_NOTE.strip()})
+            continue
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
+        if wrapped:
+            reply.wire = []  # the note changed an earlier turn; the replay would carry it
         drop_skills(reply)
         return reply
     raise ValueError("bad reply")
@@ -1639,8 +1674,10 @@ def _run_tool_raw(name: str, arguments: Any, host: ToolHost | None = None, seen:
         return f"error: {name} needs a non-empty '{param}' string"
     if name == "fetch_page" and seen is not None and (refused := _new_link(name, value.strip(), host, seen)):
         return refused
+    offset = args.get("offset")
+    offset = offset if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0 else 0
     try:
-        return web_search(value.strip()[:300]) if name == "web_search" else fetch_page(value.strip()[:2000])
+        return web_search(value.strip()[:300]) if name == "web_search" else fetch_page(value.strip()[:2000], offset)
     except ValueError as exc:
         return f"error: {name} failed ({exc})"
 
@@ -1684,13 +1721,37 @@ _STRIP_TAGS = re.compile(r"<[^>]+>")
 _RESULT_RE = re.compile(r'class="result__a" href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>', re.S)
 
 
-_DROP_BLOCKS = re.compile(r"<(script|style|noscript|svg|head)\b.*?</\1>", re.S | re.I)
+_DROP_BLOCKS = re.compile(r"<(script|style|noscript|svg|head|template)\b.*?</\1>", re.S | re.I)
+_CHROME_BLOCKS = re.compile(r"<(nav|footer|aside)\b.*?</\1>", re.S | re.I)  # site menus, not the page's content
+_PAGE_LINK = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", re.S | re.I)
+_BLOCK_END = re.compile(r"<(?:br|hr)\b[^>]*>|</(?:p|div|li|h[1-6]|tr|table|section|article|blockquote|pre|dd|dt)\s*>",
+                        re.I)
 
 
-def page_text(markup: str) -> str:
-    """Visible text of an HTML page, whitespace collapsed and capped at MAX_PAGE_CHARS."""
-    text = html.unescape(_STRIP_TAGS.sub(" ", _DROP_BLOCKS.sub(" ", markup)))
-    return re.sub(r"\s+", " ", text).strip()[:MAX_PAGE_CHARS]
+def page_text(markup: str, base: str = "") -> str:
+    """Visible text of an HTML page, one line per block, links kept as `label [url]` (resolved against `base`).
+    Menus, footers and sidebars are dropped unless nothing else is left."""
+    def link(m: re.Match[str]) -> str:
+        href = urljoin(base, html.unescape(m.group(1)).strip())
+        keep = href.startswith(("https://", "http://")) and href not in m.group(2) and not m.group(1).startswith("#")
+        return f"{m.group(2)} [{href}]" if keep else m.group(2)
+
+    def text(markup: str) -> str:
+        flat = html.unescape(_STRIP_TAGS.sub(" ", _BLOCK_END.sub("\n", _PAGE_LINK.sub(link, markup))))
+        return "\n".join(line for line in (re.sub(r"\s+", " ", ln).strip() for ln in flat.split("\n")) if line)
+
+    markup = _DROP_BLOCKS.sub(" ", markup)
+    return text(_CHROME_BLOCKS.sub(" ", markup)) or text(markup)
+
+
+def page_part(text: str, offset: int = 0) -> str:
+    """MAX_PAGE_CHARS of `text` from `offset`, ending with the offset of the next part when there is more."""
+    part = text[offset:offset + MAX_PAGE_CHARS]
+    if not part:
+        return f"nothing past offset {offset}; the page has {len(text)} characters" if text else "empty page"
+    if offset + MAX_PAGE_CHARS < len(text):
+        part += f"\n... more: fetch_page with offset {offset + MAX_PAGE_CHARS} ({len(text)} characters in all)"
+    return part
 
 
 def check_public_https(url: str) -> None:
@@ -1708,8 +1769,9 @@ def check_public_https(url: str) -> None:
         raise ValueError("private address refused")
 
 
-def fetch_page(url: str) -> str:
-    """Text of a public web page. Redirects are followed by hand so every hop is checked again."""
+def fetch_page(url: str, offset: int = 0) -> str:
+    """Text of a public web page from `offset` (see page_part). Redirects are followed by hand so every hop is
+    checked again. shortcut: each offset downloads the page again; cache by URL if paging long pages gets common."""
     for _ in range(MAX_REDIRECTS + 1):
         check_public_https(url)
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Paperduck",
@@ -1720,7 +1782,7 @@ def fetch_page(url: str) -> str:
                 if kind not in ("text/html", "text/plain"):
                     raise ValueError(f"not a text page ({kind})")
                 raw = resp.read(MAX_SEARCH_BYTES).decode(resp.headers.get_content_charset() or "utf-8", "replace")
-            return page_text(raw) if kind == "text/html" else raw.strip()[:MAX_PAGE_CHARS] or "empty page"
+            return page_part(page_text(raw, url) if kind == "text/html" else raw.strip(), offset)
         except urllib.error.HTTPError as exc:  # _NoRedirect raises these for 3xx
             location = exc.headers.get("Location") if exc.code in (301, 302, 303, 307, 308) else None
             if not location:

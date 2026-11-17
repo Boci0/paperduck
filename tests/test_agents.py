@@ -349,7 +349,7 @@ def test_agent_host_auto_mode_asks_the_reviewer_for_secrets_and_new_links(tmp_pa
     from src.tools import ai_assist
 
     (tmp_path / ".env").write_text("TOKEN=abc", encoding="utf-8")
-    monkeypatch.setattr(ai_assist, "fetch_page", lambda url: f"fetched {url}")
+    monkeypatch.setattr(ai_assist, "fetch_page", lambda url, offset=0: f"fetched {url}")
     asked: list[str] = []
     verdict = [False]
 

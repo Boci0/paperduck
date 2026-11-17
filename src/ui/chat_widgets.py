@@ -92,6 +92,8 @@ _FRIENDLY_ERRORS = {
     "refused mid-answer": ("The provider rejected the request partway through the job (often the chat got too long). "
                            "Send a message to continue from here, or start a new chat."),
     "cut off": "The model spent its whole token budget thinking. Try a lower Thinking level.",
+    "too long": ("The chat is longer than this model can take. Start a new chat, or pick a model with a bigger "
+                 "context window."),
 }
 _FIELD_CSS = (
     f"background: {rgba_css(GLASS_RAISED_RGBA)}; color: {TEXT_HEX}; border: 1px solid {rgba_css(OUTLINE_RGBA)};"

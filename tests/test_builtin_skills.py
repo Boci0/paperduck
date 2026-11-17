@@ -89,6 +89,24 @@ try {{
     assert "Saved " in text and "held docs left: 0" in text
 
 
+@pytest.mark.skipif(not _has("Excel.Application"), reason="needs Microsoft Excel")
+def test_save_book_saves_over_a_result_another_excel_still_holds(tmp_path: Path) -> None:
+    out = tmp_path / "rebuild.xlsx"
+    text = _run(tmp_path, f"""
+$held = New-Object -ComObject Excel.Application; $held.Visible = $false; $held.DisplayAlerts = $false
+$xl = New-Object -ComObject Excel.Application; $xl.Visible = $false
+try {{
+    $first = $held.Workbooks.Add(); $first.SaveAs("{out}", 51)   # the last run's result, still open
+    $book = $xl.Workbooks.Add()
+    . "{helpers_path('excel-sheets')}"
+    $book.Worksheets.Item(1).Range('A1').Value2 = 'second build'
+    Save-Book "{out}"
+    "held books left: $($held.Workbooks.Count) alerts back: $($xl.DisplayAlerts)"
+}} finally {{ $held.Quit(); $xl.Quit() }}
+""")
+    assert "Saved " in text and "held books left: 0 alerts back: True" in text
+
+
 @pytest.mark.skipif(not _has("PowerPoint.Application"), reason="needs Microsoft PowerPoint")
 def test_the_slide_helpers_build_a_deck(tmp_path: Path) -> None:
     out = tmp_path / "helpers.pptx"

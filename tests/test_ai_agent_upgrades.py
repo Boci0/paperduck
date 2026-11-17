@@ -191,6 +191,14 @@ def test_command_output_falls_back_to_the_console_code_page() -> None:
     assert "�" not in ai_tools.console_text(b"caf\x82")  # not UTF-8: read in the OEM code page, not replaced
 
 
+def test_command_output_drops_colour_codes_and_progress_redraws(tmp_path: Path) -> None:
+    raw = ("\x1b[32m3 passed\x1b[0m in 0.1s\r\n\x1b]0;title\x07Downloading 10%\r"
+           "Downloading 60%\rDownloading 100%\r\n\x1b(Bdone\r\n\r\nend")
+    assert ai_tools.clean_output(raw) == "3 passed in 0.1s\nDownloading 100%\ndone\n\nend"
+    out = ai_tools.run_command(tmp_path, "echo \x1b[31mred\x1b[0m")  # end to end through cmd.exe
+    assert "red" in out and "\x1b" not in out
+
+
 def test_session_trim_keeps_the_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ai_sessions, "MAX_SESSION_BYTES", 5000)
     history = [*ai_assist.summary_turns("old facts"),
