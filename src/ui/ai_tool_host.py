@@ -27,7 +27,7 @@ from PyQt6.QtGui import QCursor, QGuiApplication, QImage
 from PyQt6.QtWidgets import QFileDialog
 
 from src.tools import computer
-from src.tools.ai_assist import ask, fit_thinking, load_key
+from src.tools.ai_assist import ask, fit_thinking, load_key, review_action
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
                                 computer_action, destructive_reason, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
@@ -53,6 +53,20 @@ APPROVE_TIMEOUT_S = 300.0  # the user reads the MCP confirm, a diff or a command
 OUTSIDE_APPS = READERS | MESSAGE_APPS
 OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edit_file", "edit_outside", "memory", "add_skill",
                              "update_skill", "add_mcp_server"})
+# Auto mode approves these at once (edits inside the Project Folder, memory notes) unless they look destructive or the
+# chat holds outside content; every other approval goes to the reviewer (`review_action`) first.
+AUTO_INSTANT = frozenset({"edit_file", "memory"})
+
+
+def auto_mode(win: Any) -> bool:
+    return bool(getattr(getattr(getattr(win, "_ai_chat", None), "_plugin", None), "auto", False))
+
+
+def _given(args: dict[str, Any]) -> dict[str, Any]:
+    """Arguments the model really gave: weaker models send null or "" for an optional one they mean to omit."""
+    return {k: v for k, v in args.items() if v is not None and v != ""}
+
+
 ERRAND_APPROVE_S = 1800.0  # an errand runs while the user may be away, so its approvals wait longer
 MAX_CLIP_CHARS = 12000
 MAX_SCREEN_CHARS = 8000
@@ -266,7 +280,12 @@ class AiToolHost(QObject):
             shown = json.dumps(args, ensure_ascii=False)
             # Values only: an argument named "format" or "truncate" is not a destructive command
             risk = "destructive tool" if self.mcp.is_destructive(name) else destructive_reason("\n".join(_strings(args)))
-            allowed = self._waiting(lambda done: chat.confirm_mcp(server, name, done, shown[:600], risk))
+            review = (self._review(f'MCP tool "{name}" on server "{server}" with arguments:\n{shown}')
+                      if auto_mode(self._win) and f"mcp:{server}" not in chat._allowed else None)
+            if self.cancel.is_set():
+                return "error: stopped"
+            extra = {"review": review} if review else {}
+            allowed = self._waiting(lambda done: chat.confirm_mcp(server, name, done, shown[:600], risk, **extra))
             return self.mcp.call(name, args) if allowed is True else "error: the user did not allow this MCP server"
         if name in FILE_TOOLS:
             secrets = False
@@ -307,9 +326,9 @@ class AiToolHost(QObject):
             share, task = args.get("share_images") is True, args.get("task")
             if isinstance(task, str) and (notes := self._shared_notes(share)):
                 task += notes
-            auto = bool(getattr(getattr(getattr(self._win, "_ai_chat", None), "_plugin", None), "auto", False))
             return self.agents.spawn(task, args.get("effort"), self._project(), self.cancel,
-                                     args.get("_local") is True, self._shared_images(share), self.see_image, auto)
+                                     args.get("_local") is True, self._shared_images(share), self.see_image,
+                                     self._review if auto_mode(self._win) else None)
         if name == "wait_agents":
             return self.agents.wait(args.get("timeout_s"), self.cancel)
         if name == "calculate":  # pure arithmetic, nothing to allow
@@ -511,15 +530,16 @@ class AiToolHost(QObject):
         out = self._on_gui(add)
         return out if isinstance(out, str) else "error: the pet did not answer in time"
 
-    def _computer(self, name: str, args: dict[str, Any]) -> str:
+    def _computer(self, name: str, args: dict[str, Any], approved: bool = False) -> str:
         """Mouse and keyboard on the primary monitor. Every action needs the user's Allow (once or for the chat); a
-        delete key or a destructive typed command asks every time."""
+        delete key or a destructive typed command asks every time. `approved`: the batch it is in was allowed whole."""
+        args = _given(args)
         try:
             what, risk = computer_action(name, args)
         except ValueError as exc:
             return f"error: {exc}"
-        if not self._allowed("computer", f"The model wants to control your computer:\n\n{what}", "computer control",
-                             risk):
+        if not approved and not self._allowed("computer", f"The model wants to control your computer:\n\n{what}",
+                                              "computer control", risk):
             return "error: the user declined this action"
         note = ""
         if name == "mouse_click":
@@ -601,17 +621,29 @@ class AiToolHost(QObject):
                 "new position.\n\n" + self._map(*got), x, y)
 
     def _batch(self, steps: Any) -> str:
-        """computer_batch: each step through `_computer` (same approvals), stopping at the first error or Stop."""
+        """computer_batch: one approval listing every step (asked as risky when any step is), then each step through
+        `_computer`, stopping at the first error or Stop."""
         if not isinstance(steps, list) or not steps or len(steps) > MAX_BATCH_STEPS:
             return f"error: give 1 to {MAX_BATCH_STEPS} steps"
-        cancel, lines = self.cancel, []
+        plan, risks = [], []
         for i, step in enumerate(steps, 1):
             tool = step.get("tool") if isinstance(step, dict) else None
             if tool not in COMPUTER_TOOLS:
-                return "\n".join([*lines, f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS))}"])
+                return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS))}"
+            try:
+                what, risk = computer_action(tool, _given({k: v for k, v in step.items() if k != "tool"}))
+            except ValueError as exc:
+                return f"error: step {i}: {exc}"
+            plan.append(f"{i}. {what}")
+            risks += [risk] if risk else []
+        if not self._allowed("computer", "The model wants to control your computer in these steps:\n\n" + "\n".join(plan),
+                             "computer control", ", ".join(risks)):
+            return "error: the user declined these actions"
+        cancel, lines = self.cancel, []
+        for i, step in enumerate(steps, 1):
             if cancel.is_set():
                 return "\n".join([*lines, "error: stopped by the user"])
-            out = self._computer(tool, {k: v for k, v in step.items() if k != "tool"})
+            out = self._computer(step["tool"], {k: v for k, v in step.items() if k != "tool"}, approved=True)
             lines.append(f"{i}. {out}")
             if out.startswith("error"):
                 return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
@@ -735,8 +767,18 @@ class AiToolHost(QObject):
         chat = self._win._ai_chat
         extra: dict[str, Any] = {"danger": risk} if risk else {"untrusted": True} if (
             self.outside and key in OUTSIDE_GUARDED) else {}
+        if auto_mode(self._win) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
+            extra["review"] = self._review(text)
+            if self.cancel.is_set():
+                return False
         ask = lambda done: chat.confirm(key, text, what, done, **extra)  # noqa: E731
         return self._waiting(ask) is True
+
+    def _review(self, action: str) -> tuple[bool, str]:
+        """Auto mode's reviewer on this chat's provider and model (worker thread; Stop ends it)."""
+        chat = self._win._ai_chat
+        p = chat._plugin
+        return review_action(p.base_url, load_key(p.base_url), p.model, chat.user_requests(), action, self.cancel)
 
     def _waiting(self, ask: Callable[[Callable[[Any], None]], None]) -> Any:
         """An approval on the Qt thread: the pet waits with the user (`activity` "approval") until it is answered."""

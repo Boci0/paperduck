@@ -328,3 +328,65 @@ def test_stop_kills_children_that_left_the_tree(tmp_path: Path) -> None:
         assert _until(lambda: not alive())
     finally:
         procs.stop_all()
+
+
+def test_auto_mode_reviews_risky_approvals_with_only_the_typed_words(repo: Path, tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ui import ai_tool_host
+
+    reviewed: list[tuple[list[str], str]] = []
+    seen: list[tuple[str, object]] = []
+
+    def review(_url, _key, _model, requests, action, _cancel=None):
+        reviewed.append((requests, action))
+        return False, "not what the user asked"
+
+    monkeypatch.setattr(ai_tool_host, "review_action", review)
+    monkeypatch.setattr(ai_tool_host, "load_key", lambda _url: "k")
+
+    class Chat:
+        _plugin = SimpleNamespace(auto=True, base_url="https://api.example", model="m")
+        _allowed: set[str] = set()
+
+        def user_requests(self):
+            return ["fix the readme"]
+
+        def confirm(self, key, text, what, done, **extra):
+            seen.append((key, extra.get("review")))
+            done(False)
+
+    app, host = _host(repo, Chat())
+
+    def work() -> None:
+        host.run("edit_file", {"path": "inside.txt", "old_text": "", "new_text": "x"})  # project edit: instant
+        host.run("edit_file", {"path": str(tmp_path / "elsewhere.txt"), "old_text": "", "new_text": "x"})
+        host.outside = True  # after web content even a project edit is reviewed
+        host.run("edit_file", {"path": "inside2.txt", "old_text": "", "new_text": "x"})
+
+    _run_on_thread(app, work)
+    assert seen == [("edit_file", None), ("edit_outside", (False, "not what the user asked")),
+                    ("edit_file", (False, "not what the user asked"))]
+    assert [r for r, _a in reviewed] == [["fix the readme"]] * 2 and "elsewhere.txt" in reviewed[0][1]
+
+
+def test_edits_keep_every_line_ending_in_a_mixed_file(repo: Path) -> None:
+    path = repo / "mixed.txt"
+    path.write_bytes(b"a\r\nb\nc\r\nd\n")
+    edit = ai_tools.plan_edit(repo, {"path": "mixed.txt", "old_text": "b\nc\n", "new_text": "B\nC\n"})
+    assert not ai_tools.apply_edit(edit).startswith("error")
+    assert path.read_bytes() == b"a\r\nB\r\nC\r\nd\n"  # the replaced lines' ending; the rest byte for byte
+    edits = ai_tools.plan_edits(repo, {"edits": [{"path": "mixed.txt", "old_text": "a\nB", "new_text": "x"},
+                                                 {"path": "mixed.txt", "old_text": "d\n", "new_text": "y\n"}]})
+    ai_tools.apply_edits(edits)
+    assert path.read_bytes() == b"x\r\nC\r\ny\n"
+
+
+def test_read_file_end_line_and_skipped_build_folders(repo: Path) -> None:
+    (repo / "long.txt").write_text("".join(f"line {i}\n" for i in range(1, 11)), encoding="utf-8")
+    out = ai_tools.run_file_tool(repo, "read_file", {"path": "long.txt", "start_line": 3, "end_line": 4})
+    assert out == "3: line 3\n4: line 4\n... more from line 5 (of 10)"
+    assert ai_tools.run_file_tool(repo, "read_file", {"path": "long.txt", "start_line": 9, "end_line": 99}).endswith("10: line 10")
+    assert ai_tools.run_file_tool(repo, "read_file", {"path": "long.txt", "end_line": 0}).count("\n") == 9  # ignored
+    (repo / ".next").mkdir()
+    (repo / ".next" / "hidden.py").write_text("x", encoding="utf-8")
+    assert "hidden.py" not in ai_tools.run_file_tool(repo, "find_files", {"pattern": "*.py"})

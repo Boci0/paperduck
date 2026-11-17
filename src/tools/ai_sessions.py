@@ -65,6 +65,7 @@ def make_title(history: list[dict[str, Any]]) -> str:
 def _body(sid: str, history: list[dict[str, Any]], tasks: list[tuple[str, str]], created: float, now: float) -> dict:
     return {"version": VERSION, "id": sid, "title": make_title(history), "created": created, "updated": now,
             "history": [{"role": t["role"], "content": _clean(t["content"]),
+                         **({"said": _clean(t["said"])} if t.get("said") else {}),
                          **({"tools": [[_clean(n), _clean(o)] for n, o in t["tools"]]} if t.get("tools") else {})}
                         for t in history],  # no "images": attachment bytes are not kept
             "tasks": [list(t) for t in tasks]}
@@ -142,6 +143,8 @@ def _parse(path: Path) -> Session | None:
                     turn.get("content"), str):
                 return None
             item: dict[str, Any] = {"role": turn["role"], "content": turn["content"]}
+            if turn["role"] == "user" and isinstance(turn.get("said"), str) and turn["said"]:
+                item["said"] = turn["said"]  # the user's typed words, which auto mode's reviewer trusts
             tools = turn.get("tools")
             if tools:
                 if not isinstance(tools, list) or not all(isinstance(t, list) and len(t) == 2 and all(
