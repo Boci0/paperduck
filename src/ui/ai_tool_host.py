@@ -819,13 +819,19 @@ class AiToolHost(QObject):
         """view_image for this chat and its sub-agents: (text with size and OCR, data URL for a model that sees)."""
         from src.ui.chat_widgets import image_data_url
 
+        path = None
         try:
             path = resolve(root, args.get("path"))
+            raw = str(args.get("path") or "")
+            if not path.is_file() and raw and not Path(raw).is_absolute():
+                # MCP servers run in the scratch folder: Playwright's ".playwright-mcp\page-....png" is there
+                alt = resolve(scratch_dir(), raw)
+                path = alt if alt.is_file() else path
             if is_secret(path):
                 return "error: that looks like a secrets file and view_image does not open those", ""
             image = load_image_file(path)
         except (OSError, ValueError) as exc:
-            return f"error: {exc}", ""
+            return f"error: {exc}" + (f" ({path}); give the full path" if path is not None else ""), ""
         small = image if max(image.width(), image.height()) <= MAX_OCR_SIDE else image.scaled(
             MAX_OCR_SIDE, MAX_OCR_SIDE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         text = self._ocr(small, empty="no text found in it")

@@ -72,6 +72,32 @@ def test_stop_ends_a_waiting_call_at_once(hub: McpHub) -> None:
     assert hub._servers["fake"].alive  # Stop is not a hang: the server keeps running for the next message
 
 
+def test_a_browser_action_brings_a_look_at_the_page() -> None:
+    calls = []
+
+    def call(tool: str, args: dict, cancel=None) -> str:  # noqa: ANN001
+        calls.append(tool)
+        fake.image = b"png" if tool == "browser_take_screenshot" else b""
+        return "error: no such ref" if args.get("bad") else f"did {tool}"
+
+    fake = SimpleNamespace(tools={t: t for t in ("browser_click", "browser_find", "browser_close",
+                                                 "browser_take_screenshot")},
+                           readonly={"browser_find", "browser_take_screenshot"}, image=b"", alive=True, call=call)
+    hub = McpHub(Path("unused.json"))
+    hub._servers = {"pw": fake}
+    out = hub.call("pw__browser_click", {})
+    assert calls == ["browser_click", "browser_take_screenshot"] and hub.image == b"png" and "style.zoom" in out
+    for name, args in (("pw__browser_find", {}), ("pw__browser_close", {}), ("pw__browser_click", {"bad": 1})):
+        calls.clear()
+        hub.call(name, args)
+        assert calls == [name.split("__")[1]] and hub.image == b""  # reads, close and failures get no look
+    stop = threading.Event()
+    stop.set()
+    calls.clear()
+    hub.call("pw__browser_click", {}, stop)
+    assert calls == ["browser_click"]  # nothing more after Stop
+
+
 def test_hub_restarts_when_the_config_changes(hub: McpHub) -> None:
     assert hub.specs()
     hub.path.write_text('{"mcpServers": {}}', encoding="utf-8")

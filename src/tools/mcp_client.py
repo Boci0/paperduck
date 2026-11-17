@@ -44,6 +44,13 @@ START_TIMEOUT_S = 60.0  # a first npx / uvx start downloads the package
 CALL_TIMEOUT_S = 60.0
 MAX_RESULT_CHARS = 30000
 STOP_POLL_S = 0.2  # how often a waiting call looks at Stop
+LOOK_TOOL = "browser_take_screenshot"  # Playwright's: taken after each of its tools that may change the page
+NO_LOOK = {LOOK_TOOL, "browser_close"}  # a look after close would open a fresh, blank browser
+LOOK_NOTE = ("\n[Paperduck: a screenshot of the page after this action follows the tool results. If what you "
+             "changed is too small to read or judge (an editor fitting a whole poster, a scaled-down image), make it "
+             "bigger before deciding: the app's own zoom if it has one (its zoom control or ctrl+=), otherwise "
+             "browser_evaluate with document.body.style.zoom = '3' and scroll to the spot, then set it back to ''. "
+             "Never guess at text you cannot read.]")
 MAX_IMAGE_B64 =28 * 1024 * 1024  # about 20 MB decoded, the same cap view_image has
 MAX_TOOLS_PER_SERVER = 64
 IDLE_CLOSE_S = 300.0  # servers unused this long are closed (an npx server is two node processes, ~180 MB)
@@ -211,6 +218,7 @@ class McpServer:
         self.tools: dict[str, str] = {}  # safe tool name -> the server's own name
         self.destructive: set[str] = set()  # safe names of tools that declare destructiveHint (and not readOnlyHint)
         self.image = b""  # the last call's first image, for a model that sees
+        self.readonly: set[str] = set()  # safe names of tools that declare readOnlyHint (no look after them)
         self._lock = threading.Lock()
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._next_id = 0
@@ -296,6 +304,8 @@ class McpServer:
             hints = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
             if hints.get("destructiveHint") is True and hints.get("readOnlyHint") is not True:
                 self.destructive.add(short)
+            if hints.get("readOnlyHint") is True:
+                self.readonly.add(short)
             specs.append(spec)
         return specs
 
@@ -380,6 +390,14 @@ class McpHub:
             return "error: the MCP server stopped; try again"
         out = running.call(tool, args, cancel)
         self.image = running.image
+        if (not self.image and LOOK_TOOL in running.tools and tool not in NO_LOOK and tool not in running.readonly
+                and not out.startswith("error") and not (cancel is not None and cancel.is_set())):
+            # a browser action changed the page: show the model the result, as computer use does after each
+            # action, so a misplaced edit is seen at once instead of when the user complains
+            running.call(LOOK_TOOL, {"scale": "device"}, cancel)  # device: more pixels on a high-DPI screen
+            if running.image:
+                self.image = running.image
+                out += LOOK_NOTE
         self._used = time.monotonic()
         if not running.alive:
             self._loaded = None  # restart the servers when the next message asks for tools

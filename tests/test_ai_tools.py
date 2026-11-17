@@ -1416,10 +1416,17 @@ def test_view_image_loads_only_real_images_and_counts_as_local_data(tmp_path: Pa
     assert AiToolHost.see_image(fake, tmp_path, {"path": "notes.png"})[0].startswith("error: not a png")
     assert AiToolHost.see_image(fake, tmp_path, {"path": ".env.png"}) == (
         "error: that looks like a secrets file and view_image does not open those", "")
-    assert AiToolHost.see_image(fake, tmp_path, {"path": "missing.png"})[0] == "error: not a file"
+    missing = AiToolHost.see_image(fake, tmp_path, {"path": "missing.png"})[0]
+    assert missing == f"error: not a file ({tmp_path / 'missing.png'}); give the full path"  # where it looked
     assert AiToolHost.see_image(fake, tmp_path, {"path": ""})[1] == ""  # a folder
+    from src.ui import ai_tool_host
+    scratch = tmp_path / "scratch"
+    (scratch / ".playwright-mcp").mkdir(parents=True)
+    (scratch / ".playwright-mcp" / "page.png").write_bytes((tmp_path / "a.png").read_bytes())
+    monkeypatch.setattr(ai_tool_host, "scratch_dir", lambda: scratch)
+    assert AiToolHost.see_image(fake, tmp_path, {"path": ".playwright-mcp\\page.png"})[1]  # an MCP server's own file
     monkeypatch.setattr(web_drop, "MAX_WEB_IMAGE_BYTES", 10)
-    assert AiToolHost.see_image(fake, tmp_path, {"path": "a.png"})[0] == "error: image larger than 20 MB"
+    assert AiToolHost.see_image(fake, tmp_path, {"path": "a.png"})[0].startswith("error: image larger than 20 MB")
 
 
 def test_agent_gets_the_newest_pictures_of_the_chat_only_when_it_asks(monkeypatch: pytest.MonkeyPatch) -> None:
