@@ -85,6 +85,8 @@ _FRIENDLY_ERRORS = {
     "bad key": "The API key was rejected. Check it in Setup (gear).",
     "no balance": "Your balance with the provider is empty. Top it up, then try again.",
     "rate limited": "The provider is rate limiting you. Wait a moment and try again.",
+    "spend cap": "Your account with the provider hit its spending cap or used up its quota. Raise the cap or add "
+                 "billing in the provider's settings (Gemini: https://ai.studio/spend), then try again.",
     "bad model or url": "Model or URL not found. Check them in Setup (gear).",
     "network": "Could not reach the provider. Check your connection.",
     "forbidden": "The provider refused this key for that model.",

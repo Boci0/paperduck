@@ -45,6 +45,12 @@ class _Api(BaseHTTPRequestHandler):
                                                    f"However, you requested 140000 tokens. {KEY}",
                                                    "type": "invalid_request_error"}}).encode())
             return
+        if _Api.mode == "spend-cap":  # Gemini's monthly project cap: a 429 that waiting never lifts
+            self.send_response(429)
+            self.end_headers()
+            self.wfile.write(json.dumps([{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message":
+                                                    "Your project has exceeded its monthly spending cap."}}]).encode())
+            return
         if _Api.mode == "garbage":  # not an HTTP response at all
             self.wfile.write(b"NOT-HTTP\r\n\r\n")
             self.close_connection = True
@@ -245,6 +251,13 @@ def test_a_context_overflow_is_too_long_not_missing_thinking_or_tools(api: str) 
         ask(api, KEY, "m", T, thinking="high", host=None)
     assert KEY not in str(caught.value) and len(_Api.seen) == 1  # no retries without thinking or tools
     assert (api, "m") not in ai_assist._NO_THINK and (api, "m") not in ai_assist._NO_TOOLS
+
+
+def test_a_spend_cap_429_is_named_and_not_retried(api: str) -> None:
+    _Api.mode = "spend-cap"
+    with pytest.raises(ValueError, match="^spend cap$"):
+        ask(api, KEY, "m", T, host=None)
+    assert len(_Api.seen) == 1  # a plain 429 is retried; a cap never lifts by waiting
 
 
 def test_ask_maps_broken_http_replies_to_network(api: str) -> None:
@@ -1181,6 +1194,15 @@ def test_stream_joins_split_tool_calls() -> None:
         ai_assist._read_stream(_sse({"error": {"message": "x"}}), seen.append)
 
 
+def test_stream_keeps_geminis_thought_signature_on_a_tool_call() -> None:
+    sig = {"google": {"thought_signature": "c2ln"}}
+    lines = _sse({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "list_files", "arguments": "{}"}, "extra_content": sig},
+        {"index": 1, "id": "c2", "function": {"name": "read_file", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]})
+    calls = ai_assist._read_stream(lines, lambda _t: None)["choices"][0]["message"]["tool_calls"]
+    assert calls[0]["extra_content"] == sig and "extra_content" not in calls[1]  # only a batch's first call has one
+
+
 def test_typing_while_it_works_steers_the_answer(monkeypatch: pytest.MonkeyPatch, api: str) -> None:
     from src.tools.ai_assist import AiReply
 
@@ -1371,6 +1393,14 @@ def test_timeout_retried_once_and_patient_jobs_wait_longer(monkeypatch: pytest.M
     with pytest.raises(ValueError, match="network") as caught:
         ai_assist._request("https://api.example/v1", "k", "/x", {}, 5, patient=True)
     assert len(calls) == 6 and type(caught.value) is ValueError  # 1 + 3 retries + 2 patient ones
+
+
+def test_geminis_hidden_thinking_tokens_count_as_reasoning_and_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage = {"prompt_tokens": 11451, "completion_tokens": 3, "total_tokens": 11560,  # as Gemini really sent it
+             "prompt_tokens_details": {"cached_tokens": 9402}}
+    monkeypatch.setattr(ai_assist, "_request", lambda *a, **k: {"usage": usage, "choices": [{"message": {"content": "450"}}]})
+    reply = ask("https://generativelanguage.googleapis.com/v1beta/openai", KEY, "gemini-3.8-flash", T, web=False)
+    assert (reply.completion_tokens, reply.reasoning_tokens, reply.total_tokens, reply.cached_tokens) == (109, 106, 11560, 9402)
 
 
 def test_cache_hits_cost_screenshot_batches_and_deepseek_balance(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -875,6 +875,22 @@ def test_thinking_levels_follow_the_provider() -> None:
     assert thinking_params(ds, "medium")["reasoning_effort"] == "high"
 
 
+def test_gemini_model_list_keeps_only_current_chat_models() -> None:
+    from src.tools.ai_assist import ModelInfo, _gemini_chat_models
+
+    ids = """aqa antigravity-preview-latest deep-research-preview-04-2026 gemini-2.5-computer-use-preview-10-2025
+    gemini-2.5-flash gemini-2.5-flash-image gemini-2.5-flash-lite gemini-2.5-flash-native-audio-latest gemini-2.5-pro
+    gemini-2.5-pro-preview-tts gemini-3-flash-preview gemini-3-pro-image gemini-3.1-flash-lite gemini-3.1-flash-live-preview
+    gemini-3.1-pro-preview gemini-3.1-pro-preview-customtools gemini-3.5-flash gemini-3.5-flash-lite
+    gemini-3.5-live-translate-preview gemini-3.5-transcribe gemini-3.7-flash gemini-3.8-flash gemini-3.8-flash-tts
+    gemini-3.8-live gemini-4-argon gemini-4-carbon gemini-4-hydrogen gemini-embedding-2 gemini-flash-latest
+    gemini-nano-banana-2.1 gemini-omni-1.1-flash gemini-omni-1.2-flash gemini-robotics-er-2-preview gemma-4-31b-it
+    lyria-3.5 nano-banana-pro-preview""".split()
+    kept = [m.id for m in _gemini_chat_models([ModelInfo(i, "", None) for i in ids])]
+    assert kept == ["gemini-4-carbon", "gemini-4-hydrogen"]  # Argon is retired
+    assert [m.id for m in _gemini_chat_models([ModelInfo(i, "", None) for i in ids + ["gemini-4-neon"]])][-1] == "gemini-4-neon"
+
+
 def test_models_that_always_think_have_no_off_and_old_shots_go_in_batches() -> None:
     from src.tools.ai_assist import KEEP_SHOTS, _drop_old_shots, _shot_count, fit_thinking, thinking_levels
 
@@ -882,6 +898,13 @@ def test_models_that_always_think_have_no_off_and_old_shots_go_in_batches() -> N
     assert "off" in thinking_levels(oai, "gpt-5") and "off" not in thinking_levels(oai, "o3-mini")
     assert "off" not in thinking_levels("https://openrouter.ai/api/v1", "openai/o3")
     assert fit_thinking(oai, "off", "o3") == "low"
+    gem = "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert thinking_levels(gem, "gemini-4-argon") == ("low", "medium", "high")
+    assert "off" in thinking_levels(gem, "gemini-3.8-flash")
+    assert thinking_levels(gem, "gemini-4-hydrogen") == ("low", "medium", "high", "max")  # max is Hydrogen's xhigh
+    from src.tools.ai_assist import thinking_params
+    assert thinking_params(gem, "max", "gemini-4-hydrogen") == {"reasoning_effort": "xhigh"}
+    assert thinking_params(gem, "max", "gemini-4-argon") == {"reasoning_effort": "high"}
     image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A"}}
     result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1",
                                            "content": [{"type": "text", "text": "t"}, image]}]}
