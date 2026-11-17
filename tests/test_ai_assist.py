@@ -801,8 +801,24 @@ def test_fetch_page_refuses_private_targets_and_extracts_text() -> None:
     assert ai_assist._run_tool("fetch_page", '{"url": "https://127.0.0.1/"}').startswith("error: fetch_page failed")
     assert ai_assist._run_tool("fetch_page", "{}").startswith("error")
     page = "<head><title>t</title></head><style>p{}</style><script>evil()</script><p>Hello&nbsp;<b>world</b></p>\n\n<p>2nd</p>"
-    assert ai_assist.page_text(page) == "Hello world 2nd"
-    assert len(ai_assist.page_text("x " * 20000)) <= ai_assist.MAX_PAGE_CHARS
+    assert ai_assist.page_text(page) == "Hello world\n2nd"
+    menu = ('<nav><a href="/">Home</a></nav><p>See <a href="/docs?a=1&amp;b=2">the docs</a>, '
+            '<a href="#top">top</a> and <a href="https://x.example/">https://x.example/</a></p><footer>(c)</footer>')
+    assert ai_assist.page_text(menu, "https://ex.example/a/") == (
+        "See the docs [https://ex.example/docs?a=1&b=2], top and https://x.example/")
+    assert ai_assist.page_text("<nav>only a menu</nav>") == "only a menu"  # nothing else: the menu stays
+    first = ai_assist.page_part("x" * 25000)
+    assert first.endswith("fetch_page with offset 20000 (25000 characters in all)")
+    assert ai_assist.page_part("x" * 25000, 20000) == "x" * 5000 and "nothing past" in ai_assist.page_part("x", 9)
+
+
+def test_fetch_page_passes_a_valid_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    got: list[int] = []
+    monkeypatch.setattr(ai_assist, "fetch_page", lambda url, offset=0: got.append(offset) or "page")
+    for args in ('{"url": "https://a.example/", "offset": 40000}', '{"url": "https://a.example/", "offset": -5}',
+                 '{"url": "https://a.example/", "offset": true}', '{"url": "https://a.example/"}'):
+        ai_assist._run_tool("fetch_page", args)
+    assert got == [40000, 0, 0, 0]
 
 
 def test_claude_native_request_pause_turn_sources_and_thinking(api: str, monkeypatch: pytest.MonkeyPatch) -> None:

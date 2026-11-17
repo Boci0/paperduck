@@ -101,6 +101,9 @@ MAX_NATIVE_ROUNDS = 5  # pause_turn continuations of one Claude answer
 # Added to the last tool output before the answer-only round, so a long job ends with a report, not an error
 BUDGET_NOTE = (f"\n\n[Paperduck: that was the last of this message's {MAX_TOOL_ROUNDS} tool rounds. Answer now "
                "without tools: say what is done and what is left; the user can send another message to continue.]")
+# Sent once when a reply came back empty because thinking used the whole token budget; that round has no thinking
+WRAP_NOTE = ("\n\n[Paperduck: your last reply hit the token limit while thinking and said nothing. Answer now "
+             "without tools or more thinking: what is done, how you checked it, and what is left.]")
 PACE_AT = MAX_TOOL_ROUNDS * 7 // 10  # rounds used when the model is told to stop polishing and finish
 PACE_NOTE = (f"\n\n[Paperduck: {PACE_AT} of this message's {MAX_TOOL_ROUNDS} tool rounds are used. Stop polishing: fix "
              "only what is broken, verify the result, remove your scratch files, then give the final answer.]")
@@ -244,8 +247,11 @@ SEARCH_TOOL = {"type": "function", "function": {
 }}
 FETCH_TOOL = {"type": "function", "function": {
     "name": "fetch_page",
-    "description": "Read the text of a public https web page, e.g. a search result.",
-    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    "description": ("Read the text of a public https web page, e.g. a search result, with its links as [url]. "
+                    "A long page ends with the offset to pass for the next part."),
+    "parameters": {"type": "object", "properties": {
+        "url": {"type": "string"},
+        "offset": {"type": "integer", "description": "character to start from (default 0)"}}, "required": ["url"]},
 }}
 # Where each preset hands out API keys (fixed links, opened only from the setup page)
 KEY_PAGES: dict[str, str] = {
@@ -1157,14 +1163,15 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     shot_at: list[int] = []  # indexes in `messages` of the screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
     fails: list[Any] = [0, 0, None, [], None, set()]
-    blind_told = False
-    for round_ in range(MAX_TOOL_ROUNDS + 1):
+    blind_told = wrapped = False
+    for round_ in range(MAX_TOOL_ROUNDS + 2):  # the extra round is only the wrap-up after a cut-off (WRAP_NOTE)
         _check(cancel)
         shots: list[str] = []
         body: dict[str, Any] = {"model": model, "messages": messages,
                                 "max_tokens": MAX_THINKING_TOKENS if thinks else MAX_REPLY_TOKENS,
                                 **thinking_params(base_url, thinking)}
-        offer = tools and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS
+        offer = (tools and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS
+                 and not wrapped)
         if offer or (tools and used and is_deepseek(base_url)):
             body["tools"] = [*((SEARCH_TOOL, FETCH_TOOL) if web else ()), *(host.specs if host else [])]
             if not offer:  # same tools, answer only: dropping them would change DeepSeek's cached prefix (a full miss)
@@ -1279,8 +1286,20 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                 reply.wire = []  # a screenshot is still in it (never kept), or too big to carry: the note form
         except (KeyError, IndexError, TypeError, AttributeError):
             raise ValueError("bad reply") from None
+        if not reply.text and reply.cut_off and not wrapped:
+            # thinking ate the budget: one more round, thinking off, no tools, so the job still ends with a report
+            wrapped, thinks = True, False
+            thinking = fit_thinking(base_url, "off", model) if thinking in THINKING_LEVELS else thinking
+            last = messages[-1]
+            if last.get("role") in ("tool", "user") and isinstance(last.get("content"), str):
+                messages[-1] = {**last, "content": last["content"] + WRAP_NOTE}
+            else:
+                messages.append({"role": "user", "content": WRAP_NOTE.strip()})
+            continue
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
+        if wrapped:
+            reply.wire = []  # the note changed an earlier turn; the replay would carry it
         drop_skills(reply)
         return reply
     raise ValueError("bad reply")
@@ -1639,8 +1658,10 @@ def _run_tool_raw(name: str, arguments: Any, host: ToolHost | None = None, seen:
         return f"error: {name} needs a non-empty '{param}' string"
     if name == "fetch_page" and seen is not None and (refused := _new_link(name, value.strip(), host, seen)):
         return refused
+    offset = args.get("offset")
+    offset = offset if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0 else 0
     try:
-        return web_search(value.strip()[:300]) if name == "web_search" else fetch_page(value.strip()[:2000])
+        return web_search(value.strip()[:300]) if name == "web_search" else fetch_page(value.strip()[:2000], offset)
     except ValueError as exc:
         return f"error: {name} failed ({exc})"
 
@@ -1684,13 +1705,37 @@ _STRIP_TAGS = re.compile(r"<[^>]+>")
 _RESULT_RE = re.compile(r'class="result__a" href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>', re.S)
 
 
-_DROP_BLOCKS = re.compile(r"<(script|style|noscript|svg|head)\b.*?</\1>", re.S | re.I)
+_DROP_BLOCKS = re.compile(r"<(script|style|noscript|svg|head|template)\b.*?</\1>", re.S | re.I)
+_CHROME_BLOCKS = re.compile(r"<(nav|footer|aside)\b.*?</\1>", re.S | re.I)  # site menus, not the page's content
+_PAGE_LINK = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", re.S | re.I)
+_BLOCK_END = re.compile(r"<(?:br|hr)\b[^>]*>|</(?:p|div|li|h[1-6]|tr|table|section|article|blockquote|pre|dd|dt)\s*>",
+                        re.I)
 
 
-def page_text(markup: str) -> str:
-    """Visible text of an HTML page, whitespace collapsed and capped at MAX_PAGE_CHARS."""
-    text = html.unescape(_STRIP_TAGS.sub(" ", _DROP_BLOCKS.sub(" ", markup)))
-    return re.sub(r"\s+", " ", text).strip()[:MAX_PAGE_CHARS]
+def page_text(markup: str, base: str = "") -> str:
+    """Visible text of an HTML page, one line per block, links kept as `label [url]` (resolved against `base`).
+    Menus, footers and sidebars are dropped unless nothing else is left."""
+    def link(m: re.Match[str]) -> str:
+        href = urljoin(base, html.unescape(m.group(1)).strip())
+        keep = href.startswith(("https://", "http://")) and href not in m.group(2) and not m.group(1).startswith("#")
+        return f"{m.group(2)} [{href}]" if keep else m.group(2)
+
+    def text(markup: str) -> str:
+        flat = html.unescape(_STRIP_TAGS.sub(" ", _BLOCK_END.sub("\n", _PAGE_LINK.sub(link, markup))))
+        return "\n".join(line for line in (re.sub(r"\s+", " ", ln).strip() for ln in flat.split("\n")) if line)
+
+    markup = _DROP_BLOCKS.sub(" ", markup)
+    return text(_CHROME_BLOCKS.sub(" ", markup)) or text(markup)
+
+
+def page_part(text: str, offset: int = 0) -> str:
+    """MAX_PAGE_CHARS of `text` from `offset`, ending with the offset of the next part when there is more."""
+    part = text[offset:offset + MAX_PAGE_CHARS]
+    if not part:
+        return f"nothing past offset {offset}; the page has {len(text)} characters" if text else "empty page"
+    if offset + MAX_PAGE_CHARS < len(text):
+        part += f"\n... more: fetch_page with offset {offset + MAX_PAGE_CHARS} ({len(text)} characters in all)"
+    return part
 
 
 def check_public_https(url: str) -> None:
@@ -1708,8 +1753,9 @@ def check_public_https(url: str) -> None:
         raise ValueError("private address refused")
 
 
-def fetch_page(url: str) -> str:
-    """Text of a public web page. Redirects are followed by hand so every hop is checked again."""
+def fetch_page(url: str, offset: int = 0) -> str:
+    """Text of a public web page from `offset` (see page_part). Redirects are followed by hand so every hop is
+    checked again. shortcut: each offset downloads the page again; cache by URL if paging long pages gets common."""
     for _ in range(MAX_REDIRECTS + 1):
         check_public_https(url)
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Paperduck",
@@ -1720,7 +1766,7 @@ def fetch_page(url: str) -> str:
                 if kind not in ("text/html", "text/plain"):
                     raise ValueError(f"not a text page ({kind})")
                 raw = resp.read(MAX_SEARCH_BYTES).decode(resp.headers.get_content_charset() or "utf-8", "replace")
-            return page_text(raw) if kind == "text/html" else raw.strip()[:MAX_PAGE_CHARS] or "empty page"
+            return page_part(page_text(raw, url) if kind == "text/html" else raw.strip(), offset)
         except urllib.error.HTTPError as exc:  # _NoRedirect raises these for 3xx
             location = exc.headers.get("Location") if exc.code in (301, 302, 303, 307, 308) else None
             if not location:

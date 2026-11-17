@@ -376,7 +376,8 @@ def _text(path: Path) -> str | None:
 
 OFFICE_EXTS = (".docx", ".pptx", ".xlsx")
 MAX_OFFICE_PARTS = 400  # XML parts read from one Office zip
-_W, _A, _S = ("{http://schemas.openxmlformats.org/%s/2006/main}" % n for n in ("wordprocessingml", "drawingml", "spreadsheetml"))
+_W, _A, _S, _P = ("{http://schemas.openxmlformats.org/%s/2006/main}" % n
+                  for n in ("wordprocessingml", "drawingml", "spreadsheetml", "presentationml"))
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 
@@ -385,6 +386,12 @@ def _col(ref: str) -> int:
     for ch in ref.rstrip("0123456789"):
         n = n * 26 + ord(ch.upper()) - 64
     return n
+
+
+def _part(root: str, target: str) -> str:
+    """A relationship target ('slides/slide1.xml' or '/ppt/slides/slide1.xml') as a zip member name under root."""
+    target = target.lstrip("/")
+    return target if target.startswith(root) else root + target
 
 
 def _office_text(path: Path) -> str:
@@ -414,7 +421,11 @@ def _office_text(path: Path) -> str:
             return "\n".join(paras(xml("word/document.xml"), _W + "p", _W + "t"))
         if kind == ".pptx":
             slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
-                            key=lambda n: int(re.findall(r"\d+", n)[0]))  # file number, not presentation.xml order
+                            key=lambda n: int(re.findall(r"\d+", n)[0]))
+            if {"ppt/presentation.xml", "ppt/_rels/presentation.xml.rels"} <= set(names):  # the deck's own order
+                rels = {r.get("Id"): _part("ppt/", r.get("Target", "")) for r in xml("ppt/_rels/presentation.xml.rels")}
+                order = [rels.get(s.get(_R + "id")) for s in xml("ppt/presentation.xml").iter(_P + "sldId")]
+                slides = [n for n in order if n in names] or slides  # file numbers drift after slides are moved
             return "\n".join(f"Slide {i}\n" + "\n".join(paras(xml(n), _A + "p", _A + "t"))
                              for i, n in enumerate(slides, 1))
         shared = [("".join(t.text or "" for t in si.iter(_S + "t")))
@@ -422,12 +433,11 @@ def _office_text(path: Path) -> str:
         rels = {r.get("Id"): r.get("Target", "") for r in xml("xl/_rels/workbook.xml.rels")}
         out = []
         for sheet in xml("xl/workbook.xml").iter(_S + "sheet"):
-            target = rels.get(sheet.get(_R + "id"), "").lstrip("/")
-            member = target if target.startswith("xl/") else "xl/" + target
+            member = _part("xl/", rels.get(sheet.get(_R + "id"), ""))
             if member not in names:
                 continue
-            out.append(f"Sheet: {sheet.get('name')}")
-            for row in xml(member).iter(_S + "row"):
+            out.append(f"Sheet: {sheet.get('name')} (each row starts with its row number; formulas as [=...])")
+            for n, row in enumerate(xml(member).iter(_S + "row"), 1):
                 cells: list[str] = []
                 for c in row.iter(_S + "c"):
                     v = c.find(_S + "v")
@@ -439,9 +449,11 @@ def _office_text(path: Path) -> str:
                         val = shared[int(v.text)] if v.text.isdigit() and int(v.text) < len(shared) else ""
                     else:
                         val = v.text
+                    if (f := c.find(_S + "f")) is not None and f.text:  # a shared formula's copies carry no text
+                        val = f"{val} [={f.text}]"
                     at = min(_col(c.get("r") or "") or len(cells) + 1, 16384)  # Excel's last column: a forged ref pads no further
                     cells += [""] * (at - 1 - len(cells)) + [val.replace("\t", " ").replace("\n", " ")]
-                out.append("\t".join(cells))
+                out.append("\t".join([row.get("r") if (row.get("r") or "").isdigit() else str(n), *cells]))
                 budget[0] -= len(out[-1])  # padding counts too: a far-right cell in every row is a bomb of tabs
                 if budget[0] < 0:
                     raise ValueError("expands to more than 32 MB")

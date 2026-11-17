@@ -237,3 +237,32 @@ def test_mcp_approval_scans_argument_values_not_names() -> None:
     assert sorted(_strings(args)) == ["a.txt", "png", "rm -rf /"]
     assert destructive_reason("\n".join(_strings({"format": "png", "truncate": True}))) == ""
     assert destructive_reason("\n".join(_strings(args)))
+
+
+def test_a_reply_cut_off_while_thinking_gets_one_tool_free_wrap_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict] = []
+
+    def request(base, key, path, body, timeout, progress=None, patient=False):
+        sent.append(json.loads(json.dumps(body)))
+        if len(sent) == 1:
+            return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "list_files", "arguments": "{}"}}]}}]}
+        if len(sent) == 2:
+            return {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": ""}}]}
+        return {"choices": [{"message": {"role": "assistant", "content": "Done: listed the files."}}]}
+
+    monkeypatch.setattr(ai_assist, "_request", request)
+    monkeypatch.setattr(ai_assist, "_NO_STREAM", set())
+    reply = ai_assist._post("https://api.openai.com/v1", "k", "m", [{"role": "user", "content": "go"}], "high", 5,
+                            True, _Host(), lambda _s: None)
+    assert reply.text == "Done: listed the files." and reply.wire == []
+    last = sent[-1]
+    assert len(sent) == 3 and "tools" not in last and last["reasoning_effort"] == "none"
+    assert last["max_tokens"] == ai_assist.MAX_REPLY_TOKENS and "token limit" in last["messages"][-1]["content"]
+
+    sent.clear()  # cut off again: the error stands, with no third try
+    monkeypatch.setattr(ai_assist, "_request", lambda *a, **k: sent.append(1) or {
+        "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": ""}}]})
+    with pytest.raises(ValueError, match="cut off"):
+        ai_assist._post("https://api.openai.com/v1", "k", "m", [{"role": "user", "content": "go"}], "high", 5)
+    assert len(sent) == 2

@@ -77,7 +77,7 @@ def test_mcp_output_arms_the_fetch_guard(monkeypatch: pytest.MonkeyPatch) -> Non
     ])
     sent: list[dict] = []
     monkeypatch.setattr(ai_assist, "_request", lambda *a: sent.append(json.loads(json.dumps(a[3]))) or next(replies))
-    monkeypatch.setattr(ai_assist, "fetch_page", lambda url: pytest.fail("fetched " + url))
+    monkeypatch.setattr(ai_assist, "fetch_page", lambda url, offset=0: pytest.fail("fetched " + url))
     host = SimpleNamespace(specs=[mcp_client.tool_spec("notes", {"name": "read"})], run=lambda n, a: "SECRET")
     ai_assist._post("https://api.example/v1", "k", "m", [{"role": "user", "content": "hi"}], "off", 5, True, host)
     assert "only opens links already" in sent[2]["messages"][-1]["content"]
