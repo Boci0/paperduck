@@ -237,7 +237,6 @@ class AiToolHost(QObject):
         self._refused: tuple[int, int, int] | None = None  # (x, y, map) of the last click refused as stale
         self._in_batch = False
         self._batch_acted = False
-        self._computer_review: tuple[tuple[tuple[str, ...], bool], tuple[bool, str]] | None = None
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
@@ -801,22 +800,10 @@ class AiToolHost(QObject):
         extra: dict[str, Any] = {"danger": risk} if risk else {"untrusted": True} if (
             self.outside and key in OUTSIDE_GUARDED) else {}
         if auto_mode(self._win) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
-            if key == "computer" and not risk:
-                cache_key = (tuple(chat.user_requests()), bool(extra.get("untrusted")))
-                cached = getattr(self, "_computer_review", None)
-                if cached is not None and cached[0] == cache_key and cached[1][0]:
-                    extra["review"] = cached[1]
-                else:
-                    verdict = self._review(text)
-                    if self.cancel.is_set():
-                        return False
-                    extra["review"] = verdict
-                    if verdict[0]:
-                        self._computer_review = (cache_key, verdict)
-            else:
-                extra["review"] = self._review(text)
-                if self.cancel.is_set():
-                    return False
+            # every action gets its own review: a cached yes would pass later clicks (Send, Buy) unseen
+            extra["review"] = self._review(text)
+            if self.cancel.is_set():
+                return False
         ask = lambda done: chat.confirm(key, text, what, done, **extra)  # noqa: E731
         return self._waiting(ask) is True
 

@@ -1514,7 +1514,7 @@ def test_read_file_extracts_pdf_text_and_respects_binary_and_bomb_guards(
     assert "32 MB" in run_file_tool(tmp_path, "read_file", {"path": "bomb.pdf"})
 
 
-def test_auto_mode_caches_computer_review_and_batches_skip_intermediate_grabs() -> None:
+def test_auto_mode_reviews_every_computer_action_and_batches_skip_intermediate_grabs() -> None:
     from src.ui.ai_tool_host import AiToolHost
 
     reviews: list[str] = []
@@ -1530,17 +1530,13 @@ def test_auto_mode_caches_computer_review_and_batches_skip_intermediate_grabs() 
         outside=True,
         _win=SimpleNamespace(_ai_chat=chat),
         cancel=threading.Event(),
-        _computer_review=None,
         _review=lambda action: reviews.append(action) or (True, "user asked for UI work"),
         _waiting=lambda ask: (box := []) or ask(box.append) or box[0],
     )
     assert AiToolHost._allowed(fake, "computer", "left-click at (10, 20)", "computer control") is True
-    assert AiToolHost._allowed(fake, "computer", "left-click at (30, 40)", "computer control") is True
-    assert len(reviews) == 1 and len(confirmed) == 2 and confirmed[1]["review"] == (True, "user asked for UI work")
-
-    reqs.append("also align title")
-    assert AiToolHost._allowed(fake, "computer", "left-click at (50, 60)", "computer control") is True
-    assert len(reviews) == 2
+    assert AiToolHost._allowed(fake, "computer", 'left-click on "Send"', "computer control") is True
+    assert reviews == ["left-click at (10, 20)", 'left-click on "Send"']  # the second click is judged on its own
+    assert confirmed[1]["review"] == (True, "user asked for UI work")
 
     assert AiToolHost._allowed(fake, "computer", "press delete", "computer control", risk="delete") is True
     assert len(reviews) == 3
