@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
@@ -160,6 +161,7 @@ class HintsPlugin:
         self.ai_calls = 0
         self.ai_tokens = 0
         self.last_tidy: tuple[list[tuple[str, str]], list[str]] | None = None  # (moves done, folders made) to undo
+        self.history: deque[Suggestion] = deque(maxlen=5)
 
     @property
     def tool_id(self) -> str:
@@ -208,6 +210,8 @@ class HintsPlugin:
         if hint.rule == "focus":
             self._app_since = now  # the next focus hint needs another full dwell
         self.shown += 1
+        if not self.history or self.history[-1] != hint:
+            self.history.append(hint)
         return hint
 
     def _watch_hint(self, app: str, title: str, clip: str, now: float) -> Suggestion | None:
@@ -302,6 +306,10 @@ class HintsPlugin:
         if self.last_tidy is not None:
             items.append(ToolMenuItem(label=f"Undo Last Tidy ({len(self.last_tidy[0])} files)",
                                       callback_id="watch:undo_tidy", submenu=sub))
+        if self.history:
+            last = self.history[-1]
+            items.append(ToolMenuItem(label=f"Recall Last Hint: {last.text[:28]}",
+                                      callback_id="hints:last", submenu=sub))
         app = self._app.lower()
         if self.watch and app:
             items.append(ToolMenuItem(label=f"Pre-fetch Answers in {app}", callback_id="hints:prefetch",

@@ -17,6 +17,7 @@ from src.tools.ai_assist import (
     deepseek_balance,
     delete_key,
     fit_thinking,
+    is_anthropic,
     is_deepseek,
     list_models,
     load_key,
@@ -277,6 +278,7 @@ class ChatSetupMixin:
         if models:
             self._models[url] = models
         self._refresh_title()
+        self.remote_changed.emit()
         if show and url == self._plugin.base_url and self.isVisible():
             self._show_model_menu(models or [], error or ("" if models else "empty list"))
 
@@ -299,6 +301,18 @@ class ChatSetupMixin:
             action.setCheckable(True)
             action.setChecked(level == fit_thinking(p.base_url, p.thinking, p.model))
             action.triggered.connect(lambda _c=False, t=level: self._pick(thinking=t))
+        if not is_anthropic(p.base_url):  # Claude's effort is fixed per answer
+            screen = style_menu(QMenu("Screen work thinking", menu))
+            menu.addMenu(screen)
+            screen.setToolTip("Thinking used once an answer starts clicking and typing on screen: more thinking "
+                              "costs more per step but misclicks and gives up less.")
+            screen_levels = {"": "Same as chat"} | {lv: lv.title() for lv in thinking_levels(p.base_url, p.model)}
+            for level, label in screen_levels.items():
+                action = screen.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(level == (fit_thinking(p.base_url, p.screen_thinking, p.model)
+                                            if p.screen_thinking else ""))
+                action.triggered.connect(lambda _c=False, t=level: self._pick(screen_thinking=t))
         menu.addSection("Approvals")
         auto = menu.addAction("Auto mode (hands-free, reviewed)")
         auto.setCheckable(True)
@@ -312,7 +326,8 @@ class ChatSetupMixin:
         menu.exec(self._title.mapToGlobal(QPoint(0, self._title.height() + 2)))
         menu.deleteLater()
 
-    def _pick(self, model: str | None = None, thinking: str | None = None, auto: bool | None = None) -> None:
+    def _pick(self, model: str | None = None, thinking: str | None = None, auto: bool | None = None,
+              screen_thinking: str | None = None) -> None:
         p = self._plugin
         if model is not None and valid_model(model):
             p.model = model
@@ -320,7 +335,10 @@ class ChatSetupMixin:
             p.thinking = thinking
         if auto is not None:
             p.auto = auto
+        if screen_thinking == "" or screen_thinking in THINKING_LEVELS:
+            p.screen_thinking = screen_thinking
         self._refresh_title()
+        self.remote_changed.emit()
 
     def _leave_setup_if_ok(self) -> None:
         if self._stack.currentIndex() == 1 and self._ready():

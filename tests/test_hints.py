@@ -60,3 +60,15 @@ def test_hostile_clipboard_text_never_raises():
     deep = base64.urlsafe_b64encode(b'{"a":' + nested.encode() + b"}").decode().rstrip("=")
     for clip in ("²" * 10, nested, f"eyJhbGciOiJIUzI1NiJ9.{deep}.sig"):
         assert suggest("code.exe", clip, 0.0, True) is None
+
+
+def test_hints_tracks_bounded_history_and_recall_menu():
+    hints = HintsPlugin()
+    hints.poll("code.exe", "", True, now=0.0)
+    for i in range(6):
+        hints._next_ok.clear()
+        hints.poll("chrome.exe", JWT if i % 2 == 0 else "1793286902", True, now=float((i + 1) * 100))
+    assert len(hints.history) == 5
+    items = hints.get_menu_items()
+    recall = [it for it in items if it.callback_id == "hints:last"]
+    assert len(recall) == 1 and "Recall Last Hint:" in recall[0].label

@@ -239,3 +239,43 @@ def test_summary_points_at_the_archive_and_keeps_tasks_verbatim() -> None:
     first = ai_assist.summary_turns("did things", "C:/x/abc.archive.txt", [("ship 2.0.5", "doing")])[0]["content"]
     assert "- [doing] ship 2.0.5" in first and "C:/x/abc.archive.txt" in first
     assert ai_assist.summary_turns("plain")[0]["content"].endswith("plain")
+
+
+def test_session_list_cache_hits_and_invalidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ai_sessions.clear_session_cache()
+    sid = new_id()
+    assert save_session(sid, HISTORY, root=tmp_path)
+    parses = 0
+    orig = ai_sessions._parse
+
+    def tracked(p: Path):
+        nonlocal parses
+        parses += 1
+        return orig(p)
+
+    monkeypatch.setattr(ai_sessions, "_parse", tracked)
+    assert len(list_sessions(tmp_path)) == 1 and parses == 1
+    assert len(list_sessions(tmp_path)) == 1 and parses == 1  # second listing hits (mtime, size) cache
+    save_session(sid, [*HISTORY, {"role": "user", "content": "next"}], root=tmp_path)
+    assert len(list_sessions(tmp_path)) == 1 and parses == 2  # write-through invalidated cached entry
+    ai_sessions.delete_session(sid, tmp_path)
+    assert list_sessions(tmp_path) == []
+
+
+def test_ai_chat_live_stream_and_width_toggle() -> None:
+    chat = _chat()
+    try:
+        assert chat.width() == chat.WIDTH and not chat.is_wide()
+        chat.toggle_width()
+        assert chat.width() == chat.WIDE_WIDTH and chat.is_wide()
+        chat.toggle_width()
+        assert chat.width() == chat.WIDTH and not chat.is_wide()
+
+        chat._stream_text = "Streaming preview..."
+        chat._tick_dots()
+        assert chat._stream_label is not None and chat._stream_label.toPlainText() == "Streaming preview..."
+        before_rows = chat._thread_layout.count()
+        chat._clear_stream()
+        assert chat._stream_row is None and chat._thread_layout.count() == before_rows - 1
+    finally:
+        chat.close()

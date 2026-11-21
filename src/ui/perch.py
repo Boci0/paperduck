@@ -40,10 +40,15 @@ def perch_covered(rects: Sequence[Rect], index: int | None, feet_x: int) -> bool
     return any(_inside(above, feet_x, top) for above in rects[:index])
 
 
-def perch_position(edge: Rect, center_x: int, sprite_cx: int, feet_y: int, margin: int) -> tuple[int, int]:
+def perch_position(edge: Rect, center_x: int, sprite_cx: int, feet_y: int, margin: int,
+                   right_reserve: int = 0) -> tuple[int, int]:
     """Pet window top-left that stands the feet (local y `feet_y`) on the edge's top, with the sprite centre
-    (local x `sprite_cx`) kept at least `margin` inside the edge's ends."""
-    lo, hi = edge[0] + margin, edge[2] - margin
+    (local x `sprite_cx`) kept at least `margin` inside the edge's ends (and clear of `right_reserve` on the
+    right when the window has room, e.g. Win32 caption buttons)."""
+    right = edge[2] - max(0, right_reserve)
+    if right - margin < edge[0] + margin:
+        right = edge[2]
+    lo, hi = edge[0] + margin, right - margin
     cx = (edge[0] + edge[2]) // 2 if lo > hi else max(lo, min(hi, center_x))
     return cx - sprite_cx, edge[1] - feet_y
 
@@ -92,9 +97,10 @@ def _physical_rect(u, hwnd: int) -> Rect | None:
     return (r.left, r.top, r.right, r.bottom) if r.right - r.left > 0 and r.bottom - r.top > 0 else None
 
 
-def top_level_windows() -> list[tuple[int, Rect]]:
+def top_level_windows(stop_at_hwnd: int | None = None) -> list[tuple[int, Rect]]:
     """(hwnd, physical rect) of the windows the duck can sit on, topmost first: visible, not minimized, not
-    cloaked, not tool windows (the taskbar is one, and is always kept), not this process's."""
+    cloaked, not tool windows (the taskbar is one, and is always kept), not this process's. When `stop_at_hwnd`
+    is set and still visible, enumeration stops once it is added."""
     u = _user32()
     me = os.getpid()
     found: list[tuple[int, Rect]] = []
@@ -111,10 +117,17 @@ def top_level_windows() -> list[tuple[int, Rect]]:
                 rect = _physical_rect(u, hwnd)
                 if rect is not None:
                     found.append((int(hwnd), rect))
+                    if stop_at_hwnd is not None and int(hwnd) == stop_at_hwnd:
+                        return False
         return True
 
     u.EnumWindows(visit, 0)
     return found
+
+
+def is_taskbar(hwnd: int) -> bool:
+    """True when `hwnd` is the Windows taskbar (where caption-button right reserve does not apply)."""
+    return _class(_user32(), hwnd) in TASKBAR_CLASSES
 
 
 def window_rect(hwnd: int) -> Rect | None:

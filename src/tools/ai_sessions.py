@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +26,14 @@ MAX_SESSION_BYTES = 2 * 1024 * 1024
 MAX_TITLE_CHARS = 60
 VERSION = 1
 _ID = re.compile(r"^[0-9a-f]{12}$")
+_CACHE_LOCK = threading.Lock()
+_SESSION_CACHE: dict[Path, tuple[int, int, Session | None]] = {}
+
+
+def clear_session_cache() -> None:
+    """Drop all cached parsed session entries (mostly for tests)."""
+    with _CACHE_LOCK:
+        _SESSION_CACHE.clear()
 # shortcut: common key shapes only (sk-..., ghp_..., AKIA..., Bearer ...), not a secret scanner
 _KEY_LIKE = re.compile(r"\b(?:sk-[\w-]{20,}|gh[pousr]_\w{30,}|xox[abprs]-[\w-]{20,}|AKIA[0-9A-Z]{16}|AIza[\w-]{30,})"
                        r"|(?i:bearer)\s+[\w.~+/=-]{24,}")
@@ -106,11 +115,13 @@ def save_session(sid: str, history: list[dict[str, Any]], tasks: list[tuple[str,
             tmp.write(data)
             tmp.flush()
             os.fsync(tmp.fileno())
-        os.replace(tmp_name, root / f"{sid}.json")
+        os.replace(tmp_name, dest := root / f"{sid}.json")
     except OSError:
         if tmp_name:
             Path(tmp_name).unlink(missing_ok=True)
         return False
+    with _CACHE_LOCK:
+        _SESSION_CACHE.pop(dest, None)
     _trim(root)
     return True
 
@@ -161,6 +172,25 @@ def _parse(path: Path) -> Session | None:
         return None
 
 
+def _cached_parse(path: Path) -> Session | None:
+    """Cached wrapper around `_parse` keyed by `(st_mtime_ns, st_size)`."""
+    try:
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        with _CACHE_LOCK:
+            _SESSION_CACHE.pop(path, None)
+        return None
+    with _CACHE_LOCK:
+        hit = _SESSION_CACHE.get(path)
+        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
+            return hit[2]
+    parsed = _parse(path)
+    with _CACHE_LOCK:
+        _SESSION_CACHE[path] = (sig[0], sig[1], parsed)
+    return parsed
+
+
 def list_sessions(root: Path | None = None) -> list[Session]:
     """Readable sessions, newest first (at most MAX_SESSIONS)."""
     root = root or sessions_dir()
@@ -168,7 +198,11 @@ def list_sessions(root: Path | None = None) -> list[Session]:
         files = list(root.glob("*.json"))
     except OSError:
         return []
-    found = [s for s in (_parse(p) for p in files) if s is not None and s.history]
+    live = set(files)
+    with _CACHE_LOCK:
+        for stale in [p for p in _SESSION_CACHE if p.parent == root and p not in live]:
+            _SESSION_CACHE.pop(stale, None)
+    found = [s for s in (_cached_parse(p) for p in files) if s is not None and s.history]
     return sorted(found, key=lambda s: s.updated, reverse=True)[:MAX_SESSIONS]
 
 
@@ -212,7 +246,10 @@ def delete_session(sid: str, root: Path | None = None) -> None:
     """Remove one saved session and its archive; a bad id or a disk error just leaves it."""
     if _ID.match(sid):
         try:
-            ((root or sessions_dir()) / f"{sid}.json").unlink(missing_ok=True)
+            target = (root or sessions_dir()) / f"{sid}.json"
+            target.unlink(missing_ok=True)
+            with _CACHE_LOCK:
+                _SESSION_CACHE.pop(target, None)
             archive_path(sid, root).unlink(missing_ok=True)
         except OSError:
             pass
@@ -224,5 +261,8 @@ def delete_sessions(root: Path | None = None) -> None:
     try:
         for path in [*root.glob("*.json"), *root.glob("*.archive.txt"), *root.glob("*.tmp")]:
             path.unlink(missing_ok=True)
+        with _CACHE_LOCK:
+            for cached in [p for p in _SESSION_CACHE if p.parent == root]:
+                _SESSION_CACHE.pop(cached, None)
     except OSError:
         pass

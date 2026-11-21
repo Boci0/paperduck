@@ -302,3 +302,25 @@ def test_computer_batch_loop_with_varying_coordinates_is_flagged() -> None:
     ]
     assert all(n == "" for n in notes[:-1]) and "8 times" in notes[-1]
 
+
+
+def test_screen_thinking_starts_the_round_after_the_first_screen_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    replies = iter([_calls("list_files"), _calls("screen_map"), _text("done")])
+    sent: list[dict] = []
+    monkeypatch.setattr(ai_assist, "_request", lambda *a: sent.append(dict(a[3])) or next(replies))
+    host = Host()
+    host.specs.append({"type": "function", "function": {"name": "screen_map", "description": "d", "parameters": {}}})
+    ai_assist._post(URL, "k", "m", [{"role": "user", "content": "go"}], "low", 5, True, host, web=False,
+                    screen_thinking="high")
+    assert [b.get("reasoning_effort") for b in sent] == ["low", "low", "high"]
+
+def test_an_answer_ending_with_open_layout_problems_is_sent_back_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    replies = iter([_text("Done, looks great."), _text("Fixed? No: the left margin is a full-bleed band.")])
+    sent: list[dict] = []
+    monkeypatch.setattr(ai_assist, "_request", lambda *a: sent.append(json.loads(json.dumps(a[3]))) or next(replies))
+    host = Host()
+    host.layout_open = "content is 2 px from the left edge"
+    reply = ai_assist._post(URL, "k", "m", [{"role": "user", "content": "go"}], "off", 5, True, host, web=False)
+    assert len(sent) == 2 and "2 px from the left edge" in sent[1]["messages"][-1]["content"]
+    assert reply.text.startswith("Fixed? No") and reply.wire == []
+

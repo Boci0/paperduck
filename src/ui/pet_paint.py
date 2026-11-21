@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen
@@ -38,10 +39,15 @@ class PaintMixin:
         cached = self._image_cache.get(key)
         if cached is None:
             if len(self._image_cache) >= 96:  # about 10 MB at 4x on a 125% display
-                self._image_cache.clear()
+                if isinstance(self._image_cache, OrderedDict):
+                    self._image_cache.popitem(last=False)
+                else:
+                    self._image_cache.pop(next(iter(self._image_cache)))
             cached = render_pose(self._anim.current_frame(), px, mirrored=self._anim.facing_left)
             cached.setDevicePixelRatio(px / self._sprite_rect.width())
             self._image_cache[key] = cached
+        elif isinstance(self._image_cache, OrderedDict):
+            self._image_cache.move_to_end(key)
         return cached
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]

@@ -6,6 +6,7 @@ import ctypes
 import random
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from src.tools.hints import Suggestion
 from src.tools import computer
 from src.ui.ai_chat import AiChat
 from src.ui.ai_tool_host import show_quietly
+from src.ui.pet_remote import RemoteController
 from src.ui.screen_glow import ScreenGlow
 from src.storage.recent_files import RecentFiles
 from src.tools.web_drop import WebImageJob, web_image_stem
@@ -110,7 +112,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._hud_rect = QRect(8, 4, self.WINDOW_WIDTH - 16, 72)
 
         # Rendered frames keyed by (clip_name, frame_index, facing_left, device px)
-        self._image_cache: dict[tuple[str, int, bool, int], QImage] = {}
+        self._image_cache: OrderedDict[tuple[str, int, bool, int], QImage] = OrderedDict()
 
         # Mouse drag and hover state
         self._press_global_pos: QPoint | None = None
@@ -130,6 +132,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._walk_dx: int = 0
         self._walk_steps_remaining: int = 0
         self._perch: tuple[int, int] | None = None  # (hwnd, sprite centre x minus the edge's left) while sitting
+        self._perch_taskbar: bool = False
         self._fall_to: int | None = None  # window y a perch fall ends at
         self._perch_ticks = 0
         self._fall_x, self._fall_y, self._fall_v = 0, 0.0, 0.0  # x, exact y, speed in px/s
@@ -182,6 +185,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self.wheel = WheelLayout()  # Settings > Customize Wheel, persisted as tools.wheel
         self.macros = MacroBook()  # right-click > Macros, persisted as tools.macros
         self._macro_runner = MacroRunner(self)
+        self.remote = RemoteController(self)
         QTimer.singleShot(0, preload_tick_sounds)  # wheels are built lazily; sounds must be ready first
 
         self._configure_window()
@@ -432,6 +436,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         # which popped the card up out of nowhere; the clip change already shows the state
         self._schedule_next_anim_tick()
         self.update()
+        self.remote.notify_change()
 
     def _handle_stats_change(self, _stats: PetStats) -> None:
         self._collect_forge_outputs()
@@ -570,21 +575,25 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         if i is None:
             return
         self._perch = (hwnds[i], self.x() + sx - rects[i][0])
+        self._perch_taskbar = perch.is_taskbar(hwnds[i])
         self._perch_ticks = 0
         if self._follow_perch(fall=False):
             self._start_perch_timer()
 
-    def _perch_candidates(self) -> tuple[list[int], list[perch.Rect]]:
+    def _perch_candidates(self, stop_at: int | None = None) -> tuple[list[int], list[perch.Rect]]:
         """Windows the duck could sit on, topmost first, in logical px."""
         screens = self._qt_screens()
-        wins = perch.top_level_windows()
+        try:
+            wins = perch.top_level_windows(stop_at_hwnd=stop_at)
+        except TypeError:
+            wins = perch.top_level_windows()
         return [h for h, _ in wins], [perch.to_logical(r, screens) for _, r in wins]
 
     def _check_perch_cover(self) -> None:
         """Another window came up over the spot the duck sits on (alt-tab, a click on another app): hop onto that
         window's top edge when it is right at the feet, else fall to the floor."""
         assert self._perch is not None
-        hwnds, rects = self._perch_candidates()
+        hwnds, rects = self._perch_candidates(stop_at=self._perch[0])
         sx, fy = self._feet_local()
         fx = self.x() + sx
         index = hwnds.index(self._perch[0]) if self._perch[0] in hwnds else None
@@ -593,6 +602,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         j = perch.pick_perch(rects, fx, self.y() + fy)
         if j is not None:
             self._perch = (hwnds[j], fx - rects[j][0])
+            self._perch_taskbar = perch.is_taskbar(hwnds[j])
             self._follow_perch()  # falls itself when there is no room up there
             return
         self._perch = None
@@ -631,7 +641,9 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         sx, fy = self._feet_local()
         lost = rect is None or perch.perch_lost(rect, [g for g, _ in screens], rect[0] + offset)
         if rect is not None and not lost:
-            x, y = perch.perch_position(rect, rect[0] + offset + dx, sx, fy, self._sprite_rect.width() // 4)
+            reserve = 0 if getattr(self, "_perch_taskbar", False) else 140
+            x, y = perch.perch_position(rect, rect[0] + offset + dx, sx, fy, self._sprite_rect.width() // 4,
+                                        right_reserve=reserve)
             cx, cy = self._clamp_feet(x, y)
             lost = cy != y  # pushed off the edge (window dragged to the screen top, maximized)
         if rect is None or lost:
@@ -979,6 +991,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
                      for mode, label in HOTKEY_ACTIONS.items()],
             pet_scales=self.PET_SCALES,
             theme=saved_theme(),
+            phone_bridge_on=self.remote.running,
             parent=self,
         )
 
@@ -1010,6 +1023,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._overlay_timer.stop()
         self._perch_timer.stop()
         self._hint_timer.stop()
+        self.remote.close()
         if self._ai_chat is not None:
             self._ai_chat.close()
             self._ai_chat = None

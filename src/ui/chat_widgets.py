@@ -129,7 +129,13 @@ def reply_details(reply: AiReply, asked_model: str, thinking: str, name: str = "
     served = reply.model or asked_model
     parts = [(served if served == asked_model else f"{asked_model} > {served}")
              + (f" ({name})" if name and name != served else "")]
-    if thinking != "off":
+    if reply.screen_thinking_used:
+        parts.append(
+            f"thinking {thinking} > screen {reply.screen_thinking_used}"
+            if thinking != "off"
+            else f"screen thinking {reply.screen_thinking_used}"
+        )
+    elif thinking != "off":
         parts.append(f"thinking {thinking}")
     if reply.total_tokens:
         cached = min(reply.cached_tokens, reply.prompt_tokens)
@@ -192,13 +198,18 @@ class Attachment:
     thumb: QPixmap | None = None
     image_url: str = ""  # PNG data URL, sent as an image part
     path: str = ""  # set when the file is too big to paste: only its start goes in, the model reads the rest
+    saved_path: str = ""  # local disk path for images or inline files when backed by a real file
 
     def as_prompt(self) -> str:
         if self.path:
             return (f"[File: {self.name}, {self.detail}; too big to paste. Read it on demand with read_file "
                     f"(start_line) and search_text, path {self.path}. Its start:]\n{self.text[:REF_HEAD_CHARS]}")
         label = "Image (attached; its text read by OCR)" if self.kind == "image" else "File"
-        return f"[{label}: {self.name}]\n{self.text}"
+        body = f"[{label}: {self.name}]\n{self.text}"
+        if self.saved_path:
+            sep = "\n" if self.text else ""
+            return f"{body}{sep}[Saved file path: {self.saved_path}]"
+        return body
 
 
 class _Frosted(QFrame):
@@ -282,6 +293,18 @@ class IconButton(QAbstractButton):
         elif self.kind == "stop":
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(11.5, 11.5, 9, 9), 2, 2)
+        elif self.kind == "wide":  # outward chevrons
+            for ax, tx in ((13.5, 9.5), (18.5, 22.5)):
+                painter.drawLine(QPointF(ax, 12.5), QPointF(tx, 16))
+                painter.drawLine(QPointF(ax, 19.5), QPointF(tx, 16))
+            painter.drawLine(QPointF(10, 16), QPointF(14.5, 16))
+            painter.drawLine(QPointF(17.5, 16), QPointF(22, 16))
+        elif self.kind == "narrow":  # inward chevrons
+            for ax, tx in ((10, 14), (22, 18)):
+                painter.drawLine(QPointF(ax, 12.5), QPointF(tx, 16))
+                painter.drawLine(QPointF(ax, 19.5), QPointF(tx, 16))
+            painter.drawLine(QPointF(9.5, 16), QPointF(14, 16))
+            painter.drawLine(QPointF(18, 16), QPointF(22.5, 16))
         painter.end()
 
 

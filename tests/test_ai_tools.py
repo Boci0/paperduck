@@ -718,10 +718,16 @@ def test_computer_tools_parse_and_flag_risky_actions() -> None:
         with pytest.raises(ValueError):
             computer_action(name, args)
     mapped = parse_boxes("100,50,200,20\tFile Edit\nbad line\n0,0,10,10\t  ", 1920, 1080)
-    assert mapped.endswith("Visible text lines (OCR):\n(200, 60) File Edit") and "Controls" not in mapped
+    assert mapped.endswith("Visible text lines (OCR):\n#1 (200, 60) box 100,50,200x20 File Edit")
+    assert "Controls" not in mapped
     assert "No text or controls" in parse_boxes("", 1920, 1080)
-    both = parse_boxes("100,50,200,20\tFile Edit", 1920, 1080, "10,10,30,30\tButton\tSave  as\nbad\n", "Scaled 1.2x.")
-    assert 'Controls in the front window (exact):\n[Button] "Save as" (25, 25)' in both and "Scaled 1.2x." in both
+    items: dict = {}
+    both = parse_boxes("100,50,200,20\tFile Edit\n12,15,20,10\tSave as", 1920, 1080,
+                       "10,10,30,30\tButton\tSave  as\nbad\n", "Scaled 1.2x.", items)
+    assert 'Controls in the front window (exact):\n#1 [Button] "Save as" (25, 25) box 10,10,30x30' in both
+    assert "Scaled 1.2x." in both and "#2 (200, 60) box 100,50,200x20 File Edit" in both
+    assert both.count("Save as") == 1  # the OCR line inside the button that only repeats its name is left out
+    assert items == {1: (10, 10, 30, 30, "Save as"), 2: (100, 50, 200, 20, "File Edit")}
 
 
 def test_screenshots_ride_along_with_tool_results_and_only_the_newest_stays() -> None:
@@ -1016,7 +1022,7 @@ def test_computer_batch_runs_steps_in_order_and_stops_at_an_error() -> None:
              {"tool": "press_key", "keys": "enter"}]
     assert AiToolHost._batch(fake, steps) == "1. ok\n2. ok\n3. ok"
     assert len(asked) == 1 and "1. left-click at (1, 2)\n2. type: hi\n3. press enter" in asked[0][0]  # one approval
-    assert done[0] == ("mouse_click", {"x": 1, "y": 2, "name": None}, True)  # null name: an omitted argument
+    assert done[0] == ("mouse_click", {"x": 1, "y": 2}, True)  # null name: an omitted argument
     done.clear()
     out = AiToolHost._batch(fake, [{"tool": "press_key", "keys": "f5"}, {"tool": "press_key", "keys": "enter"}])
     assert out.endswith("stopped at step 1 of 2") and len(done) == 1
@@ -1559,4 +1565,63 @@ def test_auto_mode_reviews_every_computer_action_and_batches_skip_intermediate_g
     assert out == "1. ok\n2. ok\n3. ok"
     assert seen_batch_flags == [(True, False), (True, True), (False, True)]
     assert batch_fake._in_batch is False and batch_fake._batch_acted is False
+
+
+def test_edit_files_hint_and_dir_rollback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools.ai_tools import apply_edits, plan_edits
+
+    target = tmp_path / "app.py"
+    target.write_text("alpha = 1\nbeta_value = 2\ngamma = 3\n", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        plan_edits(tmp_path, {"edits": [{"path": "app.py", "old_text": "beta_val = 2", "new_text": "beta_value = 9"}]})
+    assert "closest" in str(exc.value) and "lines 2-2" in str(exc.value)
+
+    second = tmp_path / "fail.txt"
+    second.write_text("anchor\n", encoding="utf-8")
+    new_file = tmp_path / "nested" / "sub" / "created.txt"
+    edits = plan_edits(tmp_path, {"edits": [
+        {"path": "nested/sub/created.txt", "old_text": "", "new_text": "hello"},
+        {"path": "fail.txt", "old_text": "anchor", "new_text": "changed"},
+    ]})
+    orig_write_text = Path.write_text
+
+    def fail_on_second(self: Path, *args, **kwargs) -> int:
+        if self == second:
+            raise OSError("disk full")
+        return orig_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_on_second)
+    rollback_err = apply_edits(edits)
+    assert rollback_err.startswith("error:") and not new_file.exists() and not (tmp_path / "nested").exists()
+
+
+def test_powershell_path_note_and_host_keeps_failed_script(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.tools import ai_tools
+    from src.tools.ai_tools import powershell_error_note
+    from src.ui import ai_tool_host
+
+    ps = tmp_path / "ps_bad.ps1"
+    script = "$doc.Close(0)\n$p = Join-Path $d 'out.docx'\n$doc.SaveAs($p)\n"
+    ps.write_text(script, encoding="utf-8")
+    note = powershell_error_note("At ps_bad.ps1:1 char:1", script, "ps_bad.ps1", saved_path=ps)
+    assert "[ref]0" in note and "Join-Path" in note and str(ps) in note and 'run_powershell(path="' in note
+
+    monkeypatch.setattr(ai_tools, "scratch_dir", lambda: tmp_path)
+    monkeypatch.setattr(ai_tool_host, "scratch_dir", lambda: tmp_path)
+    monkeypatch.setattr(ai_tool_host, "powershell_file", lambda _s: (ps, f'powershell -NoProfile -File "{ps}"'))
+    monkeypatch.setattr(ai_tool_host, "run_command", lambda root, cmd, cancel=None, timeout=None: (
+        "exit code 1\nAt ps_bad.ps1:1 char:1"
+    ))
+    asked: list[str] = []
+    fake = SimpleNamespace(
+        mcp=SimpleNamespace(server_of=lambda _n: None),
+        _project=lambda: tmp_path,
+        _allowed=lambda _k, text, _w, _risk=None: asked.append(text) or True,
+        cancel=threading.Event(),
+    )
+    out = ai_tool_host.AiToolHost._run(fake, "run_powershell", {"path": str(ps)})
+    assert "$doc.Close(0)" in asked[0] and ps.exists() and f'kept at {ps}' in out
+    monkeypatch.setattr(ai_tool_host, "run_command", lambda root, cmd, cancel=None, timeout=None: "exit code 0\nok")
+    ok_out = ai_tool_host.AiToolHost._run(fake, "run_powershell", {"script": "Write-Output ok"})
+    assert ok_out == "exit code 0\nok" and not ps.exists()  # temp ps_*.ps1 cleaned on exit 0
 

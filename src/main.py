@@ -35,6 +35,7 @@ MACROS_KEY = "macros"
 TIPS_KEY = "tips"
 SIZE_KEY = "size"
 HOTKEYS_KEY = "hotkeys"
+REMOTE_KEY = "remote"
 
 UPDATE_FAILED_FLAG = "--update-failed"
 SIMULATION_TICK_INTERVAL_MS: int = 2_000
@@ -101,6 +102,7 @@ class PaperduckApp:
         size = saved.tools_data.get(SIZE_KEY)
         if isinstance(size, dict) and isinstance(size.get("scale"), int):
             self.window.set_pet_scale(size["scale"])  # unknown scales are ignored
+        self.window.remote.load_dict(saved.tools_data.get(REMOTE_KEY), auto_start=enable_tray)
 
         if saved.position is not None:
             self.window.move_clamped(saved.position[0], saved.position[1])
@@ -206,6 +208,7 @@ class PaperduckApp:
         tools_payload[TIPS_KEY] = {"seen": self.window.tips_seen}
         tools_payload[SIZE_KEY] = {"scale": self.window.pet_scale}
         tools_payload[HOTKEYS_KEY] = dict(self.window.hotkeys)
+        tools_payload[REMOTE_KEY] = self.window.remote.to_dict()
         return self._storage.save(
             stats=self.state_machine.stats,
             state=self.state_machine.state,

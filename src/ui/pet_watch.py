@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import time
 from collections.abc import Callable
 
@@ -20,6 +21,16 @@ from src.ui.ai_tool_host import AiToolHost, grab_screen
 from src.ui.sfx import prewarm as prewarm_ticks
 
 
+
+
+def _clip_seq() -> int | None:
+    """Windows clipboard change counter, or None outside the Windows desktop backend."""
+    if QGuiApplication.platformName() != "windows":
+        return None
+    try:
+        return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+    except (AttributeError, OSError):
+        return None
 
 
 class WatchMixin:
@@ -73,10 +84,16 @@ class WatchMixin:
         hints = self._hints_plugin()
         if hints is None or not hints.enabled:
             return
-        cb = QGuiApplication.clipboard()
+        seq = _clip_seq()
+        if seq is not None and seq != 0 and seq == getattr(self, "_last_hint_clip_seq", None):
+            clip = ""
+        else:
+            cb = QGuiApplication.clipboard()
+            # a password manager's copy is never inspected or offered to Watch
+            clip = cb.text() if cb is not None and not clipboard_is_private(cb.mimeData()) else ""
+            if seq is not None and seq != 0:
+                self._last_hint_clip_seq = seq
         pomo = self._state_machine.pomodoro_plugin
-        # a password manager's copy is never inspected or offered to Watch
-        clip = cb.text() if cb is not None and not clipboard_is_private(cb.mimeData()) else ""
         hint = hints.poll(app, clip,
                           pomo is not None and not pomo.running, title=foreground_title(),
                           watch_ok=hints.watch and self._watch_ready())
@@ -90,6 +107,16 @@ class WatchMixin:
             self._anim.play_oneshot("spin")
             self._schedule_next_anim_tick()
             self.update()
+
+    def _recall_last_hint(self) -> None:
+        hints = self._hints_plugin()
+        if hints is None or not hints.history:
+            self._show_toast("NO RECENT HINTS", QColor("#8A9AF2"))
+            return
+        self._hint, self._hint_until = hints.history[-1], time.monotonic() + 12.0
+        self._anim.play_oneshot("spin")
+        self._schedule_next_anim_tick()
+        self.update()
 
     def _clear_hint(self) -> None:
         self._hint = None

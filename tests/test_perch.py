@@ -105,3 +105,8 @@ class TestPerchCovered:
         rects = [front, WIN]
         assert perch_covered(rects, 1, 600)
         assert pick_perch(rects, 600, 300) == 0
+
+    def test_right_reserve_keeps_duck_off_caption_buttons_when_wide_enough(self) -> None:
+        assert perch_position((0, 200, 800, 900), 790, 88, 141, 16, right_reserve=140) == (644 - 88, 59)
+        # narrow window ignores right_reserve so the duck still fits
+        assert perch_position((0, 200, 160, 900), 150, 88, 141, 16, right_reserve=140) == (144 - 88, 59)

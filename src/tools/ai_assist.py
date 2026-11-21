@@ -32,11 +32,13 @@ import re
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 import html
+from html.parser import HTMLParser
 import ipaddress
 import socket
 import urllib.error
@@ -47,7 +49,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.engine.models import CompanionState, HudBar, HudData, ToolMenuItem
-from src.tools.ai_tools import (CHAIN_NOTE, MEMORY_HEADER, scratch_dir, LOCAL_DATA_TOOLS, RULES_HEADER, memory_path, memory_prompt, rules_path,
+from src.tools.ai_tools import (CHAIN_NOTE, SCREEN_TOOLS, MEMORY_HEADER, scratch_dir, LOCAL_DATA_TOOLS, RULES_HEADER, memory_path, memory_prompt, rules_path,
                                 rules_prompt, load_skill, skills_dir, skills_prompt, skills_recall)
 from src.tools.errands import ERRAND_MARK
 from src.tools.mcp_client import SEP as MCP_SEP, ensure_config
@@ -101,6 +103,10 @@ MAX_NATIVE_ROUNDS = 5  # pause_turn continuations of one Claude answer
 # Added to the last tool output before the answer-only round, so a long job ends with a report, not an error
 BUDGET_NOTE = (f"\n\n[Paperduck: that was the last of this message's {MAX_TOOL_ROUNDS} tool rounds. Answer now "
                "without tools: say what is done and what is left; the user can send another message to continue.]")
+# Sent once when an answer ends while its last layout_check still listed problems
+LAYOUT_NOTE = ("[Paperduck: your last layout_check still listed problems: {}. If you can still use tools, fix them "
+               "and run layout_check again. Otherwise, or for one that is intended (such as a full-bleed background), "
+               "tell the user plainly in your answer which problems remain.]")
 # Sent once when a reply came back empty because thinking used the whole token budget; that round has no thinking
 WRAP_NOTE = ("\n\n[Paperduck: your last reply hit the token limit while thinking and said nothing. Answer now "
              "without tools or more thinking: what is done, how you checked it, and what is left.]")
@@ -214,22 +220,31 @@ SYSTEM_PROMPT = (
     "not redo their reading); also use one for a broad search across many files or pages. "
     "Give each a precise, self-contained task (folder paths included) and pick its thinking level by how hard that "
     "part is. A single small lookup you do yourself. "
-    "For anything beyond one simple command on Windows, use run_powershell (the script goes to a file, so no "
-    "cmd.exe quoting touches it), never a long powershell -Command line through run_command. "
-    "Driving Office through COM: put the whole job in one script, save, check it with one preview_document call "
-    "(never by paging the window with screen_map), then at most two refinement passes, since every run-and-look "
-    "round is slow. Load the matching built-in skill first (word-docs, slides, excel-sheets): its helpers are "
-    "tested. Office traps in PowerShell: variable names ignore case ($d is $D); pass COM plain \"...\" strings, "
-    "never a Join-Path result; Word's Close(0) and Quit(0) throw, use [ref]0. Never click the Office window "
-    "while a COM script may run; a COM call that hangs means a dialog is open, so press esc and look at the screen. "
+    "For anything beyond one simple command on Windows, use run_powershell (prefer editing a kept script path over "
+    "rewriting long scripts; never a long powershell -Command line through run_command). "
+    "For Word, PowerPoint or Excel, load word-docs, slides or excel-sheets first and drive them in one PowerShell "
+    "COM script checked with preview_document; use screen tools only where COM cannot reach (never click an Office "
+    "window while COM may run). "
     "Creative requests (a poem, a design, a document to decorate) deserve original, ambitious work, not the "
     "safest first idea. After building anything visual, look at the whole result once (preview_document for a "
     "saved file), name its three weakest points, fix them in one pass, look once more, then stop. When a screenshot shows "
     "the work too small to judge alignment or text (a whole poster fitted to the window), zoom in first: the app's own "
-    "zoom, or in a browser page CSS zoom through a script (document.body.style.zoom). To style an open Word, Excel or PowerPoint document, drive it through its COM object "
-    "with run_powershell ([Runtime.InteropServices.Marshal]::GetActiveObject("
-    "'Word.Application')): fonts, sizes, alignment, spacing, borders, shading, drop caps and page borders are "
-    "exact and far cheaper than clicking through screen_map. Use the screen tools only for what COM cannot do. "
+    "zoom, or in a browser page CSS zoom through a script (document.body.style.zoom). "
+    "A one-page handout (cheat sheet, summary, revision or reference sheet), even one asked for in Canva: read the "
+    "source, write every key point as short sections and call make_sheet, check its preview (fix and call again if "
+    "it overflows or reads badly), then for Canva upload its PNG (Uploads, Upload files), add it on a blank page and "
+    "right-click it, Set image as background, instead of building the page by hand; never stop at the upload. "
+    "The rules below are for editing an existing design on screen. "
+    "Layout or template work on screen (a Canva design, slides, a form): first list every slot and placeholder "
+    "screen_map shows and plan what goes in each; fit content to each box's width and height (shorten the text "
+    "or lower the font size rather than let it overflow); move and resize with mouse_drag by #id and handle, "
+    "working positions out from the boxes, and batch the edits with paste_text (html true with <b> headings and "
+    "<ul> bullets keeps the formatting); keep an even margin on every side and spread blocks to fill the page "
+    "(a larger font beats empty space; when the template fights the content, delete its extras and rebuild on a "
+    "clean grid, but only in a design you are making or were asked to redo); after the edits run layout_check on "
+    "the page, fix every problem it measures plus anything that looks weak in its screenshot (empty slots, text "
+    "that overflows its box, plain unstyled headings), and run it again: the work is up to standard only when it "
+    "passes and looks finished, never by eye alone. Never hand unfinished layout back while tool rounds remain. "
     f"Each message allows at most {MAX_TOOL_ROUNDS} rounds of tool calls, so plan bigger jobs around that: stop "
     "in time, say what is done and what is left, and the user can send another message to continue. When a "
     "[Paperduck: ...] note says the tool rounds are used up, that is the app itself: answer without tools; "
@@ -281,6 +296,11 @@ class ToolHost(Protocol):
     def run(self, name: str, args: dict[str, Any]) -> str: ...
 
 
+def _all_specs(host: ToolHost) -> list[dict[str, Any]]:
+    """Every tool `host` can run, MCP schemas it loads on demand included (its `specs` may list only some)."""
+    return getattr(host, "all_specs", None) or host.specs
+
+
 @dataclass
 class AiReply:
     text: str
@@ -301,6 +321,7 @@ class AiReply:
     # Chat completions: this answer's own messages as last sent (tool calls, results, reasoning) plus the final one.
     # The chat replays them word for word next time, so the provider's prefix cache still covers this answer.
     wire: list[dict[str, Any]] = field(default_factory=list)
+    screen_thinking_used: str = ""
 
 
 @dataclass
@@ -406,7 +427,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """Connect directly to the validated public IP on fetch_page requests so DNS rebinding cannot slip past."""
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        pinned = getattr(req, "_pinned_ip", None)
+        if not pinned:
+            return super().https_open(req)
+
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self) -> None:
+                sock = socket.create_connection((pinned, self.port), self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self.sock = sock
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+        return self.do_open(_Conn, req, context=self._context)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect, _PinnedHTTPSHandler())
 _HTTP_ERRORS = {400: "bad request", 401: "bad key", 402: "no balance", 403: "forbidden",
                 404: "bad model or url", 422: "bad request", 429: "rate limited"}
 _NO_VISION: set[tuple[str, str]] = set()  # (base_url, model) that refused images this session
@@ -422,7 +462,7 @@ def wire_chars(wire: list[dict[str, Any]]) -> int:
                for m in wire)
 
 
-def chat_messages(history: list[dict[str, Any]], wire: bool = False) -> list[dict[str, Any]]:
+def chat_messages(history: list[dict[str, Any]], wire: bool = False, extra_system: str = "") -> list[dict[str, Any]]:
     """System prompt plus the newest turns that fit MAX_HISTORY_CHARS (the last turn is always kept).
 
     A turn's optional "images" (data URLs) become image parts; they are not counted against the budget.
@@ -456,7 +496,7 @@ def chat_messages(history: list[dict[str, Any]], wire: bool = False) -> list[dic
     system = (f"{SYSTEM_PROMPT} Today is {date.today()}. Put helper scripts, screenshots and drafts in your scratch "
               f"folder {scratch_dir()}, never in {skills_dir().parent} (the app's own data); save what the user "
               "asked for where they asked, else in the Project Folder.")
-    extra = [block for block in (rules_prompt(rules_path()), memory_prompt(memory_path()), skills_prompt(skills_dir()))
+    extra = [block for block in (rules_prompt(rules_path()), memory_prompt(memory_path()), skills_prompt(skills_dir()), extra_system.strip())
              if block]
     return [{"role": "system", "content": "\n\n".join([system, *extra])}, *reversed(kept)]
 
@@ -641,7 +681,8 @@ def _text_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def ask(base_url: str, key: str, model: str, messages: list[dict[str, Any]], *,
         thinking: str = "off", timeout: float | None = None, host: ToolHost | None = None,
         progress: Callable[[str], None] | None = None, web: bool = True,
-        steer: Callable[[], list[str]] | None = None, cancel: threading.Event | None = None) -> AiReply:
+        steer: Callable[[], list[str]] | None = None, cancel: threading.Event | None = None,
+        screen_thinking: str = "") -> AiReply:
     """The reply with its model and token details. Raises ValueError with a short, key-free reason.
 
     Claude goes through its native Messages API with its own server-side search and fetch. Every other model
@@ -650,24 +691,33 @@ def ask(base_url: str, key: str, model: str, messages: list[dict[str, Any]], *,
     `host`'s local PC tools when one is given. `steer` returns what the user typed while it worked; that text
     rides along with the next tool result. Once `cancel` is set (Stop) no further request or tool runs and
     ValueError("stopped") ends the answer. `web=False` drops web_search and fetch_page, so with no host no tools are sent (a Watch pre-fetch). `progress` (called on the worker thread) gets a short status
-    such as "Writing 840 chars" while an OpenAI-style answer streams in or a tool runs.
+    such as "Writing 840 chars" while an OpenAI-style answer streams in or a tool runs. `screen_thinking` (when
+    set) replaces `thinking` from the round after the answer first drives the screen (OpenAI-style APIs only).
     """
     thinking = fit_thinking(base_url, thinking, model)
+    screen_thinking = fit_thinking(base_url, screen_thinking, model) if screen_thinking else ""
     if progress is not None and cancel is not None:  # streams report every chunk, so Stop ends one mid-stream
         report = progress
 
         def progress(text: str) -> None:
             _check(cancel)
             report(text)
+
+        if (on_text := getattr(report, "on_text", None)) is not None:
+            progress.on_text = on_text  # type: ignore[attr-defined]
+    started = time.monotonic()
     if is_anthropic(base_url):
-        return _post_anthropic(base_url, key, model, messages, thinking, timeout, host, progress, web, steer, cancel)
+        return _log_usage(_post_anthropic(base_url, key, model, messages, thinking, timeout, host, progress, web,
+                                          steer, cancel), model, thinking, started, host is not None)
     while True:
         tools = (web or host is not None) and (base_url, model) not in _NO_TOOLS
         if (base_url, model) in _NO_VISION:
             messages = _text_only(messages)
         level = "default" if (base_url, model) in _NO_THINK else thinking
         try:
-            return _post(base_url, key, model, messages, level, timeout, tools, host, progress, steer, web, cancel)
+            return _log_usage(_post(base_url, key, model, messages, level, timeout, tools, host, progress, steer, web,
+                                    cancel, "" if level == "default" else screen_thinking),
+                              model, level, started, host is not None)
         except ValueError as exc:
             if str(exc) != "bad request":
                 raise
@@ -681,6 +731,17 @@ def ask(base_url: str, key: str, model: str, messages: list[dict[str, Any]], *,
                 _NO_TOOLS.add((base_url, model))
             else:
                 raise
+
+
+def _log_usage(reply: AiReply, model: str, thinking: str, started: float, agent: bool) -> AiReply:
+    """One log line per finished call, so a task's time and tokens can be read back (side calls: the reviewer,
+    compaction)."""
+    shown_thinking = f"{thinking}->{reply.screen_thinking_used}" if reply.screen_thinking_used else thinking
+    logger.info("%s %s (%s): %.1f s, %d tool calls, prompt %d (cached %d), output %d (reasoning %d)",
+                "answer" if agent else "side call", reply.model or model, shown_thinking, time.monotonic() - started,
+                len(reply.tools), reply.prompt_tokens, reply.cached_tokens, reply.completion_tokens,
+                reply.reasoning_tokens)
+    return reply
 
 
 class _Transient(ValueError):
@@ -871,6 +932,8 @@ def _read_stream(resp: Any, progress: Callable[[str], None]) -> dict[str, Any]:
         if calls and not spoke:
             progress("Preparing " + (next(iter(calls.values()))["function"]["name"] or "a tool"))
         elif spoke:
+            if (on_text := getattr(progress, "on_text", None)) is not None:
+                on_text("".join(text))
             progress(f"Writing, {written} characters")
         elif thought:
             progress(f"Thinking, {thinking} characters")
@@ -964,6 +1027,8 @@ def _read_anthropic_stream(resp: Any, progress: Callable[[str], None]) -> dict[s
                 block["text"] = block.get("text", "") + delta["text"]
                 written += len(delta["text"])
                 spoke += len(delta["text"])
+                if (on_text := getattr(progress, "on_text", None)) is not None:
+                    on_text("".join(b.get("text", "") for b in blocks.values() if b.get("type") == "text"))
                 progress(f"Writing, {spoke} characters")
             elif kind2 == "thinking_delta" and isinstance(delta.get("thinking"), str):
                 block["thinking"] = block.get("thinking", "") + delta["thinking"]
@@ -1080,7 +1145,7 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     # Fixed for the whole answer: thinking blocks are bound to the tool list, so an MCP server added mid-answer
     # joins with the next message
     tools = (CLAUDE_TOOLS if web else []) + [{"name": s["function"]["name"], "description": s["function"]["description"],
-                             "input_schema": s["function"]["parameters"]} for s in (host.specs if host else [])]
+                             "input_schema": s["function"]["parameters"]} for s in (_all_specs(host) if host else [])]
     system, turns = claude_messages(messages)
     last = turns[-1]  # prompt cache breakpoint: tools, system and the chat so far are reused by the next message
     blocks = [{"type": "text", "text": last["content"]}] if isinstance(last["content"], str) else list(last["content"])
@@ -1200,8 +1265,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
           timeout: float | None, tools: bool = False, host: ToolHost | None = None,
           progress: Callable[[str], None] | None = None,
           steer: Callable[[], list[str]] | None = None, web: bool = True,
-          cancel: threading.Event | None = None) -> AiReply:
-    thinks = thinking in THINKING_LEVELS and thinking != "off"
+          cancel: threading.Event | None = None, screen_thinking: str = "") -> AiReply:
     messages = list(messages)
     start = len(messages)  # this answer's own turns follow
     # set once a tool has returned the user's own data; a sub-agent (`local_data`) starts set: its task may hold some
@@ -1214,13 +1278,26 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     shot_at: list[int] = []  # indexes in `messages` of the screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
     fails: list[Any] = [0, 0, None, [], None, set()]
-    blind_told = wrapped = False
+    blind_told = wrapped = pushed = False
+    used_screen = ""
     for round_ in range(MAX_TOOL_ROUNDS + 2):  # the extra round is only the wrap-up after a cut-off (WRAP_NOTE)
         _check(cancel)
         shots: list[str] = []
+        screen_active = bool(
+            screen_thinking
+            and not (is_deepseek(base_url) and thinking == "off")
+            and any(  # screen work: where a cheap level misclicks and gives up
+                c.get("function", {}).get("name") in SCREEN_TOOLS for m in messages[start:]
+                for c in m.get("tool_calls") or []
+            )
+        )
+        level = screen_thinking if screen_active else thinking
+        if screen_active and level != thinking:
+            used_screen = level
+        thinks = level in THINKING_LEVELS and level != "off"
         body: dict[str, Any] = {"model": model, "messages": messages,
                                 "max_tokens": MAX_THINKING_TOKENS if thinks else MAX_REPLY_TOKENS,
-                                **thinking_params(base_url, thinking, model)}
+                                **thinking_params(base_url, level, model)}
         offer = (tools and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS
                  and not wrapped)
         if offer or (tools and used and is_deepseek(base_url)):
@@ -1334,16 +1411,17 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                 reasoning=reasoning.strip() if isinstance(reasoning, str) else "",
                 prompt_tokens=spent[0], completion_tokens=spent[1], reasoning_tokens=spent[2], total_tokens=spent[3],
                 cached_tokens=cached, cost=cost, cost_estimate=estimate, cut_off=choice.get("finish_reason") == "length", tools=used,
-                wire=[*messages[start:], {"role": "assistant", **{k: v for k, v in message.items()
-                                          if k in ("content", "reasoning_content") and v is not None}}],
+                wire=_wire_without_images([*messages[start:], {"role": "assistant", **{k: v for k, v in message.items()
+                                          if k in ("content", "reasoning_content") and v is not None}}]),
+                screen_thinking_used=used_screen,
             )
-            if any(isinstance(m.get("content"), list) for m in reply.wire) or wire_chars(reply.wire) > MAX_WIRE_CHARS:
-                reply.wire = []  # a screenshot is still in it (never kept), or too big to carry: the note form
+            if wire_chars(reply.wire) > MAX_WIRE_CHARS:
+                reply.wire = []  # too big to carry: fall back to the note form
         except (KeyError, IndexError, TypeError, AttributeError):
             raise ValueError("bad reply") from None
         if not reply.text and reply.cut_off and not wrapped:
             # thinking ate the budget: one more round, thinking off, no tools, so the job still ends with a report
-            wrapped, thinks = True, False
+            wrapped, screen_thinking = True, ""
             thinking = fit_thinking(base_url, "off", model) if thinking in THINKING_LEVELS else thinking
             last = messages[-1]
             if last.get("role") in ("tool", "user") and isinstance(last.get("content"), str):
@@ -1351,13 +1429,29 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
             else:
                 messages.append({"role": "user", "content": WRAP_NOTE.strip()})
             continue
+        if ((open_ := getattr(host, "layout_open", "")) and isinstance(open_, str) and not pushed
+                and round_ < MAX_TOOL_ROUNDS + 1):  # the loop's last round must stay free for this answer
+            pushed = True  # once: with tools left it fixes them, without it tells the user what is still wrong
+            messages += [{"role": "assistant", "content": reply.text or "(no text)"},
+                         {"role": "user", "content": LAYOUT_NOTE.format(open_[:800])}]
+            continue
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
-        if wrapped:
+        if wrapped or pushed:
             reply.wire = []  # the note changed an earlier turn; the replay would carry it
         drop_skills(reply)
         return reply
     raise ValueError("bad reply")
+
+
+def _wire_without_images(wire: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip inline screenshot parts from `wire` so vision tool turns still preserve text/tool prefix caching."""
+    return [
+        {"role": m["role"], "content": "(earlier screenshot removed)"}
+        if isinstance(m.get("content"), list)
+        else m
+        for m in wire
+    ]
 
 
 def _check(cancel: threading.Event | None) -> None:
@@ -1521,7 +1615,7 @@ def _trim_results(messages: list[dict[str, Any]], start: int) -> None:
              if messages[i].get("role") == "tool" and isinstance(messages[i].get("content"), str)]
     screen_ids = {c.get("id") for m in messages[start:] if m.get("role") == "assistant"
                   for c in m.get("tool_calls") or []
-                  if isinstance(c, dict) and (c.get("function") or {}).get("name") in ("screen_map", "read_screen")}
+                  if isinstance(c, dict) and (c.get("function") or {}).get("name") in ("screen_map", "read_screen", "layout_check")}
     screen_spots = [i for i in spots if _is_screen_result(messages[i]["content"], messages[i].get("tool_call_id"), screen_ids)]
     if len(screen_spots) > KEEP_SHOTS:
         for i in screen_spots[:-1]:
@@ -1543,7 +1637,7 @@ def _trim_claude_results(turns: list[dict[str, Any]], start: int) -> list[dict[s
     spots = [(t, b) for t in range(start, len(turns)) if turns[t]["role"] == "user" and isinstance(turns[t]["content"], list)
              for b, block in enumerate(turns[t]["content"]) if block.get("type") == "tool_result"]
     screen_ids = {b.get("id") for t in turns[start:] if t["role"] == "assistant" and isinstance(t["content"], list)
-                  for b in t["content"] if b.get("type") == "tool_use" and b.get("name") in ("screen_map", "read_screen")}
+                  for b in t["content"] if b.get("type") == "tool_use" and b.get("name") in ("screen_map", "read_screen", "layout_check")}
     screen_spots = [(t, b) for t, b in spots if _is_screen_result(
         text(turns[t]["content"][b]), turns[t]["content"][b].get("tool_use_id"), screen_ids)]
     out = list(turns)
@@ -1727,7 +1821,7 @@ def _run_tool_raw(name: str, arguments: Any, host: ToolHost | None = None, seen:
     if name == "spawn_agent":  # set here, never by the model: the agent's own guard starts on after a local read
         args = {**args, "_local": seen is not None}
     if host is not None and name not in ("web_search", "fetch_page") and any(
-            s["function"]["name"] == name for s in host.specs):
+            s["function"]["name"] == name for s in (*host.specs, *_all_specs(host))):  # an MCP tool not loaded yet runs too
         return host.run(name, args)
     param = {"web_search": "query", "fetch_page": "url"}.get(name)
     if param is None:
@@ -1750,7 +1844,7 @@ def _run_tool_raw(name: str, arguments: Any, host: ToolHost | None = None, seen:
 
 def _example_args(name: str, host: ToolHost | None) -> str:
     """`{"a": ..., "b": ...}` naming a tool's required parameters, for a bad-arguments error."""
-    specs = [*(host.specs if host is not None else []), SEARCH_TOOL, FETCH_TOOL]
+    specs = [*(_all_specs(host) if host is not None else []), SEARCH_TOOL, FETCH_TOOL]
     need = next((s["function"].get("parameters", {}).get("required", []) for s in specs
                  if s["function"]["name"] == name), [])
     return "{" + ", ".join(f'"{p}": ...' for p in need) + "}"
@@ -1786,28 +1880,102 @@ def _new_link(name: str, url: str, host: ToolHost | None, seen: str) -> str:
 _STRIP_TAGS = re.compile(r"<[^>]+>")
 _RESULT_RE = re.compile(r'class="result__a" href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>', re.S)
 
+_ALWAYS_DROP_TAGS = frozenset({"script", "style", "noscript", "svg", "head", "template"})
+_CHROME_TAGS = frozenset({"nav", "footer", "aside"})
+_CHROME_ROLES = frozenset({"navigation", "banner", "contentinfo"})
+_VOID_BLOCKS = frozenset({"br", "hr"})
+_BLOCK_TAGS = frozenset({"p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "table", "section", "article",
+                         "blockquote", "pre", "dd", "dt"})
+PAGE_CACHE_SIZE = 16
+PAGE_CACHE_TTL_S = 300.0
+_PAGE_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_PAGE_CACHE_LOCK = threading.Lock()
 
-_DROP_BLOCKS = re.compile(r"<(script|style|noscript|svg|head|template)\b.*?</\1>", re.S | re.I)
-_CHROME_BLOCKS = re.compile(r"<(nav|footer|aside)\b.*?</\1>", re.S | re.I)  # site menus, not the page's content
-_PAGE_LINK = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", re.S | re.I)
-_BLOCK_END = re.compile(r"<(?:br|hr)\b[^>]*>|</(?:p|div|li|h[1-6]|tr|table|section|article|blockquote|pre|dd|dt)\s*>",
-                        re.I)
+
+class _PageTextParser(HTMLParser):
+    """Stream HTML into block-separated lines, stripping scripts/chrome and keeping links as `label [url]`."""
+
+    def __init__(self, base: str, drop_chrome: bool) -> None:
+        super().__init__(convert_charrefs=True)
+        self._base = base
+        self._drop_chrome = drop_chrome
+        self._skip: list[str] = []
+        self._out: list[str] = []
+        self._link_href: str | None = None
+        self._link_parts: list[str] = []
+
+    def _emit(self, piece: str) -> None:
+        if self._link_href is not None:
+            self._link_parts.append(piece)
+        else:
+            self._out.append(piece)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr = {k.lower(): (v or "") for k, v in attrs}
+        if self._skip:
+            if tag == self._skip[-1]:
+                self._skip.append(tag)
+            return
+        is_chrome = self._drop_chrome and (
+            tag in _CHROME_TAGS
+            or (tag in ("div", "section", "header")
+                and (attr.get("role", "").lower() in _CHROME_ROLES or attr.get("aria-hidden", "").lower() == "true"))
+        )
+        if tag in _ALWAYS_DROP_TAGS or is_chrome:
+            self._skip.append(tag)
+            return
+        if tag in _VOID_BLOCKS:
+            self._emit("\n")
+        elif tag == "a" and self._link_href is None:
+            self._link_href = attr.get("href", "")
+            self._link_parts = []
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if not self._skip and tag.lower() in _VOID_BLOCKS:
+            self._emit("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._skip:
+            if tag == self._skip[-1]:
+                self._skip.pop()
+            elif tag in self._skip:
+                while self._skip and self._skip.pop() != tag:
+                    pass
+            return
+        if tag == "a" and self._link_href is not None:
+            raw_href = self._link_href.strip()
+            label = "".join(self._link_parts)
+            self._link_href, self._link_parts = None, []
+            href = urljoin(self._base, raw_href)
+            keep = href.startswith(("https://", "http://")) and href not in label and not raw_href.startswith("#")
+            self._emit(f"{label} [{href}]" if keep else label)
+        elif tag in _BLOCK_TAGS:
+            self._emit("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self._emit(data)
+
+    def result(self) -> str:
+        if self._link_href is not None:
+            self._emit("".join(self._link_parts))
+            self._link_href, self._link_parts = None, []
+        flat = "".join(self._out)
+        return "\n".join(line for line in (re.sub(r"\s+", " ", ln).strip() for ln in flat.split("\n")) if line)
 
 
 def page_text(markup: str, base: str = "") -> str:
     """Visible text of an HTML page, one line per block, links kept as `label [url]` (resolved against `base`).
-    Menus, footers and sidebars are dropped unless nothing else is left."""
-    def link(m: re.Match[str]) -> str:
-        href = urljoin(base, html.unescape(m.group(1)).strip())
-        keep = href.startswith(("https://", "http://")) and href not in m.group(2) and not m.group(1).startswith("#")
-        return f"{m.group(2)} [{href}]" if keep else m.group(2)
+    Menus, footers, nav/banner roles and hidden blocks are dropped unless nothing else is left."""
+    def parse(drop_chrome: bool) -> str:
+        parser = _PageTextParser(base, drop_chrome)
+        parser.feed(markup)
+        parser.close()
+        return parser.result()
 
-    def text(markup: str) -> str:
-        flat = html.unescape(_STRIP_TAGS.sub(" ", _BLOCK_END.sub("\n", _PAGE_LINK.sub(link, markup))))
-        return "\n".join(line for line in (re.sub(r"\s+", " ", ln).strip() for ln in flat.split("\n")) if line)
-
-    markup = _DROP_BLOCKS.sub(" ", markup)
-    return text(_CHROME_BLOCKS.sub(" ", markup)) or text(markup)
+    return parse(True) or parse(False)
 
 
 def page_part(text: str, offset: int = 0) -> str:
@@ -1820,10 +1988,8 @@ def page_part(text: str, offset: int = 0) -> str:
     return part
 
 
-def check_public_https(url: str) -> None:
-    """Raise ValueError unless url is https to a host whose every address is public. The model chooses the
-    URL, so loopback, LAN and link-local targets (router pages, cloud metadata) are refused.
-    shortcut: resolved here, connected again by urllib, so DNS rebinding could slip through; upgrade by pinning the IP."""
+def check_public_https(url: str) -> str:
+    """Validate `url` is public HTTPS and return one resolved global IP to pin the connection against DNS rebinding."""
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         raise ValueError("public https links only")
@@ -1833,27 +1999,50 @@ def check_public_https(url: str) -> None:
         raise ValueError("network") from None
     if not addrs or not all(ipaddress.ip_address(a).is_global for a in addrs):
         raise ValueError("private address refused")
+    return sorted(addrs)[0]
+
+
+def clear_page_cache() -> None:
+    with _PAGE_CACHE_LOCK:
+        _PAGE_CACHE.clear()
 
 
 def fetch_page(url: str, offset: int = 0) -> str:
-    """Text of a public web page from `offset` (see page_part). Redirects are followed by hand so every hop is
-    checked again. shortcut: each offset downloads the page again; cache by URL if paging long pages gets common."""
+    """Text of a public web page from `offset` (see page_part). Redirects are followed manually with IP pinning
+    at every hop; extracted page text is cached briefly in RAM so `offset` paging avoids re-downloading."""
+    use_cache = getattr(_OPENER.open, "__self__", None) is _OPENER
+    now = time.monotonic()
+    if use_cache:
+        with _PAGE_CACHE_LOCK:
+            hit = _PAGE_CACHE.get(url)
+            if hit is not None and now - hit[0] < PAGE_CACHE_TTL_S:
+                _PAGE_CACHE.move_to_end(url)
+                return page_part(hit[1], offset)
+    cur = url
     for _ in range(MAX_REDIRECTS + 1):
-        check_public_https(url)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Paperduck",
+        pinned_ip = check_public_https(cur)
+        req = urllib.request.Request(cur, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Paperduck",
                                                    "Accept": "text/html,text/plain"})
+        req._pinned_ip = pinned_ip  # type: ignore[attr-defined]
         try:
             with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
                 kind = resp.headers.get_content_type()
                 if kind not in ("text/html", "text/plain"):
                     raise ValueError(f"not a text page ({kind})")
                 raw = resp.read(MAX_SEARCH_BYTES).decode(resp.headers.get_content_charset() or "utf-8", "replace")
-            return page_part(page_text(raw, url) if kind == "text/html" else raw.strip(), offset)
+            extracted = page_text(raw, cur) if kind == "text/html" else raw.strip()
+            if use_cache:
+                with _PAGE_CACHE_LOCK:
+                    _PAGE_CACHE[url] = (time.monotonic(), extracted)
+                    _PAGE_CACHE.move_to_end(url)
+                    while len(_PAGE_CACHE) > PAGE_CACHE_SIZE:
+                        _PAGE_CACHE.popitem(last=False)
+            return page_part(extracted, offset)
         except urllib.error.HTTPError as exc:  # _NoRedirect raises these for 3xx
             location = exc.headers.get("Location") if exc.code in (301, 302, 303, 307, 308) else None
             if not location:
                 raise ValueError(_HTTP_ERRORS.get(exc.code, f"http {exc.code}")) from None
-            url = urljoin(url, location)
+            cur = urljoin(cur, location)
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, LookupError):
             raise ValueError("network") from None
     raise ValueError("too many redirects")
@@ -2029,6 +2218,7 @@ class AiAssistPlugin:
         self.model = PRESETS["deepseek"][2]
         self.thinking = "off"
         self.auto = False  # auto mode: all chat confirmations in ai_chat answer themselves without asking
+        self.screen_thinking = ""  # thinking once an answer drives the screen; "" keeps `thinking`
         self.asks = 0
         self.tokens = 0
         self._notice: tuple[str, str] | None = None
@@ -2159,7 +2349,7 @@ class AiAssistPlugin:
 
     def to_dict(self) -> dict[str, Any]:
         return {"provider": self.provider, "base_url": self.base_url, "model": self.model,
-                "thinking": self.thinking, "auto": self.auto}
+                "thinking": self.thinking, "screen_thinking": self.screen_thinking, "auto": self.auto}
 
     def load_dict(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
@@ -2181,3 +2371,4 @@ class AiAssistPlugin:
         elif data.get("low_effort") is True:  # before thinking levels: a checkbox for reasoning_effort low
             self.thinking = "low"
         self.auto = data.get("auto") is True
+        self.screen_thinking = data.get("screen_thinking") if data.get("screen_thinking") in THINKING_LEVELS else ""

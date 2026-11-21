@@ -1777,3 +1777,85 @@ def test_auto_mode_allows_computer_control_for_the_chat_after_one_review(monkeyp
         assert not chat._allowed and got == [True] * 4  # commands are still reviewed every time
     finally:
         chat.close()
+
+
+def test_fetch_page_uses_ttl_cache_and_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    import email.message
+    import io
+
+    ai_assist.clear_page_cache()
+    calls: list[str] = []
+
+    class FakeResp(io.BytesIO):
+        def __init__(self, body: bytes) -> None:
+            super().__init__(body)
+            self.headers = email.message.Message()
+            self.headers["Content-Type"] = "text/html; charset=utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class FakeOpener:
+        def open(self, req, timeout=0):
+            calls.append(req.full_url)
+            return FakeResp(b"<html><body><p>Cached body paragraph</p></body></html>")
+
+    monkeypatch.setattr(ai_assist, "check_public_https", lambda url: "93.184.216.34")
+    monkeypatch.setattr(ai_assist, "_OPENER", FakeOpener())
+    try:
+        t1 = ai_assist.fetch_page("https://example.com/cached")
+        t2 = ai_assist.fetch_page("https://example.com/cached", offset=7)
+        assert "Cached body" in t1 and t2.startswith("body paragraph")
+        assert calls == ["https://example.com/cached"]  # second call hit cache without re-fetching
+        ai_assist.clear_page_cache()
+        ai_assist.fetch_page("https://example.com/cached")
+        assert len(calls) == 2
+    finally:
+        ai_assist.clear_page_cache()
+
+
+def test_page_text_strips_nav_footer_and_role_chrome() -> None:
+    html = """<html><head><title>Doc</title></head><body>
+        <div role="navigation"><a href="/home">Home</a> | <a href="/docs">Docs</a></div>
+        <div aria-hidden="true">Hidden text</div>
+        <main><h1>Guide Title</h1><p>Useful <a href="/step1">step one</a>.</p></main>
+        <footer>Copyright notice</footer>
+    </body></html>"""
+    out = ai_assist.page_text(html, "https://example.com/guide")
+    assert "Guide Title" in out and "Useful step one [https://example.com/step1]." in out
+    assert "Home" not in out and "Copyright" not in out and "Hidden text" not in out
+
+
+def test_wire_kept_without_images_and_ask_forwards_on_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    wire = [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "function": {"name": "screen_map", "arguments": "{}"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "Attached:"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]},
+        {"role": "assistant", "content": "Saw it."},
+    ]
+    cleaned = ai_assist._wire_without_images(wire)
+    assert cleaned[0]["tool_calls"][0]["id"] == "1" and cleaned[2]["content"] == "Saw it."
+    assert cleaned[1]["content"] == "(earlier screenshot removed)"
+
+    streamed: list[str] = []
+
+    class Note:
+        def __call__(self, text: str) -> None:
+            pass
+
+        def on_text(self, full: str) -> None:
+            streamed.append(full)
+
+    def fake_request(base, key, path, body, timeout, progress=None, patient=False):
+        if (cb := getattr(progress, "on_text", None)) is not None:
+            cb("Hello ")
+            cb("Hello world")
+        return {"model": "m", "choices": [{"message": {"role": "assistant", "content": "Hello world"}}]}
+
+    monkeypatch.setattr(ai_assist, "_request", fake_request)
+    cancel = threading.Event()
+    reply = ai_assist.ask("https://api.example/v1", "k", "m", [{"role": "user", "content": "hi"}],
+                          progress=Note(), cancel=cancel)
+    assert reply.text == "Hello world" and streamed == ["Hello ", "Hello world"]

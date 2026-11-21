@@ -87,9 +87,9 @@ def fullscreen_in_front(own: set[int], pet_hwnd: int) -> bool:
 
 # What the duck acts out while the chat model runs a tool (body language); anything else reads as thinking
 READING_TOOLS = frozenset({"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen",
-                           "screen_map", "preview_document", "view_image", "find_skill", "load_skill", "read_background", "pet_status"})
-WORKING_TOOLS = frozenset({"run_command", "run_powershell", "start_background", "edit_file", "edit_files", "mouse_click", "type_text",
-                           "press_key", "scroll", "computer_batch", "save_file"})
+                           "screen_map", "layout_check", "preview_document", "view_image", "find_skill", "load_skill", "read_background", "pet_status"})
+WORKING_TOOLS = frozenset({"run_command", "run_powershell", "start_background", "edit_file", "edit_files", "mouse_click", "mouse_drag", "type_text",
+                           "paste_text", "press_key", "scroll", "computer_batch", "save_file", "make_sheet"})
 LOOKING_TOOLS = frozenset({"web_search", "fetch_page", "open_link", "find_mcp_servers"})
 
 

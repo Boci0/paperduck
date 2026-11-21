@@ -158,6 +158,7 @@ class PetContextMenu(QMenu):
         hotkeys: Sequence[tuple[str, str, str]] = (),
         pet_scales: dict[int, str] | None = None,
         theme: str = "system",
+        phone_bridge_on: bool | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -286,6 +287,25 @@ class PetContextMenu(QMenu):
             connect(p_act, item.callback_id)
             sub.addAction(p_act)
             self.plugin_actions[item.callback_id] = p_act
+
+        if phone_bridge_on is not None and on_tool_action is not None:
+            phone_menu = style_menu(QMenu("Phone Control", self))
+            toggle_act = QAction("Enable Phone Bridge (Tailscale)", phone_menu)
+            toggle_act.setCheckable(True)
+            toggle_act.setChecked(phone_bridge_on)
+            connect(toggle_act, "remote:toggle")
+            phone_menu.addAction(toggle_act)
+            self.plugin_actions["remote:toggle"] = toggle_act
+            pair_act = QAction("Show Phone Link & Token...", phone_menu)
+            connect(pair_act, "remote:pair")
+            phone_menu.addAction(pair_act)
+            self.plugin_actions["remote:pair"] = pair_act
+            rot_act = QAction("Rotate Phone Token", phone_menu)
+            connect(rot_act, "remote:rotate")
+            phone_menu.addAction(rot_act)
+            self.plugin_actions["remote:rotate"] = rot_act
+            self.plugin_submenus["Phone Control"] = phone_menu
+            self.addMenu(phone_menu)
 
         self.addSeparator()
 

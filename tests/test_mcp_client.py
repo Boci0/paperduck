@@ -150,7 +150,8 @@ def test_tool_host_asks_before_a_servers_first_call(hub: McpHub) -> None:
     results: list[str] = []
 
     def worker() -> None:
-        assert "fake__echo" in [s["function"]["name"] for s in host.specs] and "read_file" in str(host.specs)
+        assert "fake__echo" in [s["function"]["name"] for s in host.all_specs] and "read_file" in str(host.specs)
+        assert host.specs[-1]["function"]["name"] == "load_mcp_tools" and "fake (echo" in str(host.specs[-1])
         results.extend(host.run("fake__echo", {"text": n}) for n in "abc")
 
     thread = threading.Thread(target=worker)

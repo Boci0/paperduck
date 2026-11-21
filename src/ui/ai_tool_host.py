@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import shutil
 import tempfile
 import threading
 import time
@@ -22,14 +23,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QCoreApplication, QObject, QRect, QStandardPaths, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QGuiApplication, QImage
+from PyQt6.QtCore import QCoreApplication, QMimeData, QObject, QRect, QStandardPaths, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QImage, QTextDocument
 from PyQt6.QtWidgets import QFileDialog
 
 from src.tools import computer
 from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool_note
+from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
-from src.tools.ai_tools import (calculate, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
+from src.tools.ai_tools import (calculate, check_layout, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
                                 computer_action, destructive_reason, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
                                 PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
@@ -57,9 +59,28 @@ OUTSIDE_GUARDED = frozenset({"run_command", "start_background", "computer", "edi
 # chat holds outside content; every other approval goes to the reviewer (`review_action`) first.
 AUTO_INSTANT = frozenset({"edit_file", "memory"})
 
+LAPTOP_CHAT_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "laptop_chat",
+        "description": "Read the live desktop Laptop chat's status and recent messages (action='read'), send or steer a message to it (action='send'), or stop its active reply (action='stop').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "send", "stop"], "description": "Operation to perform on the desktop Laptop chat."},
+                "message": {"type": "string", "description": "Message text to send or steer when action='send'."},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
 
 def auto_mode(win: Any) -> bool:
     return bool(getattr(getattr(getattr(win, "_ai_chat", None), "_plugin", None), "auto", False))
+
+
+_GUI_CONTROL_LOCK = threading.Lock()
 
 
 def _given(args: dict[str, Any]) -> dict[str, Any]:
@@ -152,6 +173,98 @@ SPOT_R = 16  # half the side of the square compared around a click
 ROW_LEFT, ROW_RIGHT, ROW_R = 700, 300, 10  # the strip across the click's row: a list row's label sits to the left
 
 
+def _rgb32_bytes(image: QImage, rect: QRect) -> tuple[bytes, int, int, int]:
+    """(RGB32 bytes, stride, width, height) of `rect` inside `image` (B, G, R, A per pixel)."""
+    part = image.copy(rect).convertToFormat(QImage.Format.Format_RGB32)
+    bits = part.constBits()
+    bits.setsize(part.sizeInBytes())
+    return bytes(bits), part.bytesPerLine(), part.width(), part.height()
+
+
+def _luma(r: int, g: int, b: int) -> float:
+    def ch(v: int) -> float:
+        x = v / 255.0
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def page_color(image: QImage, rect: QRect) -> int:
+    """The commonest colour (0xRRGGBB) on a coarse grid inside `rect`: a design page's background."""
+    box = rect.intersected(image.rect())
+    if box.isEmpty():
+        return 0xFFFFFF
+    data, stride, w, h = _rgb32_bytes(image, box)
+    counts: dict[int, int] = {}
+    best_bucket, best_count, sample = 0xF0F0F0, 0, 0xFFFFFF
+    first_in: dict[int, int] = {}
+    for y in range(0, h, 6):
+        row = y * stride
+        for x in range(0, w, 6):
+            j = row + 4 * x
+            r, g, b = data[j + 2], data[j + 1], data[j]
+            bucket = ((r & 0xF0) << 16) | ((g & 0xF0) << 8) | (b & 0xF0)
+            if bucket not in first_in:
+                first_in[bucket] = (r << 16) | (g << 8) | b
+            cnt = counts.get(bucket, 0) + 1
+            counts[bucket] = cnt
+            if cnt > best_count:
+                best_bucket, best_count, sample = bucket, cnt, first_in[bucket]
+    return sample
+
+
+def snap_page(image: QImage, given: QRect) -> QRect | None:
+    """The page itself around a rough box from the model: the rows and columns, holding the box's middle, where the
+    page colour fills at least 40% of the box (gaps under 15% of it, such as a coloured band, are bridged). The box as
+    given when that finds less than half of it (a full-bleed picture); None for a box under 16 px."""
+    if given.width() < 16 or given.height() < 16:
+        return None
+    bg = page_color(image, given)
+    br, bg_g, bb = (bg >> 16) & 255, (bg >> 8) & 255, bg & 255
+    pad_x, pad_y = max(24, given.width() // 10), max(24, given.height() // 10)
+    win = given.adjusted(-pad_x, -pad_y, pad_x, pad_y).intersected(image.rect())
+    if win.isEmpty():
+        return None
+    data, stride, _w, _h = _rgb32_bytes(image, win)
+    gx0, gx1 = max(0, given.left() - win.left()), min(win.width() - 1, given.right() - win.left())
+    gy0, gy1 = max(0, given.top() - win.top()), min(win.height() - 1, given.bottom() - win.top())
+    xs = range(gx0, gx1 + 1, 4)
+    ys = range(gy0, gy1 + 1, 4)
+    need_x, need_y = 0.4 * len(xs), 0.4 * len(ys)
+
+    def near(j: int) -> bool:
+        return abs(data[j + 2] - br) <= 12 and abs(data[j + 1] - bg_g) <= 12 and abs(data[j] - bb) <= 12
+
+    def row_ok(y: int) -> bool:
+        base = (y - win.top()) * stride
+        return sum(near(base + 4 * x) for x in xs) >= need_x
+
+    def col_ok(x: int) -> bool:
+        col = 4 * (x - win.left())
+        return sum(near(y * stride + col) for y in ys) >= need_y
+
+    def span(ok: Callable[[int], bool], lo: int, hi: int, size: int) -> tuple[int, int]:
+        good = [v for v in range(lo, hi + 1, 2) if ok(v)]
+        mid = (lo + hi) // 2
+        if not good:
+            return lo, hi
+        start = min(good, key=lambda v: abs(v - mid))
+        a = b = start
+        for v in sorted(g for g in good if g < start)[::-1]:  # walk out from the middle, bridging short gaps
+            if a - v > 0.15 * size:
+                break
+            a = v
+        for v in sorted(g for g in good if g > start):
+            if v - b > 0.15 * size:
+                break
+            b = v
+        return a, b
+
+    top, bottom = span(row_ok, win.top(), win.bottom(), given.height())
+    left, right = span(col_ok, win.left(), win.right(), given.width())
+    found = QRect(left, top, right - left + 1, bottom - top + 1)
+    return found if found.width() * found.height() >= 0.5 * given.width() * given.height() else given
+
+
 def _diff(old: QImage, new: QImage, rect: QRect) -> tuple[int, int]:
     """(pixels that differ by more than 48 in a channel, columns holding any of them) inside `rect`."""
     a, b = (img.copy(rect).convertToFormat(QImage.Format.Format_RGB32) for img in (old, new))
@@ -220,6 +333,18 @@ def follow(old: QImage, new: QImage, x: int, y: int) -> tuple[int, int] | None:
     return (x, y + hits[0]) if hits else None
 
 
+def _host_chat(host: Any) -> Any:
+    """Resolve the owning chat from either an AiToolHost or a test SimpleNamespace mock."""
+    chat = getattr(host, "chat", None)
+    return chat if chat is not None else getattr(getattr(host, "_win", None), "_ai_chat", None)
+
+
+def _host_auto_mode(host: Any) -> bool:
+    """Read auto-mode flag from the resolved chat's plugin cleanly (False when unconfigured)."""
+    chat = _host_chat(host)
+    return bool(getattr(getattr(chat, "_plugin", None), "auto", False))
+
+
 class AiToolHost(QObject):
     """The ToolHost the chat hands to ask(); `window` is the PetWindow."""
 
@@ -230,6 +355,7 @@ class AiToolHost(QObject):
     def __init__(self, window: Any, mcp: McpHub | None = None) -> None:
         super().__init__(window)  # lives on the Qt thread, so the queued signal lands there
         self._win = window
+        self.chat: Any = None
         self.saved: list[Path] = []
         self._shot = ""
         self._ref: QImage | None = None  # the screen as the model last saw it: screen_map, then after each action
@@ -237,13 +363,17 @@ class AiToolHost(QObject):
         self._refused: tuple[int, int, int] | None = None  # (x, y, map) of the last click refused as stale
         self._in_batch = False
         self._batch_acted = False
+        self._items: dict[int, tuple[int, int, int, int, str]] = {}  # the last screen_map's #id: (x, y, w, h, label)
+        self._ocr_ids: set[int] = set()  # which of those ids are OCR text lines
+        self.mcp_loaded: set[str] = set()  # MCP servers whose tools this answer offers (the chat clears it per answer)
+        self.layout_open = ""  # the last layout_check's problems, "" once one passes (the chat clears it per answer)
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
         self.ran: list[tuple[str, str]] = []  # (tool note, output) this answer ran; a fresh list per answer, kept on Stop
         self.approve_s = APPROVE_TIMEOUT_S  # the chat raises it for an errand's answer
         self.outside = False  # ask() sets it while the chat holds web, MCP or agent content (see _allowed)
-        self.agents = Agents(self._run_agent, lambda text, source: self._win._ai_chat.add_branch_note(text, source),
+        self.agents = Agents(self._run_agent, lambda text, source: _host_chat(self).add_branch_note(text, source),
                              self.agent_event.emit)
         self._call.connect(self._on_call)
         self._idle_timer = QTimer(self)
@@ -254,14 +384,44 @@ class AiToolHost(QObject):
             app.aboutToQuit.connect(self.mcp.close)
             app.aboutToQuit.connect(self.procs.stop_all)
 
+    def _chat(self) -> Any:
+        return _host_chat(self)
+
+    def _auto_mode(self) -> bool:
+        return _host_auto_mode(self)
+
     def _close_idle_mcp(self) -> None:
-        if getattr(self._win._ai_chat, "_job", None) is None:  # never mid-answer
+        if getattr(_host_chat(self), "_job", None) is None:  # never mid-answer
             threading.Thread(target=self.mcp.close_idle, daemon=True).start()  # taskkill blocks briefly
 
     @property
     def specs(self) -> list[dict[str, Any]]:
-        """Built-in tools plus the MCP servers' (started on first use, on the worker thread)."""
-        return TOOL_SPECS + AGENT_SPECS + self.mcp.specs()
+        """Built-in tools plus the MCP tools of servers loaded in this answer, and `load_mcp_tools` naming the rest:
+        every round resends the tool list, and one browser server's schemas alone are ~20k characters."""
+        mcp = self.mcp.specs()  # started on first use, on the worker thread
+        loaded = getattr(self, "mcp_loaded", set())
+        waiting: dict[str, list[str]] = {}
+        for s in mcp:
+            server, _sep, tool = s["function"]["name"].partition(SEP)
+            if server not in loaded:
+                waiting.setdefault(server, []).append(tool)
+        shown = [s for s in mcp if s["function"]["name"].partition(SEP)[0] in loaded]
+        base = TOOL_SPECS + AGENT_SPECS + ([LAPTOP_CHAT_SPEC] if getattr(_host_chat(self), "_remote_only", False) else [])
+        if not waiting:
+            return base + shown
+        listed = "; ".join(f"{server} ({', '.join(tools)})" for server, tools in waiting.items())
+        loader = {"type": "function", "function": {
+            "name": "load_mcp_tools", "description": "Add an MCP server's tools to this answer, then call them as "
+            f"server{SEP}tool. Servers and their tools: {listed}.",
+            "parameters": {"type": "object", "properties": {"server": {"type": "string", "enum": list(waiting)}},
+                           "required": ["server"]}}}
+        return base + shown + [loader]
+
+    @property
+    def all_specs(self) -> list[dict[str, Any]]:
+        """Every tool with every MCP schema: Claude's tool list is fixed for a whole answer."""
+        base = TOOL_SPECS + AGENT_SPECS + ([LAPTOP_CHAT_SPEC] if getattr(_host_chat(self), "_remote_only", False) else [])
+        return base + self.mcp.specs()
 
     def blocked(self, name: str) -> str | None:
         """ask() refuses a research tool while this chat's sub-agents still run (see Agents.blocked)."""
@@ -280,14 +440,21 @@ class AiToolHost(QObject):
             self.activity.emit("")
 
     def _run(self, name: str, args: dict[str, Any]) -> str:
+        if name == "load_mcp_tools":
+            want = args.get("server")
+            tools = [s["function"]["name"] for s in self.mcp.specs() if self.mcp.server_of(s["function"]["name"]) == want]
+            if not tools:
+                return f"error: no MCP server named {want!r}"
+            self.mcp_loaded.add(want)
+            return f"loaded {len(tools)} tools: {', '.join(tools)}. Call them from the next step."
         server = self.mcp.server_of(name)
         if server is not None:
-            chat = self._win._ai_chat
+            chat = _host_chat(self)
             shown = json.dumps(args, ensure_ascii=False)
             # Values only: an argument named "format" or "truncate" is not a destructive command
             risk = "destructive tool" if self.mcp.is_destructive(name) else destructive_reason("\n".join(_strings(args)))
             review = (self._review(f'MCP tool "{name}" on server "{server}" with arguments:\n{shown}')
-                      if auto_mode(self._win) and f"mcp:{server}" not in chat._allowed else None)
+                      if _host_auto_mode(self) and f"mcp:{server}" not in chat._allowed else None)
             if self.cancel.is_set():
                 return "error: stopped"
             extra = {"review": review} if review else {}
@@ -348,7 +515,7 @@ class AiToolHost(QObject):
                 task += notes
             return self.agents.spawn(task, args.get("effort"), self._project(), self.cancel,
                                      args.get("_local") is True, self._shared_images(share), self.see_image,
-                                     self._review if auto_mode(self._win) else None)
+                                     self._review if _host_auto_mode(self) else None)
         if name == "wait_agents":
             return self.agents.wait(args.get("timeout_s"), self.cancel)
         if name == "calculate":  # pure arithmetic, nothing to allow
@@ -358,14 +525,35 @@ class AiToolHost(QObject):
                 tasks = task_list(args)
             except ValueError as exc:
                 return f"error: {exc}"
-            self._on_gui(lambda done: done(self._win._ai_chat.set_tasks(tasks) or "ok"))
+            self._on_gui(lambda done: done(_host_chat(self).set_tasks(tasks) or "ok"))
             return f"task list shown ({sum(1 for _t, s in tasks if s == 'done')} of {len(tasks)} done)"
         if name in ("run_command", "run_powershell"):
             ps = name == "run_powershell"
             command = args.get("script" if ps else "command")
+            ps_path = args.get("path") if ps else None
+            cwd = self._project() or Path.home()
+            user_script: Path | None = None
+            if ps and (not isinstance(command, str) or not command.strip()):
+                if not isinstance(ps_path, str) or not ps_path.strip():
+                    return "error: give a script or path"
+                try:
+                    resolved = resolve(self._project(), ps_path)
+                except (OSError, ValueError):
+                    return "error: bad script path"
+                allowed_roots = [scratch_dir().resolve()] + ([self._project().resolve()] if self._project() else [])
+                if resolved.suffix.lower() != ".ps1" or not any(resolved.is_relative_to(r) for r in allowed_roots):
+                    return "error: path must be a .ps1 file inside the scratch or Project Folder"
+                if is_secret(resolved) or not resolved.is_file():
+                    return "error: script file not found"
+                if resolved.stat().st_size > MAX_SAVE_CHARS:
+                    return f"error: script is longer than {MAX_SAVE_CHARS} characters"
+                try:
+                    command = resolved.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeDecodeError):
+                    return "error: could not read script as UTF-8"
+                user_script = resolved
             if not isinstance(command, str) or not command.strip():
                 return "error: give a script" if ps else "error: give a command"
-            cwd = self._project() or Path.home()
             where = "the Project Folder" if self._project() else f"your home folder ({cwd})"
             risk = destructive_reason(command)
             seconds = command_timeout(args.get("timeout_s"))
@@ -375,20 +563,23 @@ class AiToolHost(QObject):
                                  "commands", risk):
                 return "error: the user declined this command"
             script, source = None, command
-            if ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
+            if user_script is not None:
+                command = f'powershell -NoProfile -ExecutionPolicy Bypass -File "{user_script}"'
+            elif ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
                 try:
                     script, command = powershell_file(command)
                 except (ValueError, OSError) as exc:
                     return f"error: {exc}"
             pdfs = {pdf: file_stamp(pdf) for pdf in print_to_pdf_paths(command, cwd)}
             media = media_stamps(command, cwd)
-            try:
-                out = run_command(cwd, command, self.cancel, seconds)
-            finally:
-                if script is not None:
-                    script.unlink(missing_ok=True)
-            if script is not None:
-                out += powershell_error_note(out, source, script.name)
+            out = run_command(cwd, command, self.cancel, seconds)
+            failed = out.startswith(("error", "stopped after")) or (
+                out.startswith("exit code") and not out.startswith("exit code 0"))
+            if script is not None and not failed:
+                script.unlink(missing_ok=True)
+            active = user_script or script
+            if active is not None and failed:
+                out += powershell_error_note(out, source, active.name, saved_path=active)
             for pdf, before in pdfs.items():  # headless Edge stamps HeadlessChrome, Skia and dates
                 # msedge.exe hands off to a child and returns before the PDF is written: wait for the new file
                 if wait_for_new_file(pdf, before, PDF_WAIT_S, self.cancel):
@@ -416,7 +607,7 @@ class AiToolHost(QObject):
                                  destructive_reason(command)):
                 return "error: the user declined this command"
             out = self.procs.start(cwd, command)
-            self._on_gui(lambda done: done(self._win._ai_chat.watch_procs() or "ok"))
+            self._on_gui(lambda done: done(_host_chat(self).watch_procs() or "ok"))
             return out
         if name == "read_background":
             return self.procs.read(args.get("id"))
@@ -472,6 +663,8 @@ class AiToolHost(QObject):
             if again != note:
                 return "error: memory changed while the user was deciding; try again"
             return write_memory(memory_path(), text)
+        if name == "make_sheet":
+            return self._make_sheet(args)
         if name == "read_screen":
             image = self._on_gui(self._grab_screen)
             return self._ocr(image) if isinstance(image, QImage) and not image.isNull() else "error: no screen grab"
@@ -479,11 +672,19 @@ class AiToolHost(QObject):
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
                 return "error: no screen grab"
-            return self._map(*got)
-        if name in COMPUTER_TOOLS:
-            return self._computer(name, args)
-        if name == "computer_batch":
-            return self._batch(args.get("steps"))
+            return self._map(*got, region=args.get("region"))
+        if name == "layout_check":
+            got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
+            if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
+                return "error: no screen grab"
+            return self._layout_check(*got, args.get("page"))
+        if name in COMPUTER_TOOLS or name == "computer_batch":
+            if not _GUI_CONTROL_LOCK.acquire(blocking=False):
+                return "error: another chat is currently controlling the screen; try again once it finishes"
+            try:
+                return self._computer(name, args) if name in COMPUTER_TOOLS else self._batch(args.get("steps"))
+            finally:
+                _GUI_CONTROL_LOCK.release()
         if name == "preview_document":  # reads a private copy in a hidden Office instance, so it needs no approval
             try:
                 path = resolve(self._project(), args.get("path"))
@@ -511,8 +712,81 @@ class AiToolHost(QObject):
                 return f"error: {exc}"
             out = self._on_gui(lambda done: done(self._save_file(file_name, content)), SAVE_TIMEOUT_S)
             return out if isinstance(out, str) else "error: the user did not answer the Save dialog in time"
+        if name == "laptop_chat":
+            return self._laptop_chat_tool(args)
         out = self._on_gui(lambda done: done(self._pet_tool(name, args)))
         return out if isinstance(out, str) else "error: the pet did not answer in time"
+
+    def _laptop_chat_tool(self, args: dict[str, Any]) -> str:
+        """Allow the phone chat to inspect, message/steer, or stop the live desktop Laptop chat."""
+        if not getattr(_host_chat(self), "_remote_only", False):
+            return "error: laptop_chat is only available from the phone chat"
+        action = str(args.get("action") or "read").strip().lower()
+        if action == "read":
+            def read(done: Callable[[Any], None]) -> None:
+                chat = getattr(self._win, "_ai_chat", None)
+                if chat is None:
+                    done("Laptop chat: not opened yet (idle, 0 messages).")
+                    return
+                plugin = getattr(chat, "_plugin", None)
+                hist = list(getattr(chat, "_history", []) or [])
+                busy = getattr(chat, "_job", None) is not None and not getattr(chat, "_testing", False)
+                progress = getattr(chat, "_progress", "") or ""
+                approvals = len(getattr(chat, "_remote_approvals", ()) or ())
+                status = f"busy ({progress})" if (busy and progress) else ("busy" if busy else "idle")
+                model = getattr(plugin, "model", "") or "unset"
+                thinking = getattr(plugin, "thinking", "off")
+                auto = bool(getattr(plugin, "auto", False))
+                lines = [
+                    f"Laptop chat: {status}, model={model}, thinking={thinking}, auto={auto}, "
+                    f"pending_approvals={approvals}, messages={len(hist)}."
+                ]
+                for turn in hist[-10:]:
+                    role = turn.get("role", "assistant")
+                    raw_txt = _clean_secrets(str(turn.get("content") or "")).strip()
+                    snippet = raw_txt[:350] + ("..." if len(raw_txt) > 350 else "")
+                    lines.append(f"[{role}] {snippet}" if snippet else f"[{role}] (empty)")
+                done("\n".join(lines)[:4000])
+
+            out = self._on_gui(read)
+            return out if isinstance(out, str) else "error: could not read laptop chat"
+
+        if action == "send":
+            msg = str(args.get("message") or "").strip()
+            if not msg:
+                return "error: give a non-empty message"
+            if not self._allowed("laptop_chat", f"Send this message to the desktop Laptop chat:\n\n{msg[:1500]}",
+                                 "laptop chat"):
+                return "error: the user declined sending to the laptop chat"
+
+            def deliver(done: Callable[[Any], None]) -> None:
+                remote = getattr(self._win, "remote", None)
+                chat = remote._ensure_laptop_chat() if remote is not None else getattr(self._win, "_ai_chat", None)
+                if chat is None:
+                    done("error: laptop chat is unavailable")
+                    return
+                ok, status = chat.send_remote(msg)
+                done(f"Laptop chat: {status}" if ok else f"error: {status}")
+
+            out = self._on_gui(deliver)
+            return out if isinstance(out, str) else "error: laptop chat did not respond"
+
+        if action == "stop":
+            if not self._allowed("laptop_chat", "Stop the active reply in the desktop Laptop chat.", "laptop chat"):
+                return "error: the user declined stopping the laptop chat"
+
+            def halt(done: Callable[[Any], None]) -> None:
+                chat = getattr(self._win, "_ai_chat", None)
+                if chat is None or getattr(chat, "_job", None) is None or getattr(chat, "_testing", False):
+                    done("Laptop chat is already idle.")
+                    return
+                chat.stop()
+                done("Laptop chat stopped.")
+
+            out = self._on_gui(halt)
+            return out if isinstance(out, str) else "error: laptop chat did not respond"
+
+        return "error: action must be 'read', 'send', or 'stop'"
 
     def _errand(self, name: str, args: dict[str, Any]) -> str:
         """set_errand asks every time (it is an instruction that runs later, maybe while the user is away);
@@ -539,7 +813,7 @@ class AiToolHost(QObject):
 
         def add(done: Callable[[Any], None]) -> None:
             try:
-                errand = errands.add(args.get("when"), instruction, self._win._ai_chat.ensure_sid())
+                errand = errands.add(args.get("when"), instruction, _host_chat(self).ensure_sid())
             except ValueError as exc:
                 done(f"error: {exc}")
                 return
@@ -553,7 +827,12 @@ class AiToolHost(QObject):
     def _computer(self, name: str, args: dict[str, Any], approved: bool = False) -> str:
         """Mouse and keyboard on the primary monitor. Every action needs the user's Allow (once or for the chat); a
         delete key or a destructive typed command asks every time. `approved`: the batch it is in was allowed whole."""
-        args = _given(args)
+        raw_id = args.get("id")
+        items = getattr(self, "_items", {})
+        target_label = str(args.get("name") or (items[raw_id][4] if isinstance(raw_id, int) and raw_id in items else ""))
+        args = resolve_target(name, _given(args), items)
+        if isinstance(args, str):
+            return args
         try:
             what, risk = computer_action(name, args)
         except ValueError as exc:
@@ -569,27 +848,173 @@ class AiToolHost(QObject):
                     return found
                 args = {**args, "x": found[0], "y": found[1]}
             if not getattr(self, "_batch_acted", False):
-                note, x, y = self._stale_click(args["x"], args["y"])
+                note, x, y = self._stale_click(args["x"], args["y"], target_label)
                 if note.startswith("error"):
                     return note
                 args = {**args, "x": x, "y": y}
+        elif name == "mouse_drag" and not getattr(self, "_batch_acted", False):
+            note, x, y = self._stale_click(args["x"], args["y"], target_label)  # the grab point only: drop spot may be anywhere
+            if note.startswith("error"):
+                return note
+            args = {**args, "x": x, "y": y}
         out = self._on_gui(lambda done: self._act(done, name, args), 90.0)  # up to 2000 chars at 20 ms
         return note + out if isinstance(out, str) else "error: the action did not finish in time"
 
-    def _map(self, image: QImage, hwnd: int) -> str:
-        """screen_map's text for a grab; the grab becomes what the next click is checked against."""
-        with ThreadPoolExecutor(max_workers=2) as pool:  # OCR and the control tree overlap
+    @staticmethod
+    def _offset_ocr_boxes(raw: str, dx: int, dy: int) -> str:
+        if not (dx or dy):
+            return raw
+        out = []
+        for line in raw.splitlines():
+            box, tab, rest = line.partition("\t")
+            try:
+                x, y, w, h = (int(n) for n in box.split(","))
+            except ValueError:
+                out.append(line)
+                continue
+            out.append(f"{x + dx},{y + dy},{w},{h}{tab}{rest}")
+        return "\n".join(out)
+
+    def _map(self, image: QImage, hwnd: int, region: Any = None) -> str:
+        """screen_map's text for a grab; the grab becomes what the next click is checked against. `region`
+        ([left, top, width, height]) lists only what is inside it and sends just that part as the screenshot: the
+        provider charges about the same per image whatever its size, so a crop shows more for the same tokens."""
+        clip = None
+        if region is not None:
+            if (not isinstance(region, list) or len(region) != 4
+                    or any(isinstance(v, bool) or not isinstance(v, int) for v in region)):
+                return "error: region is [left, top, width, height] in screen pixels"
+            rect = QRect(*region).intersected(image.rect())
+            if rect.width() < 8 or rect.height() < 8:
+                return "error: the region is (almost) off the screen"
+            clip = (rect.x(), rect.y(), rect.width(), rect.height())
+        shown = image.copy(QRect(*clip)) if clip else image
+        with ThreadPoolExecutor(max_workers=2) as pool:  # OCR (cropped when zoomed) and the control tree overlap
             controls = pool.submit(computer.ui_elements, hwnd)
-            lines = pool.submit(self._ocr, image, True).result()
+            raw_ocr = pool.submit(self._ocr, shown, True).result()
             elements = controls.result()
+        lines = self._offset_ocr_boxes(raw_ocr, clip[0], clip[1]) if clip else raw_ocr
         from src.ui.chat_widgets import MAX_IMAGE_SIDE, image_data_url
 
-        side = max(image.width(), image.height())
-        self._shot = image_data_url(image)
+        side = max(shown.width(), shown.height())
+        self._shot = image_data_url(shown)
         self._ref, self._maps = image, self._maps + 1
         note = (f"The screenshot you see is scaled down {side / MAX_IMAGE_SIDE:.2f}x: do not read pixels from "
                 "it, use the (x, y) listed here." if side > MAX_IMAGE_SIDE else "The screenshot is at full size.")
-        return parse_boxes(lines, image.width(), image.height(), elements, note)
+        if clip:
+            note = (f"Zoomed: only region {clip[0]},{clip[1]},{clip[2]}x{clip[3]} is listed and shown; (x, y) are "
+                    "still screen pixels. " + note)
+        self._items, self._ocr_ids = {}, set()  # the ids this map hands out; clicks and drags resolve `id` with them
+        return parse_boxes(lines, image.width(), image.height(), elements, note, self._items, clip, self._ocr_ids)
+
+    def _make_sheet(self, args: dict[str, Any]) -> str:
+        """make_sheet: render in the scratch folder, then copy to Documents\\Paperduck under a name nothing has."""
+        from src.tools.sheet import check_spec, page_count, render_sheet
+        from src.ui.chat_widgets import image_data_url
+
+        spec = check_spec(args)
+        if isinstance(spec, str):
+            return spec
+        got = render_sheet(spec, scratch_dir() / "sheets", self.cancel)
+        if isinstance(got, str):
+            return got
+        pdf, png = got
+        target, image = pdf, png  # kept in the scratch folder when no user folder takes it
+        loc = QStandardPaths.StandardLocation
+        # Controlled Folder Access can block Documents (it shows as "file not found"); Downloads is not protected
+        for base in (QStandardPaths.writableLocation(loc.DocumentsLocation),
+                     QStandardPaths.writableLocation(loc.DownloadLocation)):
+            if not base:
+                continue
+            folder = Path(base) / "Paperduck"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                stem, n = pdf.stem, 2
+                while (folder / f"{stem}.pdf").exists() or (folder / f"{stem}.png").exists():
+                    stem, n = f"{pdf.stem} ({n})", n + 1  # never over a file the user may have kept or edited
+                shutil.copyfile(pdf, folder / f"{stem}.pdf")
+                shutil.copyfile(png, folder / f"{stem}.png")
+            except OSError:
+                continue
+            target, image = folder / f"{stem}.pdf", folder / f"{stem}.png"
+            break
+        preview = QImage(str(png))
+        if not preview.isNull():
+            self._shot = image_data_url(preview)
+        pages = page_count(target)
+        fit = ("fits on one page" if pages == 1 else f"needs {pages} pages even at the smallest size: shorten the "
+               "points or drop the least useful ones, then call make_sheet again")
+        return (f"saved {target} and the same page as an image, {image} ({fit}; {spec['columns']} columns, "
+                f"{spec['chars']} characters). Look at the preview: if it reads well, tell the user where it is. For "
+                "Canva, upload the PNG (a PDF upload makes Canva swap the fonts and sizes), add it on a blank page "
+                "and right-click it, Set image as background, so it fills the page; then check with screen_map.")
+
+    def _layout_check(self, image: QImage, hwnd: int, page: Any) -> str:
+        """layout_check: screen_map zoomed on `page`, headed by the problems `check_layout` measures there."""
+        if (not isinstance(page, list) or len(page) != 4
+                or any(isinstance(v, bool) or not isinstance(v, int) for v in page)):
+            return "error: page is [left, top, width, height] in screen pixels"
+        rect = snap_page(image, QRect(*page).intersected(image.rect()))
+        if rect is None:
+            return "error: no page found there; give the page's box from a screen_map"
+        listing = self._map(image, hwnd, region=[rect.x(), rect.y(), rect.width(), rect.height()])
+        if listing.startswith("error:"):
+            return listing.replace("region", "page")
+        bg = page_color(image, rect)
+        br, bg_g, bb = (bg >> 16) & 255, (bg >> 8) & 255, bg & 255
+        data, stride, rw, rh = _rgb32_bytes(image, rect)
+        ink: list[tuple[int, int, int]] = []
+        inset = 5  # a selection outline or the page's own border sits on the edge; it is not content
+        x_end, y_end = max(inset, rw - inset), max(inset, rh - inset)
+        for y in range(inset, y_end, 3):  # every third pixel over the single copied RGB32 buffer
+            row = y * stride
+            first_x = last_x = -1
+            for x in range(inset, x_end, 3):
+                j = row + 4 * x
+                if max(abs(data[j + 2] - br), abs(data[j + 1] - bg_g), abs(data[j] - bb)) > 24:
+                    if first_x < 0:
+                        first_x = x
+                    last_x = x
+            if first_x >= 0:
+                ink.append((rect.top() + y, rect.left() + first_x, rect.left() + last_x))
+        texts = {n: it for n, it in self._items.items() if n in self._ocr_ids}  # controls (the canvas) are no text
+        low_contrast: list[tuple[int, float, str]] = []
+        for n, (bx, by, bw, bh, lbl) in texts.items():
+            if bw < 4 or bh < 4 or not lbl.strip():
+                continue
+            lx0, ly0 = max(0, bx - rect.x()), max(0, by - rect.y())
+            lx1, ly1 = min(rw - 1, bx + bw - 1 - rect.x()), min(rh - 1, by + bh - 1 - rect.y())
+            if lx1 - lx0 < 3 or ly1 - ly0 < 3:
+                continue
+            # Sample local background along the outer box edge, then find peak foreground contrast inside
+            edge_lumas = []
+            for sx in range(lx0, lx1 + 1, max(1, (lx1 - lx0) // 6)):
+                for sy in (ly0, ly1):
+                    j = sy * stride + 4 * sx
+                    edge_lumas.append(_luma(data[j + 2], data[j + 1], data[j]))
+            bg_l = sorted(edge_lumas)[len(edge_lumas) // 2]
+            best_ratio = 1.0
+            for sy in range(ly0 + 1, ly1, max(1, (ly1 - ly0) // 6)):
+                row = sy * stride
+                for sx in range(lx0 + 1, lx1, max(1, (lx1 - lx0) // 8)):
+                    j = row + 4 * sx
+                    fg_l = _luma(data[j + 2], data[j + 1], data[j])
+                    hi, lo = max(bg_l, fg_l), min(bg_l, fg_l)
+                    ratio = (hi + 0.05) / (lo + 0.05)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+            if best_ratio < 2.5:
+                low_contrast.append((n, best_ratio, lbl))
+        problems = check_layout((rect.x(), rect.y(), rect.width(), rect.height()), texts, ink, low_contrast)
+        if (rect.x(), rect.y(), rect.width(), rect.height()) != tuple(page):
+            listing = f"(The page measures {rect.x()},{rect.y()},{rect.width()}x{rect.height()}.)\n" + listing
+        self.layout_open = "; ".join(problems)
+        if not problems:
+            return ("Layout check: no problems measured. Still look at the screenshot: is it clear, balanced and "
+                    "well styled? Fix what is not.\n\n" + listing)
+        return ("Layout check: NOT up to standard yet. Fix each problem, then run layout_check again (a full-bleed "
+                "background or picture may touch the edge on purpose):\n- " + "\n- ".join(problems)
+                + "\n\n" + listing)
 
     def _find_click(self, args: dict[str, Any]) -> tuple[int, int] | str:
         """Where the control `name` (on the row of `near`) is right now, from a fresh look. When something else covers
@@ -620,10 +1045,11 @@ class AiToolHost(QObject):
                     "spot. Call screen_map for details.")
         return f'error: not clicked: "{cover}" covers "{label}" at ({x}, {y}); close it or scroll it out of the way first'
 
-    def _stale_click(self, x: int, y: int) -> tuple[str, int, int]:
+    def _stale_click(self, x: int, y: int, label: str = "") -> tuple[str, int, int]:
         """(note, where to click). The note is an error when the screen at (x, y) changed since the model last saw
         it and the target cannot be found again, so the click could hit the wrong thing; a target that only moved
-        is followed. A spot that changes again right after a fresh screen_map is animated and gets clicked."""
+        is followed (by row pixels, else local UIA label). A spot that changes again right after a fresh screen_map is
+        animated and gets clicked."""
         if self._ref is None:
             return "", x, y
         got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
@@ -633,6 +1059,10 @@ class AiToolHost(QObject):
             return "", x, y
         if (moved := follow(self._ref, got[0], x, y)) is not None:
             return f"The target moved from ({x}, {y}) to {moved} since you looked; followed it and ", *moved
+        if label and got[1]:
+            found = find_control(computer.ui_elements(got[1]), "", label, "", got[0].width(), got[0].height())
+            if isinstance(found, tuple) and abs(found[0] - x) <= FOLLOW_PX and abs(found[1] - y) <= FOLLOW_PX:
+                return f'The control "{label[:40]}" moved from ({x}, {y}) to ({found[0]}, {found[1]}); followed it and ', found[0], found[1]
         if self._refused is not None and self._refused[:2] == (x, y) and self._refused[2] != self._maps:
             return "", x, y
         self._refused = (x, y, self._maps)  # against this map; the one below is a fresh look
@@ -646,28 +1076,44 @@ class AiToolHost(QObject):
         `_computer`, stopping at the first error or Stop."""
         if not isinstance(steps, list) or not steps or len(steps) > MAX_BATCH_STEPS:
             return f"error: give 1 to {MAX_BATCH_STEPS} steps"
-        plan, risks = [], []
+        plan, risks, todo = [], [], []
         for i, step in enumerate(steps, 1):
             tool = step.get("tool") if isinstance(step, dict) else None
+            if tool == "wait":  # batch-only: lets an app catch up (a toolbar, a save) without a round of its own
+                ms = step.get("ms")
+                if isinstance(ms, bool) or not isinstance(ms, int) or not 0 < ms <= MAX_WAIT_MS:
+                    return f"error: step {i}: wait takes ms from 1 to {MAX_WAIT_MS}"
+                plan.append(f"{i}. wait {ms} ms")
+                todo.append((tool, {"ms": ms}))
+                continue
             if tool not in COMPUTER_TOOLS:
-                return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS))}"
+                return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS | {'wait'}))}"
+            args = resolve_target(tool, _given({k: v for k, v in step.items() if k != "tool"}),
+                                  getattr(self, "_items", {}))
+            if isinstance(args, str):
+                return f"error: step {i}: {args.removeprefix('error: ')}"
             try:
-                what, risk = computer_action(tool, _given({k: v for k, v in step.items() if k != "tool"}))
+                what, risk = computer_action(tool, args)
             except ValueError as exc:
                 return f"error: step {i}: {exc}"
             plan.append(f"{i}. {what}")
             risks += [risk] if risk else []
+            todo.append((tool, args))
         if not self._allowed("computer", "The model wants to control your computer in these steps:\n\n" + "\n".join(plan),
                              "computer control", ", ".join(risks)):
             return "error: the user declined these actions"
         cancel, lines = self.cancel, []
         self._batch_acted = False
         try:
-            for i, step in enumerate(steps, 1):
+            for i, (tool, args) in enumerate(todo, 1):
                 if cancel.is_set():
                     return "\n".join([*lines, "error: stopped by the user"])
-                self._in_batch = i < len(steps)
-                out = self._computer(step["tool"], {k: v for k, v in step.items() if k != "tool"}, approved=True)
+                if tool == "wait":
+                    cancel.wait(args["ms"] / 1000)
+                    lines.append(f"{i}. waited {args['ms']} ms")
+                    continue
+                self._in_batch = i < len(todo)
+                out = self._computer(tool, args, approved=True)
                 self._batch_acted = True
                 lines.append(f"{i}. {out}")
                 if out.startswith("error"):
@@ -686,6 +1132,15 @@ class AiToolHost(QObject):
         for w in hidden:
             w.hide()
         before = [("", False)]
+        if name == "paste_text" and (cb := QGuiApplication.clipboard()) is not None:
+            if args.get("html") is True:  # both formats: rich-paste apps take the HTML, the rest the plain text
+                mime, doc = QMimeData(), QTextDocument()
+                doc.setHtml(args["text"])
+                mime.setHtml(args["text"])
+                mime.setText(doc.toPlainText())
+                cb.setMimeData(mime)
+            else:
+                cb.setText(args["text"])  # here on the Qt thread; the worker only presses ctrl+v
 
         def act() -> str:  # on a worker thread: typing takes 8 ms a character and must not freeze the pet
             computer.focus_front_app()  # the chat has the keyboard after the user pressed Enter
@@ -694,6 +1149,13 @@ class AiToolHost(QObject):
                 if name == "mouse_click":
                     computer.click(args["x"], args["y"], args.get("button") or "left", bool(args.get("double")))
                     result = "clicked"
+                elif name == "paste_text":
+                    time.sleep(0.05)  # the app reads the clipboard on ctrl+v; give the copy a moment to land
+                    computer.press(computer.parse_keys("ctrl+v"))
+                    result = f"pasted {len(args['text'])} characters"
+                elif name == "mouse_drag":
+                    computer.drag(args["x"], args["y"], args["to_x"], args["to_y"])
+                    result = "dragged"
                 elif name == "type_text":
                     typed = computer.type_text(args["text"], stop=self.cancel)
                     result = (f"error: stopped by the user after {typed} characters" if self.cancel.is_set()
@@ -741,13 +1203,13 @@ class AiToolHost(QObject):
         """The pictures of the newest user turn that has any (data URLs, at most MAX_ATTACHMENTS), when asked for."""
         from src.ui.chat_widgets import MAX_ATTACHMENTS
 
-        turns = list(self._win._ai_chat._history) if share else []
+        turns = list(_host_chat(self)._history) if share else []
         return next((t["images"][:MAX_ATTACHMENTS] for t in reversed(turns) if t["role"] == "user" and t.get("images")), [])
 
     def _shared_notes(self, share: bool) -> str:
         """What a shared picture's task text adds: that the pictures are in the message, and their OCR text. Live,
         a model that takes an image without an error but cannot read it searched the disk for the file instead."""
-        turns = list(self._win._ai_chat._history) if share else []
+        turns = list(_host_chat(self)._history) if share else []
         notes = next((t.get("image_notes") or [] for t in reversed(turns) if t["role"] == "user" and t.get("images")), [])
         if not notes:
             return ""
@@ -756,7 +1218,7 @@ class AiToolHost(QObject):
 
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:
         """A sub-agent's thread: one ask() with the chat's provider and model at the agent's own thinking level."""
-        plugin = self._win._ai_chat._plugin
+        plugin = _host_chat(self)._plugin
         url, model = plugin.base_url, plugin.model
         where = f"the Project Folder {host.root}" if host.root else f"the home folder {Path.home()}"
         messages = [{"role": "system", "content": AGENT_PROMPT.format(calls=MAX_AGENT_CALLS, where=where, today=date.today())},
@@ -796,10 +1258,10 @@ class AiToolHost(QObject):
         """The user's answer in the chat; no answer within APPROVE_TIMEOUT_S counts as declined.
         A `risk` (destructive command) is asked every time, even when the chat allowed the tool before. So is a
         tool in OUTSIDE_GUARDED once the chat holds outside content, which could have told the model what to do."""
-        chat = self._win._ai_chat
+        chat = _host_chat(self)
         extra: dict[str, Any] = {"danger": risk} if risk else {"untrusted": True} if (
             self.outside and key in OUTSIDE_GUARDED) else {}
-        if auto_mode(self._win) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
+        if _host_auto_mode(self) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
             # every action gets its own review: a cached yes would pass later clicks (Send, Buy) unseen
             extra["review"] = self._review(text)
             if self.cancel.is_set():
@@ -809,7 +1271,7 @@ class AiToolHost(QObject):
 
     def _review(self, action: str) -> tuple[bool, str]:
         """Auto mode's reviewer on this chat's provider and model (worker thread; Stop ends it)."""
-        chat = self._win._ai_chat
+        chat = _host_chat(self)
         p = chat._plugin
         return review_action(p.base_url, load_key(p.base_url), p.model, chat.user_requests(), action, self.cancel)
 
@@ -896,7 +1358,9 @@ class AiToolHost(QObject):
     def _save_file(self, file_name: str, content: str) -> str:
         """Nothing is written unless the user picks a path; the dialog itself confirms overwrites."""
         downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
-        path, _filter = QFileDialog.getSaveFileName(self._win._ai_chat, "Save file from Paperduck AI",
+        chat = _host_chat(self)
+        parent = self._win if getattr(chat, "_remote_only", False) else chat
+        path, _filter = QFileDialog.getSaveFileName(parent, "Save file from Paperduck AI",
                                                     str(Path(downloads) / file_name))
         if not path:
             return "the user cancelled the save"
@@ -959,12 +1423,12 @@ class AiToolHost(QObject):
     @staticmethod
     def _ocr(image: QImage, boxes: bool = False, empty: str = "no text found on screen") -> str:
         tmp = Path(tempfile.mkdtemp(prefix="paperduck_ocr_"))
-        png = tmp / "screen.png"
+        bmp = tmp / "screen.bmp"
         try:
-            image.save(str(png), "PNG")
-            text = ocr_image_file(png, boxes=boxes)
+            image.save(str(bmp), "BMP")
+            text = ocr_image_file(bmp, boxes=boxes)
         finally:
-            for leftover in (png, png.with_suffix(".ps1")):
+            for leftover in (bmp, bmp.with_suffix(".ps1")):
                 leftover.unlink(missing_ok=True)
             tmp.rmdir()
         if boxes:

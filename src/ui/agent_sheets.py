@@ -6,6 +6,7 @@ the card back. Every place comes from one base point, so dragging whichever shee
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer
 from PyQt6.QtGui import QColor, QMouseEvent, QPainter
@@ -306,3 +307,20 @@ class AgentSheets:
             sheet.refresh()
         if not running:
             self._timer.stop()
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Qt-thread summary of each active or finished sub-agent sheet for the remote phone UI."""
+        out: list[dict[str, Any]] = []
+        for sheet in self.sheets:
+            lines = [line for line in sheet.log.toPlainText().splitlines() if line.strip()][-25:]
+            out.append({
+                "n": sheet.n,
+                "status": sheet.status,
+                "effort": sheet.effort,
+                "calls": sheet.calls,
+                "elapsed": int((sheet.ended or time.monotonic()) - sheet.started),
+                "task": sheet.task.text()[:240],
+                "log": lines,
+                "report": sheet.report_text.toPlainText()[:4000] if sheet.report_text is not None else "",
+            })
+        return out

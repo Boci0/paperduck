@@ -85,7 +85,7 @@ class ChatAttachMixin:
         if path.suffix.lower() in _IMAGE_SUFFIXES:
             image = QImage(str(path))
             if not image.isNull():
-                self.attach_image(image, path.name)
+                self.attach_image(image, path.name, saved_path=str(path))
                 return
         item = Attachment("file", path.name)
         try:
@@ -102,15 +102,18 @@ class ChatAttachMixin:
                 if len(item.text) > INLINE_FILE_CHARS:
                     item.path = str(path)
                     item.detail += ", read on demand"
+                else:
+                    item.saved_path = str(path)
         except ValueError:
             item.detail = "Can't read: not a text file"
         except OSError:
             item.detail = "Can't read this file"
         self._add_attachment(item)
 
-    def attach_image(self, image: QImage, name: str) -> None:
+    def attach_image(self, image: QImage, name: str, *, saved_path: str = "") -> None:
         """Image chips are sent as images, plus their offline Windows OCR text for models without vision."""
-        item = Attachment("image", name, pending=True, thumb=QPixmap.fromImage(image), image_url=image_data_url(image))
+        item = Attachment("image", name, pending=True, thumb=QPixmap.fromImage(image),
+                          image_url=image_data_url(image), saved_path=saved_path)
         if not self._add_attachment(item):
             return
         job = OcrJob(self)

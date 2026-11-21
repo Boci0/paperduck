@@ -68,6 +68,9 @@ class AiMixin:
     def _prebuild_ai_chat(self) -> None:
         plugin = self._state_machine.registry.get_plugin("ai")
         if self._ai_chat is None and not self._is_shutting_down and isinstance(plugin, AiAssistPlugin):
+            errands = self._errands()
+            if not plugin.has_key() and (errands is None or (not errands.errands and not errands.fired)):
+                return
             self._make_ai_chat(plugin)
             self._ai_chat.warm_up()
 
@@ -80,6 +83,7 @@ class AiMixin:
             errands.probes.bg = host.procs.peek
         self._ai_chat.thinking_changed.connect(self._on_ai_thinking)
         self._ai_chat.answered.connect(self._on_ai_answered)
+        self._ai_chat.remote_changed.connect(self.remote.notify_change)
 
     def ensure_ai_chat(self) -> AiChat | None:
         """Open the chat if it is closed (never toggles it shut, unlike open_ai_chat)."""
@@ -220,6 +224,9 @@ class AiMixin:
         if callback_id == "watch:undo_tidy":
             self._undo_tidy()
             return
+        if callback_id == "hints:last":
+            self._recall_last_hint()
+            return
         if callback_id.startswith("hotkey:"):
             self._edit_hotkey(callback_id.removeprefix("hotkey:"))
             return
@@ -265,6 +272,18 @@ class AiMixin:
             return
         if callback_id == "ai:skills":
             self.open_output_folder(skills_dir())
+            return
+        if callback_id == "remote:toggle":
+            self.remote.toggle_async(
+                lambda ok, _info: self._show_toast("PHONE ON" if ok else "PHONE OFF", QColor("#38B764" if ok else "#8A9AF2"))
+            )
+            return
+        if callback_id == "remote:pair":
+            self.remote.show_pairing_dialog()
+            return
+        if callback_id == "remote:rotate":
+            self.remote.rotate_token()
+            self._show_toast("NEW TOKEN", QColor("#73EFF7"))
             return
         if callback_id.startswith(("macro:", "macrokey:")):  # by name (wheel, menu) or number (hotkey)
             key = callback_id.partition(":")[2]

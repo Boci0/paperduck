@@ -90,12 +90,28 @@ def screen_size() -> tuple[int, int]:
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
+_DEFAULT_SCREEN_SIZE = screen_size
+
+
+def virtual_screen_bounds() -> tuple[int, int, int, int]:
+    """(left, top, width, height) spanning all monitors in physical pixels (primary-only if screen_size is mocked)."""
+    if screen_size is not _DEFAULT_SCREEN_SIZE:
+        w, h = screen_size()
+        return 0, 0, w, h
+    user32 = _user32()
+    vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    if vw <= 0 or vh <= 0:
+        w, h = screen_size()
+        return 0, 0, w, h
+    return user32.GetSystemMetrics(76), user32.GetSystemMetrics(77), vw, vh
+
+
 def _move(x: int, y: int) -> None:
-    width, height = screen_size()
-    if not (-2 <= x < width + 2 and -2 <= y < height + 2):
+    vx, vy, width, height = virtual_screen_bounds()
+    if not (vx - 2 <= x < vx + width + 2 and vy - 2 <= y < vy + height + 2):
         raise ValueError(f"({x}, {y}) is off the screen, which is {width}x{height}")
     # a hair past the edge (the taskbar's corner, a centre rounded up) lands on the last pixel instead of failing
-    x, y = max(0, min(x, width - 1)), max(0, min(y, height - 1))
+    x, y = max(vx, min(x, vx + width - 1)), max(vy, min(y, vy + height - 1))
     _user32().SetCursorPos(x, y)
     time.sleep(0.05)
 
@@ -108,6 +124,20 @@ def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
     for _ in range(2 if double else 1):
         _send(_mouse(down), _mouse(up))
         time.sleep(0.06)
+
+
+def drag(x: int, y: int, to_x: int, to_y: int, steps: int = 12) -> None:
+    """Left-button drag in small moves (web canvases such as Canva ignore a jump); the button always comes back up."""
+    _move(to_x, to_y)  # checks the end is on screen before anything is pressed
+    _move(x, y)
+    _send(_mouse(_MOUSE_FLAGS["left"][0]))
+    try:
+        time.sleep(0.08)
+        for i in range(1, steps + 1):
+            _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
+        time.sleep(0.08)
+    finally:
+        _send(_mouse(_MOUSE_FLAGS["left"][1]))
 
 
 def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
@@ -147,25 +177,25 @@ def press(codes: list[int]) -> None:
 _UIA_PS = r"""
 param([long]$Hwnd)
 $ErrorActionPreference = 'Stop'
-# Per-monitor DPI aware, so rectangles are physical pixels like SendInput and the grab; unaware, they were scaled
-# and drifted further off the further a control sat from the top-left (right and bottom edges missed most)
 if (-not ('BS.Dpi' -as [type])) {  # a warm worker runs this again in the same process
     Add-Type -Namespace BS -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);'
 }
 [void][BS.Dpi]::SetThreadDpiAwarenessContext([IntPtr]-4)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-$A = [System.Windows.Automation.AutomationElement]
-$CT = [System.Windows.Automation.ControlType]
-$root = $A::FromHandle([IntPtr]$Hwnd)
-$types = @($CT::Button, $CT::CheckBox, $CT::ComboBox, $CT::Edit, $CT::Hyperlink, $CT::ListItem, $CT::MenuItem,
-    $CT::RadioButton, $CT::TabItem, $CT::TreeItem, $CT::SplitButton, $CT::Slider, $CT::DataItem, $CT::Document)
-$any = [System.Windows.Automation.OrCondition]::new([System.Windows.Automation.Condition[]]@(
-    $types | ForEach-Object { [System.Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $_) }))
-$visible = [System.Windows.Automation.PropertyCondition]::new($A::IsOffscreenProperty, $false)
-$cond = [System.Windows.Automation.AndCondition]::new($any, $visible)
+if (-not $script:paperduckUiaCond) {
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $A = [System.Windows.Automation.AutomationElement]
+    $CT = [System.Windows.Automation.ControlType]
+    $types = @($CT::Button, $CT::CheckBox, $CT::ComboBox, $CT::Edit, $CT::Hyperlink, $CT::ListItem, $CT::MenuItem,
+        $CT::RadioButton, $CT::TabItem, $CT::TreeItem, $CT::SplitButton, $CT::Slider, $CT::DataItem, $CT::Document)
+    $any = [System.Windows.Automation.OrCondition]::new([System.Windows.Automation.Condition[]]@(
+        $types | ForEach-Object { [System.Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $_) }))
+    $visible = [System.Windows.Automation.PropertyCondition]::new($A::IsOffscreenProperty, $false)
+    $script:paperduckUiaCond = [System.Windows.Automation.AndCondition]::new($any, $visible)
+}
+$root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
 $count = 0
-foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)) {
+foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond)) {
     try {
         $r = $e.Current.BoundingRectangle
         if ($r.IsEmpty -or $r.Width -lt 4 -or $r.Height -lt 4) { continue }
@@ -389,7 +419,10 @@ if (-not ('BS.Dpi' -as [type])) {
     Add-Type -Namespace BS -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);'
 }
 [void][BS.Dpi]::SetThreadDpiAwarenessContext([IntPtr]-4)
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+if (-not $script:paperduckUiaBase) {
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+    $script:paperduckUiaBase = $true
+}
 $A = [System.Windows.Automation.AutomationElement]
 """
 
