@@ -185,8 +185,11 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._above: bool | None = None  # which side of the sprite the card sits on, until the next open_near
         self._drag_from: QPoint | None = None  # cursor minus card position while the header is dragged
         self._dots_timer = QTimer(self)
-        self._dots_timer.setInterval(33)  # ~30 fps for the dots
+        self._dots_timer.setInterval(150 if remote_only else 33)  # ~30 fps for desktop dots; 150ms SSE cadence for headless phone chat
         self._dots_timer.timeout.connect(self._tick_dots)
+        self._last_remote_tick: tuple[str, str] = ("", "")
+        self._snap_history_key: tuple[int, tuple[tuple[int, int, int], ...]] | None = None
+        self._snap_history_cache: list[dict[str, Any]] = []
         self._thinking_label: ChatText | None = None
         self._steer_q: list[str] = []  # typed while an answer is coming; the worker takes them with its next tool result
         self._steer_sent: list[str] = []  # the ones it took
@@ -840,14 +843,24 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._relayout()
 
     def _tick_dots(self) -> None:
+        if self._remote_only:
+            sig = (self._progress, self._stream_text)
+            if sig != self._last_remote_tick:
+                self._last_remote_tick = sig
+                self.remote_changed.emit()
+            return
         self._think_dots.phase += self._dots_timer.interval() / 1000
         self._think_dots.update()
         text = self._progress or "Thinking"
         changed = False
         if self._thinking_label is not None and self._thinking_label.toPlainText() != text:
+            old_h = self._thinking_label.height()
             self._thinking_label.set_text(text)
+            if self._thinking_label.height() != old_h:
+                self._relayout()
             changed = True
         if self._sync_stream() or changed:
+            self._last_remote_tick = (self._progress, self._stream_text)
             self.remote_changed.emit()
 
     def _clear_stream(self) -> None:
@@ -868,6 +881,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             return False
         if self._stream_label is None:
             self._stream_row, self._stream_label = self._add_row("assistant", "")
+            content_w = max(1, (self._scroll.viewport().width() if self._scroll.viewport().width() > 24
+                                else self._width - 2 * (6 + SHADOW) - 6) - 16)
+            self._stream_label.resize(content_w, 0)
         if self._stream_label.toPlainText() == stream:
             return False
         now = time.monotonic()
@@ -1104,37 +1120,45 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         if self._ready() and p.base_url not in self._models and p.base_url not in self._models_attempted and self._models_job is None:
             self._models_attempted.add(p.base_url)
             self._fetch_models(show=False)
-        shown_turns: list[dict[str, Any]] = []
-        for t in self._history[-40:]:
-            role = t.get("role", "assistant")
-            content = str(t.get("content") or "")
-            if role == "assistant":
-                raw_tools = t.get("tools") or []
-                tools = [name for name, _out in raw_tools]
-                tool_details = []
-                for name, out in raw_tools:
-                    collapsed = " ".join(_clean_secrets(str(out or "")).split())
-                    tool_details.append({"name": str(name), "summary": collapsed[:240]})
-                shown_turns.append({
-                    "role": "assistant",
-                    "text": content,
-                    "tools": tools,
-                    "tool_details": tool_details,
-                })
-            elif content.startswith(COMPACT_PREFIX):
-                shown_turns.append({"role": "note", "text": "Earlier messages were compacted into a summary.", "tools": []})
-            else:
-                if content.startswith(ERRAND_MARK):
-                    text, atts = "Errand: " + content.rsplit("\n\nErrand: ", 1)[-1], []
+        tail = self._history[-40:]
+        hkey = (len(self._history), tuple((id(t), len(t.get("content") or ""), len(t.get("tools") or ())) for t in tail))
+        if hkey == self._snap_history_key:
+            shown_turns = [dict(item) for item in self._snap_history_cache]
+        else:
+            parsed_turns: list[dict[str, Any]] = []
+            for t in tail:
+                role = t.get("role", "assistant")
+                content = str(t.get("content") or "")
+                if role == "assistant":
+                    raw_tools = t.get("tools") or []
+                    tools = [name for name, _out in raw_tools]
+                    tool_details = []
+                    for name, out in raw_tools:
+                        collapsed = " ".join(_clean_secrets(str(out or "")).split())
+                        tool_details.append({"name": str(name), "summary": collapsed[:240]})
+                    parsed_turns.append({
+                        "role": "assistant",
+                        "text": content,
+                        "tools": tools,
+                        "tool_details": tool_details,
+                    })
+                elif content.startswith(COMPACT_PREFIX):
+                    parsed_turns.append({"role": "note", "text": "Earlier messages were compacted into a summary.", "tools": []})
                 else:
-                    text = re.split(r"\n*\[(?:File|Image \(attached; its text read by OCR\)): ", content, maxsplit=1)[0].strip()
-                    atts = self._parse_remote_attachments(content)
-                shown_turns.append({
-                    "role": "user",
-                    "text": text if (text or atts) else "(attachment)",
-                    **({"attachments": atts} if atts else {}),
-                    "tools": [],
-                })
+                    if content.startswith(ERRAND_MARK):
+                        text, atts = "Errand: " + content.rsplit("\n\nErrand: ", 1)[-1], []
+                    else:
+                        text = re.split(r"\n*\[(?:File|Image \(attached; its text read by OCR\)): ", content, maxsplit=1)[0].strip()
+                        atts = self._parse_remote_attachments(content)
+                    parsed_turns.append({
+                        "role": "user",
+                        "text": text if (text or atts) else "(attachment)",
+                        **({"attachments": atts} if atts else {}),
+                        "tools": [],
+                    })
+            self._snap_history_key = hkey
+            self._snap_history_cache = parsed_turns
+            shown_turns = [dict(item) for item in parsed_turns]
         busy = self._job is not None and not self._testing
         if busy and self._remote_steers:
             shown_turns.extend(dict(item) for item in self._remote_steers)
@@ -1464,8 +1488,10 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
 
     def _relayout(self) -> None:
         """Size the thread to its content (capped) and keep the edge nearest the pet in place."""
+        if self._remote_only:
+            return
         if self._stack.currentIndex() == 0:
-            width = self._width - 12 - 6  # card margins and the scrollbar gutter
+            width = self._width - 2 * (6 + SHADOW) - 6  # card shadow margins and scrollbar gutter
             content = self._thread.heightForWidth(width) if self._thread_layout.count() else 0
             self._stack.setFixedHeight(max(0, min(self.THREAD_MAX_H, content + 4)))
         else:
@@ -1510,6 +1536,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        if self._job is not None and not self._remote_only:
+            self._tick_dots()
         self._sheets.show_all()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]

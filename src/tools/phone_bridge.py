@@ -341,8 +341,10 @@ def _app_html(nonce: str, csrf_token: str) -> str:
 }}
 @media (pointer: coarse) {{
   :root {{ --target: 44px; }}
+  .select-sm {{ font-size: 16px; }}
 }}
 * {{ box-sizing: border-box; }}
+[hidden] {{ display: none !important; }}
 .visually-hidden {{
   position: absolute;
   width: 1px;
@@ -355,13 +357,13 @@ html {{
   background: var(--bg);
   color: var(--ink);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  block-size: 100dvh;
+  block-size: var(--app-h, 100dvh);
   overflow: hidden;
   -webkit-tap-highlight-color: transparent;
 }}
 body {{
   margin: 0;
-  block-size: 100dvh;
+  block-size: var(--app-h, 100dvh);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -385,7 +387,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
 header {{
   background: var(--paper);
   border-bottom: 1px solid var(--line);
-  padding: max(0.5rem, env(safe-area-inset-top, 0px)) max(0.85rem, env(safe-area-inset-right, 0px)) 0.48rem max(0.85rem, env(safe-area-inset-left, 0px));
+  padding: max(0.42rem, env(safe-area-inset-top, 0px)) max(0.75rem, env(safe-area-inset-right, 0px)) 0.38rem max(0.75rem, env(safe-area-inset-left, 0px));
 }}
 .sheet-w {{
   width: 100%;
@@ -395,44 +397,39 @@ header {{
 .topbar {{
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 0.34rem 0.42rem;
+  flex-wrap: nowrap;
+  gap: 0.32rem;
 }}
 .top-actions {{
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 0.32rem;
-  max-width: 100%;
-}}
-@media (max-width: 480px) {{
-  .top-actions .btn.sm {{
-    padding: 0 0.44rem;
-  }}
+  flex-wrap: nowrap;
+  gap: 0.28rem;
+  flex: none;
 }}
 .brand {{
   font-weight: 700;
-  font-size: 0.96rem;
+  font-size: 0.94rem;
   letter-spacing: -0.01em;
   margin-right: auto;
   display: flex;
   align-items: center;
-  gap: 0.45rem;
+  gap: 0.36rem;
   min-width: 0;
 }}
 .duck-mark {{
-  width: 21px;
-  height: 21px;
+  width: 19px;
+  height: 19px;
   flex: none;
 }}
 .meta-line {{
-  margin-top: 0.24rem;
-  font-size: 0.74rem;
+  margin-top: 0.18rem;
+  font-size: 0.72rem;
   color: var(--dim);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.45rem;
+  gap: 0.4rem;
   white-space: nowrap;
   overflow: hidden;
 }}
@@ -444,14 +441,31 @@ header {{
   border-radius: 6px;
   padding: 2px;
   gap: 2px;
+  min-width: 0;
 }}
 .btn.target-btn {{
-  min-block-size: 26px;
-  padding: 0 0.52rem;
-  font-size: 0.74rem;
+  min-block-size: 28px;
+  padding: 0 0.46rem;
+  font-size: 0.73rem;
   border: none;
   background: transparent;
   border-radius: 4px;
+}}
+@media (max-width: 420px) {{
+  .topbar {{ gap: 0.24rem; }}
+  .top-actions {{ gap: 0.22rem; }}
+  .top-actions .btn.sm {{
+    padding: 0 0.42rem;
+    font-size: 0.72rem;
+    min-block-size: 32px;
+  }}
+  .btn.target-btn {{
+    padding: 0 0.38rem;
+    font-size: 0.7rem;
+  }}
+}}
+@media (max-width: 340px) {{
+  .topbar {{ flex-wrap: wrap; }}
 }}
 .btn.target-btn.active {{
   background: var(--paper);
@@ -485,13 +499,6 @@ header {{
   text-overflow: ellipsis;
   white-space: nowrap;
 }}
-#progressText {{
-  flex: none;
-  max-width: 42%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}}
 .pip {{
   width: 6px;
   height: 6px;
@@ -511,6 +518,7 @@ header {{
   font-size: 0.82rem;
   font-weight: 600;
   cursor: pointer;
+  touch-action: manipulation;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -618,52 +626,59 @@ header {{
 .screen-drawer {{
   background: var(--paper);
   border-bottom: 1px solid var(--line);
-  padding: 0.52rem max(0.85rem, env(safe-area-inset-right, 0px)) 0.62rem max(0.85rem, env(safe-area-inset-left, 0px));
+  padding: 0.42rem max(0.75rem, env(safe-area-inset-right, 0px)) 0.48rem max(0.75rem, env(safe-area-inset-left, 0px));
 }}
 .screen-drawer[hidden] {{ display: none; }}
 .screen-bar {{
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 0.36rem;
+  gap: 0.3rem;
 }}
 .screen-opts {{
-  margin-top: 0.4rem;
+  margin-top: 0.28rem;
 }}
 .screen-opts summary {{
-  font-size: 0.74rem;
+  font-size: 0.72rem;
   color: var(--dim);
   cursor: pointer;
   user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  list-style: none;
 }}
+.screen-opts summary::-webkit-details-marker {{ display: none; }}
 .screen-opts-row {{
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 0.38rem;
-  margin-top: 0.36rem;
+  gap: 0.34rem;
+  margin-top: 0.32rem;
 }}
 .toggle-label {{
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  font-size: 0.78rem;
+  gap: 0.32rem;
+  font-size: 0.76rem;
   color: var(--ink);
-  padding: 0 0.5rem;
+  padding: 0 0.48rem;
   min-block-size: 32px;
   border-radius: 6px;
   background: var(--raised);
   border: 1px solid var(--line);
   cursor: pointer;
+  touch-action: manipulation;
 }}
 .toggle-label input {{ accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }}
 .screen-meta {{
-  font-size: 0.74rem;
+  font-size: 0.71rem;
   color: var(--dim);
   margin-left: auto;
 }}
 .screen-body {{
-  margin-top: 0.48rem;
+  margin-top: 0.38rem;
 }}
 .screen-body[hidden] {{ display: none; }}
 .screen-frame {{
@@ -677,7 +692,7 @@ header {{
 .screen-img {{
   display: block;
   max-inline-size: 100%;
-  max-block-size: min(24dvh, 210px);
+  max-block-size: min(20dvh, 170px);
   width: auto;
   height: auto;
   object-fit: contain;
@@ -699,10 +714,13 @@ main {{
   width: 100%;
   max-width: 720px;
   margin: 0 auto;
-  padding: 0.85rem max(0.85rem, env(safe-area-inset-right, 0px)) 1.15rem max(0.85rem, env(safe-area-inset-left, 0px));
+  padding: 0.85rem max(0.85rem, env(safe-area-inset-right, 0px)) 2.2rem max(0.85rem, env(safe-area-inset-left, 0px));
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}}
+main > * {{
+  flex-shrink: 0;
 }}
 .empty-note {{
   margin: 2.2rem 0 0.5rem;
@@ -745,6 +763,8 @@ main {{
   display: flex;
   flex-direction: column;
   gap: 0.28rem;
+  min-width: 0;
+  max-width: 100%;
 }}
 .msg-wrap.user {{ align-items: flex-end; }}
 .msg-wrap.assistant {{ align-items: flex-start; }}
@@ -772,6 +792,8 @@ main {{
   line-height: 1.52;
   font-size: 0.94rem;
   color: var(--ink);
+  min-width: 0;
+  max-width: 100%;
 }}
 .msg-wrap.user .msg {{
   max-width: 86%;
@@ -1056,9 +1078,27 @@ main {{
 }}
 .copy-link:hover {{ color: var(--ink); }}
 .stream-status {{
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
   color: var(--dim);
   font-size: 0.78rem;
-  padding: 0.2rem 0;
+  padding: 0.25rem 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}}
+.stream-status::before {{
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+  animation: pulseDot 1.2s ease-in-out infinite;
+}}
+@keyframes pulseDot {{
+  0%, 100% {{ opacity: 0.35; }}
+  50% {{ opacity: 1; }}
 }}
 .stream-status[hidden] {{ display: none; }}
 .approval {{
@@ -1080,11 +1120,60 @@ main {{
   border: 1px solid var(--line);
   padding: 0.5rem;
   border-radius: 4px;
-  overflow-x: auto;
+  overflow: auto;
+  max-block-size: 38dvh;
   font-size: 0.8rem;
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-word;
+}}
+.approval pre.collapsed {{ max-block-size: 8.5rem; }}
+.approval pre.nowrap {{ white-space: pre; word-break: normal; }}
+.approval-detail-bar {{
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}}
+.diff-line {{ display: block; }}
+.diff-add {{ color: var(--ok); }}
+.diff-del {{ color: var(--danger); }}
+.diff-hdr {{ color: var(--accent); font-weight: 600; }}
+.repair-banner {{
+  background: var(--paper);
+  border-bottom: 1px solid var(--danger);
+  padding: 0.45rem max(0.85rem, env(safe-area-inset-right, 0px)) 0.45rem max(0.85rem, env(safe-area-inset-left, 0px));
+}}
+.repair-banner[hidden] {{ display: none; }}
+.repair-row {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--danger);
+  font-weight: 600;
+}}
+.queue-bar {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.34rem 0.55rem;
+  margin-bottom: 0.42rem;
+  font-size: 0.76rem;
+  color: var(--ink);
+}}
+.queue-bar[hidden] {{ display: none; }}
+.queue-actions {{
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  flex: none;
 }}
 .approval-actions {{
   display: flex;
@@ -1196,7 +1285,7 @@ textarea {{
   border-radius: 6px;
   padding: 0.52rem 0.72rem;
   font: inherit;
-  font-size: 0.94rem;
+  font-size: max(16px, 0.96rem);
   line-height: 1.38;
   max-height: 8.5rem;
 }}
@@ -1209,31 +1298,90 @@ dialog.screen-modal {{
   background: var(--paper);
   color: var(--ink);
 }}
+dialog.screen-modal.fs-live[open] {{
+  width: 100vw;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: #09090c;
+  color: #efece5;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}}
 dialog.screen-modal::backdrop {{
-  background: rgba(0, 0, 0, 0.76);
+  background: rgba(0, 0, 0, 0.88);
 }}
 .modal-head {{
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 0.42rem;
-  margin-bottom: 0.48rem;
+  gap: 0.34rem;
+  margin-bottom: 0.42rem;
+}}
+dialog.screen-modal.fs-live .modal-head {{
+  margin: 0;
+  padding: max(0.38rem, env(safe-area-inset-top, 0px)) max(0.6rem, env(safe-area-inset-right, 0px)) 0.38rem max(0.6rem, env(safe-area-inset-left, 0px));
+  background: rgba(24, 23, 28, 0.94);
+  border-bottom: 1px solid #302f39;
+  flex: none;
+  z-index: 2;
+}}
+dialog.screen-modal.fs-live.hud-hidden .modal-head {{
+  display: none;
+}}
+dialog.screen-modal.fs-live .btn,
+dialog.screen-modal.fs-live .select-sm,
+dialog.screen-modal.fs-live .toggle-label {{
+  background: #232229;
+  color: #efece5;
+  border-color: #3a3844;
+  min-block-size: 30px;
+  font-size: 0.72rem;
 }}
 .modal-tools {{
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 0.36rem;
+  gap: 0.28rem;
+  flex: 1;
+  justify-content: flex-end;
 }}
-.modal-title {{ font-weight: 700; font-size: 0.9rem; margin: 0; }}
+.modal-title {{ font-weight: 700; font-size: 0.86rem; margin: 0; }}
+@media (max-width: 420px) {{
+  dialog.screen-modal.fs-live .modal-title {{ display: none; }}
+}}
+.modal-stage {{
+  flex: 1 1 0;
+  min-block-size: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  touch-action: pinch-zoom pan-x pan-y;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}}
 .modal-img {{
   display: block;
-  max-inline-size: 100%;
-  max-block-size: calc(90dvh - 3.6rem);
-  margin: 0 auto;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  cursor: pointer;
+}}
+.fs-exit-fab {{
+  position: fixed;
+  top: max(0.55rem, env(safe-area-inset-top, 0px));
+  right: max(0.55rem, env(safe-area-inset-right, 0px));
+  z-index: 5;
+  opacity: 0.82;
+}}
+dialog.screen-modal.fs-live:not(.hud-hidden) .fs-exit-fab {{
+  display: none;
 }}
 </style>
 </head>
@@ -1262,7 +1410,6 @@ dialog.screen-modal::backdrop {{
       </div>
       <div class="meta-line mono">
         <span class="status-unit"><span id="dot" class="pip"></span><span id="modelText">connecting...</span></span>
-        <span id="progressText"></span>
       </div>
     </div>
   </header>
@@ -1293,6 +1440,7 @@ dialog.screen-modal::backdrop {{
         </div>
         <div class="settings-foot">
           <label class="toggle-label"><input type="checkbox" id="autoModeChk"> Auto mode (hands-free, reviewed)</label>
+          <label class="toggle-label"><input type="checkbox" id="alertsChk"> Alerts</label>
         </div>
       </div>
     </div>
@@ -1302,13 +1450,12 @@ dialog.screen-modal::backdrop {{
     <div class="sheet-w">
       <div class="screen-bar">
         <button type="button" class="btn sm" id="refreshScreenBtn">Refresh</button>
-        <label class="toggle-label"><input type="checkbox" id="autoScreenChk"> Auto</label>
-        <button type="button" class="btn sm" id="minScreenBtn" aria-expanded="true">Minimize</button>
-        <button type="button" class="btn sm" id="expandScreenBtn">Expand</button>
-        <span id="screenMeta" class="screen-meta mono">Not loaded</span>
+        <label class="toggle-label"><input type="checkbox" id="autoScreenChk"> Live</label>
+        <button type="button" class="btn sm" id="minScreenBtn" aria-expanded="true">Hide</button>
+        <button type="button" class="btn sm primary" id="expandScreenBtn">Fullscreen</button>
       </div>
       <details class="screen-opts">
-        <summary class="mono">Display options</summary>
+        <summary class="mono"><span>Display options</span><span id="screenMeta" class="screen-meta mono">Not loaded</span></summary>
         <div class="screen-opts-row">
           <select id="monitorSelect" class="select-sm" aria-label="Display" hidden></select>
           <select id="screenFmtSelect" class="select-sm" aria-label="Image format">
@@ -1316,8 +1463,10 @@ dialog.screen-modal::backdrop {{
             <option value="png">Sharp PNG</option>
           </select>
           <select id="screenInterval" class="select-sm" aria-label="Auto refresh interval">
-            <option value="1000">1s</option>
-            <option value="3000" selected>3s</option>
+            <option value="500">0.5s</option>
+            <option value="1000" selected>1s</option>
+            <option value="2000">2s</option>
+            <option value="3000">3s</option>
             <option value="5000">5s</option>
           </select>
         </div>
@@ -1329,6 +1478,13 @@ dialog.screen-modal::backdrop {{
       </div>
     </div>
   </section>
+
+  <div id="repairBanner" class="repair-banner" hidden>
+    <div class="sheet-w repair-row">
+      <span>Session expired (token rotated or signed out).</span>
+      <button type="button" class="btn sm primary" id="repairBtn">Pair again</button>
+    </div>
+  </div>
 </div>
 
 <div class="pane-wrap">
@@ -1359,18 +1515,28 @@ dialog.screen-modal::backdrop {{
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
 
-<dialog id="screenModal" class="screen-modal" closedby="any" aria-labelledby="screenModalTitle">
+<dialog id="screenModal" class="screen-modal fs-live" closedby="any" aria-labelledby="screenModalTitle">
   <div class="modal-head">
-    <h2 id="screenModalTitle" class="modal-title">PC Screen</h2>
+    <h2 id="screenModalTitle" class="modal-title">Live Screen</h2>
     <div class="modal-tools">
       <select id="modalMonitorSelect" class="select-sm" aria-label="Fullscreen display" hidden></select>
+      <select id="modalIntervalSelect" class="select-sm" aria-label="Live refresh interval">
+        <option value="500">0.5s</option>
+        <option value="1000" selected>1s</option>
+        <option value="2000">2s</option>
+        <option value="3000">3s</option>
+        <option value="5000">5s</option>
+      </select>
       <button type="button" class="btn sm" id="modalRefreshBtn">Refresh</button>
-      <label class="toggle-label"><input type="checkbox" id="modalAutoChk"> Auto</label>
+      <label class="toggle-label"><input type="checkbox" id="modalAutoChk"> Live</label>
       <span id="modalMeta" class="screen-meta mono"></span>
-      <button type="button" class="btn sm" id="closeModalBtn">Minimize</button>
+      <button type="button" class="btn sm primary" id="closeModalBtn">Exit</button>
     </div>
   </div>
-  <img id="modalImg" class="modal-img" alt="Expanded PC Screen">
+  <button type="button" class="btn sm fs-exit-fab" id="fsExitFab">Exit</button>
+  <div class="modal-stage" id="modalStage">
+    <img id="modalImg" class="modal-img" alt="Expanded PC Screen">
+  </div>
 </dialog>
 
 <dialog id="chatsModal" class="screen-modal" closedby="any" aria-labelledby="chatsModalTitle">
@@ -1383,6 +1549,13 @@ dialog.screen-modal::backdrop {{
 
 <footer class="composer-wrap">
   <div class="sheet-w">
+    <div id="queueBar" class="queue-bar" hidden>
+      <span id="queueLabel" class="mono"></span>
+      <div class="queue-actions">
+        <button type="button" class="btn xs" id="queueRetryBtn">Retry</button>
+        <button type="button" class="btn xs" id="queueCancelBtn">Cancel</button>
+      </div>
+    </div>
     <div id="attachStrip" class="attach-strip" hidden></div>
     <form id="sendForm" class="composer">
       <input id="fileInput" type="file" class="visually-hidden" multiple accept="image/*,.txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.csv,.tsv,.yaml,.yml,.toml,.ini,.cfg,.log,.html,.css,.xml,.svg,.sql,.sh,.ps1,.bat,.pdf,.docx,.xlsx,.pptx">
@@ -1405,7 +1578,6 @@ dialog.screen-modal::backdrop {{
   const csrf = document.querySelector('meta[name="csrf-token"]').content;
   const dot = document.getElementById('dot');
   const modelText = document.getElementById('modelText');
-  const progressText = document.getElementById('progressText');
   const targetPhoneBtn = document.getElementById('targetPhoneBtn');
   const targetLaptopBtn = document.getElementById('targetLaptopBtn');
   const phoneBadge = document.getElementById('phoneBadge');
@@ -1438,11 +1610,14 @@ dialog.screen-modal::backdrop {{
   const screenImg = document.getElementById('screenImg');
   const screenModal = document.getElementById('screenModal');
   const modalMonitorSelect = document.getElementById('modalMonitorSelect');
+  const modalIntervalSelect = document.getElementById('modalIntervalSelect');
   const modalRefreshBtn = document.getElementById('modalRefreshBtn');
   const modalAutoChk = document.getElementById('modalAutoChk');
   const modalMeta = document.getElementById('modalMeta');
+  const modalStage = document.getElementById('modalStage');
   const modalImg = document.getElementById('modalImg');
   const closeModalBtn = document.getElementById('closeModalBtn');
+  const fsExitFab = document.getElementById('fsExitFab');
   const newBtn = document.getElementById('newBtn');
   const stopBtn = document.getElementById('stopBtn');
   const chatPane = document.getElementById('chatPane');
@@ -1468,6 +1643,13 @@ dialog.screen-modal::backdrop {{
   const sendForm = document.getElementById('sendForm');
   const draft = document.getElementById('draft');
   const sendBtn = document.getElementById('sendBtn');
+  const alertsChk = document.getElementById('alertsChk');
+  const repairBanner = document.getElementById('repairBanner');
+  const repairBtn = document.getElementById('repairBtn');
+  const queueBar = document.getElementById('queueBar');
+  const queueLabel = document.getElementById('queueLabel');
+  const queueRetryBtn = document.getElementById('queueRetryBtn');
+  const queueCancelBtn = document.getElementById('queueCancelBtn');
 
   let lastHeaderKey = '';
   let lastTarget = '';
@@ -1495,7 +1677,62 @@ dialog.screen-modal::backdrop {{
   let pendingTarget = null;
   let userTouching = false;
   let disconnectTimer = null;
+  let sessionExpired = false;
+  let unreadDone = false;
+  let wasBusy = null;
+  let prevApprovalsCount = 0;
+  let pendingQueue = [];
+  let flushingQueue = false;
+  let alertsEnabled = false;
+  try {{ alertsEnabled = localStorage.getItem('pd_alerts') === '1'; }} catch (_e) {{}}
+  alertsChk.checked = alertsEnabled;
   const openAgents = new Set();
+
+  function saveDraft() {{
+    try {{
+      if (draft.value) sessionStorage.setItem('pd_draft', draft.value);
+      else sessionStorage.removeItem('pd_draft');
+    }} catch (_e) {{}}
+  }}
+
+  function handleUnauthorized() {{
+    if (sessionExpired) return;
+    sessionExpired = true;
+    saveDraft();
+    clearTimeout(sseTimer);
+    if (disconnectTimer) {{ clearTimeout(disconnectTimer); disconnectTimer = null; }}
+    if (es) {{
+      try {{ es.close(); }} catch (_e) {{}}
+      es = null;
+    }}
+    dot.className = 'pip off';
+    modelText.textContent = 'session expired';
+    repairBanner.hidden = false;
+  }}
+
+  function syncTitle(busy, approvalCount) {{
+    if (approvalCount > 0) {{
+      document.title = '(' + approvalCount + '!) Paperduck';
+    }} else if (unreadDone) {{
+      document.title = '(Done) Paperduck';
+    }} else if (busy) {{
+      document.title = '[*] Paperduck';
+    }} else {{
+      document.title = 'Paperduck';
+    }}
+  }}
+
+  function notifyUser(title, body) {{
+    try {{
+      if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+    }} catch (_e) {{}}
+    if (!alertsEnabled || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    if (!document.hidden) return;
+    try {{
+      const n = new Notification(title, {{ body: body || '', tag: 'paperduck-remote' }});
+      setTimeout(() => {{ try {{ n.close(); }} catch (_e) {{}} }}, 8000);
+    }} catch (_e) {{}}
+  }}
 
   function showToast(text) {{
     toastEl.textContent = text;
@@ -1643,11 +1880,16 @@ dialog.screen-modal::backdrop {{
       headers: {{ 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }},
       body: JSON.stringify(payload || {{}}),
     }});
-    if (res.status === 401) {{ window.location.reload(); return null; }}
+    if (res.status === 401) {{
+      handleUnauthorized();
+      return {{ ok: false, status: 401, error: 'Session expired' }};
+    }}
     try {{
-      return await res.json();
+      const data = await res.json();
+      if (data && typeof data === 'object' && data.status === undefined) data.status = res.status;
+      return data;
     }} catch (_e) {{
-      return {{ ok: false, error: 'HTTP ' + res.status }};
+      return {{ ok: false, status: res.status, error: 'HTTP ' + res.status }};
     }}
   }}
 
@@ -1951,6 +2193,8 @@ dialog.screen-modal::backdrop {{
       lastHistoryKey = '';
       lastStreamKey = '';
       lastApprovalsKey = '';
+      wasBusy = null;
+      prevApprovalsCount = (s.approvals || []).length;
       resetNewConfirm();
     }}
     lastTarget = curTarget;
@@ -1976,19 +2220,19 @@ dialog.screen-modal::backdrop {{
     const headerKey = JSON.stringify([curTarget, s.busy, s.model_name || s.model, s.thinking, s.screen_thinking || '', s.auto_mode, s.progress]);
     if (headerKey !== lastHeaderKey) {{
       lastHeaderKey = headerKey;
+      if (s.busy) shouldScroll = true;
       dot.className = 'pip' + (s.busy ? ' busy' : '');
       const shownModel = s.model_name || s.model || 'no model';
       const thinkTag = (s.thinking && s.thinking !== 'off') ? ' · ' + s.thinking : '';
       const screenTag = s.screen_thinking ? ' · scr ' + s.screen_thinking : '';
       modelText.textContent = shownModel + thinkTag + screenTag + (s.auto_mode ? ' · auto' : '');
-      progressText.textContent = s.busy ? (s.progress || 'working') : '';
       newBtn.hidden = !!s.busy;
       stopBtn.hidden = !s.busy;
       newBtn.disabled = !!s.busy;
       if (s.busy && newConfirmArmed) resetNewConfirm();
       if (!sending) sendBtn.textContent = s.busy ? 'Steer' : 'Send';
       streamStatus.hidden = !s.busy;
-      streamLabel.textContent = s.progress || 'Working...';
+      streamLabel.textContent = s.progress || 'Thinking...';
     }}
 
     const settingsKey = JSON.stringify([curTarget, s.models || [], s.model, s.thinking_levels || [], s.thinking, s.screen_thinking || '', s.supports_screen_thinking !== false, !!s.auto_mode, !!s.ready]);
@@ -2061,6 +2305,7 @@ dialog.screen-modal::backdrop {{
     const agentsKey = JSON.stringify(agents);
     if (agentsKey !== lastAgentsKey) {{
       lastAgentsKey = agentsKey;
+      shouldScroll = true;
       agentsBox.hidden = agents.length === 0;
       agentsList.textContent = '';
       for (const ag of agents) {{
@@ -2105,6 +2350,7 @@ dialog.screen-modal::backdrop {{
     const tasksKey = JSON.stringify(tasks);
     if (tasksKey !== lastTasksKey) {{
       lastTasksKey = tasksKey;
+      shouldScroll = true;
       tasksBox.hidden = tasks.length === 0;
       tasksList.textContent = '';
       for (const [label, status] of tasks) {{
@@ -2124,6 +2370,7 @@ dialog.screen-modal::backdrop {{
     const procsKey = JSON.stringify(procs);
     if (procsKey !== lastProcsKey) {{
       lastProcsKey = procsKey;
+      shouldScroll = true;
       procsBox.hidden = procs.length === 0;
       procsList.textContent = '';
       for (const [name, cmd] of procs) {{
@@ -2204,6 +2451,17 @@ dialog.screen-modal::backdrop {{
     emptyNote.hidden = history.length > 0 || !!stream || !!s.busy || !!s.error;
 
     const approvals = s.approvals || [];
+    if (wasBusy === true && !s.busy && document.hidden) {{
+      unreadDone = true;
+      notifyUser('Paperduck finished', 'Reply is ready.');
+    }}
+    if (approvals.length > prevApprovalsCount) {{
+      notifyUser('Paperduck needs approval', (approvals[0] && approvals[0].title) || 'Tap Allow or Deny.');
+    }}
+    wasBusy = !!s.busy;
+    prevApprovalsCount = approvals.length;
+    syncTitle(!!s.busy, approvals.length);
+
     const approvalsKey = JSON.stringify(approvals);
     if (approvalsKey !== lastApprovalsKey) {{
       lastApprovalsKey = approvalsKey;
@@ -2227,8 +2485,54 @@ dialog.screen-modal::backdrop {{
           card.appendChild(intro);
         }}
         if (ap.detail) {{
+          const lines = String(ap.detail).split(/\\r?\\n/);
+          const isDiff = lines.some((ln) => ln.startsWith('@@ ') || ln.startsWith('diff --git '))
+            || (lines.some((ln) => ln.startsWith('+') && !ln.startsWith('+++')) && lines.some((ln) => ln.startsWith('-') && !ln.startsWith('---')));
+          const isLong = lines.length > 10 || ap.detail.length > 400;
+          const isWide = isDiff || lines.some((ln) => ln.length > 52);
           const pre = document.createElement('pre');
-          pre.textContent = ap.detail;
+          if (isLong) pre.classList.add('collapsed');
+          if (isDiff) pre.classList.add('nowrap');
+          if (isDiff) {{
+            for (const ln of lines) {{
+              const span = document.createElement('span');
+              span.className = 'diff-line';
+              if (ln.startsWith('@@') || ln.startsWith('diff ') || ln.startsWith('+++') || ln.startsWith('---')) span.classList.add('diff-hdr');
+              else if (ln.startsWith('+')) span.classList.add('diff-add');
+              else if (ln.startsWith('-')) span.classList.add('diff-del');
+              span.textContent = ln;
+              pre.appendChild(span);
+            }}
+          }} else {{
+            pre.textContent = ap.detail;
+          }}
+          if (isLong || isWide) {{
+            const bar = document.createElement('div');
+            bar.className = 'approval-detail-bar';
+            if (isWide) {{
+              const wrapBtn = document.createElement('button');
+              wrapBtn.type = 'button';
+              wrapBtn.className = 'btn xs';
+              wrapBtn.textContent = pre.classList.contains('nowrap') ? 'Wrap' : 'Scroll';
+              wrapBtn.addEventListener('click', () => {{
+                const nowrap = pre.classList.toggle('nowrap');
+                wrapBtn.textContent = nowrap ? 'Wrap' : 'Scroll';
+              }});
+              bar.appendChild(wrapBtn);
+            }}
+            if (isLong) {{
+              const expBtn = document.createElement('button');
+              expBtn.type = 'button';
+              expBtn.className = 'btn xs';
+              expBtn.textContent = 'Expand (' + lines.length + ' lines)';
+              expBtn.addEventListener('click', () => {{
+                const col = pre.classList.toggle('collapsed');
+                expBtn.textContent = col ? ('Expand (' + lines.length + ' lines)') : 'Collapse';
+              }});
+              bar.appendChild(expBtn);
+            }}
+            card.appendChild(bar);
+          }}
           card.appendChild(pre);
         }}
         const acts = document.createElement('div');
@@ -2270,15 +2574,24 @@ dialog.screen-modal::backdrop {{
 
     if (!userTouching && atBottom && shouldScroll) {{
       chatPane.scrollTop = chatPane.scrollHeight;
+      requestAnimationFrame(() => {{
+        if (!userTouching) chatPane.scrollTop = chatPane.scrollHeight;
+        syncJumpButton();
+      }});
+    }} else {{
+      syncJumpButton();
     }}
-    syncJumpButton();
   }}
 
   async function refreshState() {{
     try {{
       const res = await fetch('/api/state', {{ credentials: 'same-origin' }});
-      if (res.status === 401) {{ window.location.reload(); return; }}
-      if (res.ok) renderState(await res.json());
+      if (res.status === 401) {{ handleUnauthorized(); return; }}
+      if (res.ok) {{
+        sessionExpired = false;
+        repairBanner.hidden = true;
+        renderState(await res.json());
+      }}
     }} catch (_e) {{}}
   }}
 
@@ -2287,16 +2600,39 @@ dialog.screen-modal::backdrop {{
     modalMeta.textContent = text;
   }}
 
+  let prevAutoBeforeFs = null;
+  let pendingScreenReload = false;
+
+  function screenVisible() {{
+    return !document.hidden && ((screenOpen && !screenMinimized) || screenModal.open);
+  }}
+
+  function scheduleNextScreen() {{
+    if (screenTimer) {{ clearTimeout(screenTimer); screenTimer = null; }}
+    const liveOn = screenModal.open ? modalAutoChk.checked : autoScreenChk.checked;
+    if (screenVisible() && liveOn && !sessionExpired) {{
+      const ms = Math.max(400, Number(screenInterval.value) || 1000);
+      screenTimer = setTimeout(loadScreen, ms);
+    }}
+  }}
+
   async function loadScreen() {{
-    if (loadingScreen) return;
+    if (sessionExpired) return;
+    if (loadingScreen) {{
+      pendingScreenReload = true;
+      return;
+    }}
     loadingScreen = true;
+    pendingScreenReload = false;
     if (!screenImg.src) setScreenStatus('Capturing...');
     const fmt = screenFmtSelect.value || 'jpeg';
+    const maxW = screenModal.open ? 1600 : 1280;
+    const q = screenModal.open ? 82 : 76;
     try {{
-      const urlPath = '/api/screen?max_w=1280&monitor=' + encodeURIComponent(selectedMonitor)
-        + '&fmt=' + encodeURIComponent(fmt) + '&q=78&t=' + Date.now();
+      const urlPath = '/api/screen?max_w=' + maxW + '&monitor=' + encodeURIComponent(selectedMonitor)
+        + '&fmt=' + encodeURIComponent(fmt) + '&q=' + q + '&t=' + Date.now();
       const res = await fetch(urlPath, {{ credentials: 'same-origin' }});
-      if (res.status === 401) {{ window.location.reload(); return; }}
+      if (res.status === 401) {{ handleUnauthorized(); return; }}
       if (!res.ok) {{
         let msg = 'Unavailable';
         try {{ msg = (await res.json()).error || msg; }} catch (_e) {{}}
@@ -2312,46 +2648,55 @@ dialog.screen-modal::backdrop {{
       screenImg.hidden = false;
       if (screenModal.open) modalImg.src = url;
       if (prev) URL.revokeObjectURL(prev);
-      setScreenStatus(screenMinimized && !screenModal.open ? 'Minimized' : new Date().toLocaleTimeString());
+      setScreenStatus(screenMinimized && !screenModal.open ? 'Hidden' : new Date().toLocaleTimeString());
     }} catch (_e) {{
       setScreenStatus('Capture failed');
     }} finally {{
       loadingScreen = false;
+      if (pendingScreenReload && screenVisible()) {{
+        pendingScreenReload = false;
+        loadScreen();
+      }} else {{
+        pendingScreenReload = false;
+        scheduleNextScreen();
+      }}
     }}
   }}
 
   function syncScreenTimer() {{
-    if (screenTimer) {{ clearInterval(screenTimer); screenTimer = null; }}
-    modalAutoChk.checked = autoScreenChk.checked;
-    const visible = (screenOpen && !screenMinimized) || screenModal.open;
-    if (visible && autoScreenChk.checked) {{
-      const ms = Math.max(1000, Number(screenInterval.value) || 3000);
-      screenTimer = setInterval(loadScreen, ms);
-    }}
+    if (!screenModal.open) modalAutoChk.checked = autoScreenChk.checked;
+    modalIntervalSelect.value = screenInterval.value;
+    scheduleNextScreen();
   }}
 
   function syncScreenView() {{
     screenBody.hidden = screenMinimized;
-    minScreenBtn.textContent = screenMinimized ? 'Expand' : 'Minimize';
+    minScreenBtn.textContent = screenMinimized ? 'Show' : 'Hide';
     minScreenBtn.setAttribute('aria-expanded', String(!screenMinimized));
-    setScreenStatus(screenMinimized && !screenModal.open ? 'Minimized' : (screenImg.src ? new Date().toLocaleTimeString() : 'Not loaded'));
+    setScreenStatus(screenMinimized && !screenModal.open ? 'Hidden' : (screenImg.src ? new Date().toLocaleTimeString() : 'Not loaded'));
     syncScreenTimer();
   }}
 
-  function openFullscreenScreen() {{
-    if (!screenImg.src) {{
-      loadScreen().then(() => {{
-        if (screenImg.src && !screenModal.open) {{
-          modalImg.src = screenImg.src;
-          screenModal.showModal();
-          syncScreenTimer();
-        }}
-      }});
-      return;
+  async function openFullscreenScreen() {{
+    if (prevAutoBeforeFs === null) prevAutoBeforeFs = autoScreenChk.checked;
+    modalAutoChk.checked = true;
+    autoScreenChk.checked = true;
+    modalIntervalSelect.value = screenInterval.value;
+    screenModal.classList.remove('hud-hidden');
+    if (screenImg.src) modalImg.src = screenImg.src;
+    if (!screenModal.open) screenModal.showModal();
+    if (screenModal.requestFullscreen) {{
+      try {{ await screenModal.requestFullscreen(); }} catch (_e) {{}}
     }}
-    modalImg.src = screenImg.src;
-    screenModal.showModal();
+    loadScreen();
     syncScreenTimer();
+  }}
+
+  function closeFullscreenScreen() {{
+    if (document.fullscreenElement === screenModal && document.exitFullscreen) {{
+      try {{ document.exitFullscreen(); }} catch (_e) {{}}
+    }}
+    if (screenModal.open) screenModal.close();
   }}
 
   function setMonitor(idx) {{
@@ -2369,7 +2714,8 @@ dialog.screen-modal::backdrop {{
   }}
 
   async function applySettings(patch) {{
-    const out = await apiPost('/api/settings', patch);
+    const body = Object.assign({{ target: lastTarget || 'phone' }}, patch);
+    const out = await apiPost('/api/settings', body);
     if (!out || !out.ok) {{
       showToast((out && (out.message || out.error)) || 'Update failed');
       lastSettingsKey = '';
@@ -2514,6 +2860,20 @@ dialog.screen-modal::backdrop {{
   thinkingSelect.addEventListener('change', () => applySettings({{ thinking: thinkingSelect.value }}));
   screenThinkingSelect.addEventListener('change', () => applySettings({{ screen_thinking: screenThinkingSelect.value }}));
   autoModeChk.addEventListener('change', () => applySettings({{ auto: autoModeChk.checked }}));
+  alertsChk.addEventListener('change', async () => {{
+    alertsEnabled = alertsChk.checked;
+    try {{ localStorage.setItem('pd_alerts', alertsEnabled ? '1' : '0'); }} catch (_e) {{}}
+    if (alertsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'default') {{
+      try {{
+        const perm = await Notification.requestPermission();
+        if (perm === 'denied') showToast('Notifications blocked in browser settings');
+      }} catch (_e) {{}}
+    }}
+  }});
+  repairBtn.addEventListener('click', () => {{
+    saveDraft();
+    window.location.reload();
+  }});
   refreshModelsBtn.addEventListener('click', async () => {{
     refreshModelsBtn.disabled = true;
     const out = await apiPost('/api/models/refresh', {{}});
@@ -2536,7 +2896,14 @@ dialog.screen-modal::backdrop {{
   monitorSelect.addEventListener('change', () => setMonitor(monitorSelect.value));
   modalMonitorSelect.addEventListener('change', () => setMonitor(modalMonitorSelect.value));
   screenFmtSelect.addEventListener('change', loadScreen);
-  screenInterval.addEventListener('change', syncScreenTimer);
+  screenInterval.addEventListener('change', () => {{
+    modalIntervalSelect.value = screenInterval.value;
+    syncScreenTimer();
+  }});
+  modalIntervalSelect.addEventListener('change', () => {{
+    screenInterval.value = modalIntervalSelect.value;
+    syncScreenTimer();
+  }});
   refreshScreenBtn.addEventListener('click', () => {{
     if (screenMinimized) {{
       screenMinimized = false;
@@ -2545,7 +2912,10 @@ dialog.screen-modal::backdrop {{
     loadScreen();
   }});
   modalRefreshBtn.addEventListener('click', loadScreen);
-  autoScreenChk.addEventListener('change', syncScreenTimer);
+  autoScreenChk.addEventListener('change', () => {{
+    modalAutoChk.checked = autoScreenChk.checked;
+    syncScreenTimer();
+  }});
   modalAutoChk.addEventListener('change', () => {{
     autoScreenChk.checked = modalAutoChk.checked;
     syncScreenTimer();
@@ -2557,8 +2927,21 @@ dialog.screen-modal::backdrop {{
   }});
   expandScreenBtn.addEventListener('click', openFullscreenScreen);
   screenImg.addEventListener('click', openFullscreenScreen);
-  closeModalBtn.addEventListener('click', () => screenModal.close());
-  screenModal.addEventListener('close', syncScreenTimer);
+  modalImg.addEventListener('click', () => screenModal.classList.toggle('hud-hidden'));
+  closeModalBtn.addEventListener('click', closeFullscreenScreen);
+  fsExitFab.addEventListener('click', closeFullscreenScreen);
+  screenModal.addEventListener('close', () => {{
+    if (document.fullscreenElement === screenModal && document.exitFullscreen) {{
+      try {{ document.exitFullscreen(); }} catch (_e) {{}}
+    }}
+    if (prevAutoBeforeFs !== null) {{
+      autoScreenChk.checked = prevAutoBeforeFs;
+      modalAutoChk.checked = prevAutoBeforeFs;
+      prevAutoBeforeFs = null;
+    }}
+    screenModal.classList.remove('hud-hidden');
+    syncScreenTimer();
+  }});
   for (const dlg of [screenModal, chatsModal]) {{
     if (!('closedBy' in HTMLDialogElement.prototype)) {{
       dlg.addEventListener('click', (event) => {{
@@ -2580,8 +2963,8 @@ dialog.screen-modal::backdrop {{
   }}
 
   stopBtn.addEventListener('click', async () => {{
-    await apiPost('/api/stop', {{}});
-    showToast('Stopped');
+    const out = await apiPost('/api/stop', {{}});
+    showToast((out && out.ok) ? 'Stopped' : ((out && (out.message || out.error)) || 'Stop failed'));
   }});
   newBtn.addEventListener('click', async () => {{
     if (hasHistory && !newConfirmArmed) {{
@@ -2640,7 +3023,17 @@ dialog.screen-modal::backdrop {{
       chatPane.scrollTop = savedTop;
     }}
   }}
-  draft.addEventListener('input', fitDraft);
+  draft.addEventListener('input', () => {{
+    fitDraft();
+    saveDraft();
+  }});
+  try {{
+    const savedDraft = sessionStorage.getItem('pd_draft');
+    if (savedDraft && !draft.value) {{
+      draft.value = savedDraft;
+      fitDraft();
+    }}
+  }} catch (_e) {{}}
   draft.addEventListener('keydown', (e) => {{
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{
       e.preventDefault();
@@ -2649,32 +3042,122 @@ dialog.screen-modal::backdrop {{
     }}
   }});
 
+  function syncQueueBar() {{
+    queueBar.hidden = pendingQueue.length === 0;
+    if (pendingQueue.length > 0) {{
+      const n = pendingQueue.length;
+      queueLabel.textContent = n + (n === 1 ? ' message queued' : ' messages queued')
+        + (navigator.onLine === false ? ' (offline)' : ' (waiting to retry)');
+    }}
+  }}
+
+  async function postMessageItem(item) {{
+    if (item.files && item.files.length) {{
+      const encoded = await Promise.all(item.files.map(async (f) => ({{
+        name: f.name,
+        mime: f.mime,
+        data_b64: await readFileBase64(f.file),
+      }})));
+      return await apiPost('/api/upload', {{ text: item.text, attachments: encoded }});
+    }}
+    return await apiPost('/api/send', {{ text: item.text }});
+  }}
+
+  async function flushQueue() {{
+    if (flushingQueue || !pendingQueue.length || sessionExpired || navigator.onLine === false) return;
+    flushingQueue = true;
+    queueRetryBtn.disabled = true;
+    try {{
+      while (pendingQueue.length && !sessionExpired) {{
+        const item = pendingQueue[0];
+        let out = null;
+        try {{
+          out = await postMessageItem(item);
+        }} catch (_e) {{
+          break;
+        }}
+        if (out && out.ok) {{
+          pendingQueue.shift();
+          for (const f of (item.files || [])) if (f.thumbUrl) URL.revokeObjectURL(f.thumbUrl);
+          syncQueueBar();
+          showToast(out.message === 'steered' ? 'Queued steering sent' : 'Queued message sent');
+          await refreshState();
+          chatPane.scrollTop = chatPane.scrollHeight;
+          syncJumpButton();
+        }} else if (out && out.status && out.status >= 400 && out.status < 500) {{
+          pendingQueue.shift();
+          if (out.status !== 401 && !draft.value && item.text) {{
+            draft.value = item.text;
+            fitDraft();
+            saveDraft();
+          }}
+          if (item.files && item.files.length && staged.length === 0) {{
+            staged = item.files;
+            renderChips();
+          }}
+          syncQueueBar();
+          showToast(out.message || out.error || 'Queued send rejected');
+          break;
+        }} else {{
+          break;
+        }}
+      }}
+    }} finally {{
+      flushingQueue = false;
+      queueRetryBtn.disabled = false;
+      syncQueueBar();
+    }}
+  }}
+
+  queueRetryBtn.addEventListener('click', () => flushQueue());
+  queueCancelBtn.addEventListener('click', () => {{
+    if (!pendingQueue.length) return;
+    const item = pendingQueue.shift();
+    if (item && item.text) {{
+      draft.value = draft.value ? (draft.value + '\\n' + item.text) : item.text;
+      fitDraft();
+      saveDraft();
+    }}
+    if (item && item.files && item.files.length) {{
+      for (const f of item.files) {{
+        if (staged.length < MAX_FILES) staged.push(f);
+        else if (f.thumbUrl) URL.revokeObjectURL(f.thumbUrl);
+      }}
+      renderChips();
+    }}
+    syncQueueBar();
+  }});
+
   sendForm.addEventListener('submit', async (e) => {{
     e.preventDefault();
     if (sending) return;
     const text = draft.value.trim();
     const files = staged.slice();
     if (!text && files.length === 0) return;
+    if (navigator.onLine === false) {{
+      draft.value = '';
+      fitDraft();
+      saveDraft();
+      clearStaged({{ revoke: false }});
+      pendingQueue.push({{ text, files }});
+      syncQueueBar();
+      showToast('Offline: queued to send on reconnect');
+      return;
+    }}
     sending = true;
     sendBtn.disabled = true;
     sendBtn.textContent = files.length ? 'Uploading...' : '...';
     draft.value = '';
     fitDraft();
+    saveDraft();
     clearStaged({{ revoke: false }});
     let out = null;
+    let netErr = false;
     try {{
-      if (files.length) {{
-        const encoded = await Promise.all(files.map(async (f) => ({{
-          name: f.name,
-          mime: f.mime,
-          data_b64: await readFileBase64(f.file),
-        }})));
-        out = await apiPost('/api/upload', {{ text, attachments: encoded }});
-      }} else {{
-        out = await apiPost('/api/send', {{ text }});
-      }}
+      out = await postMessageItem({{ text, files }});
     }} catch (_e) {{
-      out = {{ ok: false, error: 'Upload failed' }};
+      netErr = true;
+      out = {{ ok: false, error: 'Network error' }};
     }} finally {{
       sending = false;
       sendBtn.disabled = false;
@@ -2688,9 +3171,16 @@ dialog.screen-modal::backdrop {{
       syncJumpButton();
       return;
     }}
+    if ((netErr || (out && out.status >= 500)) && !sessionExpired) {{
+      pendingQueue.push({{ text, files }});
+      syncQueueBar();
+      showToast('Connection lost: queued for retry');
+      return;
+    }}
     if (!draft.value && text) {{
       draft.value = text;
       fitDraft();
+      saveDraft();
     }}
     if (files.length && staged.length === 0) {{
       staged = files;
@@ -2703,14 +3193,36 @@ dialog.screen-modal::backdrop {{
   let es = null;
   let sseTimer = null;
   let retryMs = 1500;
+  let probingSession = false;
+
+  async function probeSession() {{
+    if (probingSession || sessionExpired) return;
+    probingSession = true;
+    try {{
+      const res = await fetch('/api/state', {{ credentials: 'same-origin' }});
+      if (res.status === 401) {{
+        handleUnauthorized();
+        return;
+      }}
+      if (res.ok) {{
+        sessionExpired = false;
+        repairBanner.hidden = true;
+        renderState(await res.json());
+      }}
+    }} catch (_e) {{}} finally {{
+      probingSession = false;
+    }}
+  }}
 
   function scheduleReconnect() {{
+    if (sessionExpired) return;
     clearTimeout(sseTimer);
     sseTimer = setTimeout(connectEvents, retryMs);
     retryMs = Math.min(6000, Math.round(retryMs * 1.5));
   }}
 
   function connectEvents() {{
+    if (sessionExpired) return;
     clearTimeout(sseTimer);
     if (es) {{
       try {{ es.close(); }} catch (_e) {{}}
@@ -2719,43 +3231,81 @@ dialog.screen-modal::backdrop {{
     es.addEventListener('state', (ev) => {{
       try {{
         retryMs = 1500;
+        sessionExpired = false;
+        repairBanner.hidden = true;
         if (disconnectTimer) {{ clearTimeout(disconnectTimer); disconnectTimer = null; }}
         renderState(JSON.parse(ev.data));
       }} catch (_e) {{}}
     }});
     es.onopen = () => {{
       retryMs = 1500;
+      sessionExpired = false;
+      repairBanner.hidden = true;
       if (disconnectTimer) {{ clearTimeout(disconnectTimer); disconnectTimer = null; }}
+      flushQueue();
     }};
     es.onerror = () => {{
-      if (!disconnectTimer) {{
+      if (!disconnectTimer && !sessionExpired) {{
         disconnectTimer = setTimeout(() => {{
           disconnectTimer = null;
+          if (sessionExpired) return;
           lastHeaderKey = '';
           dot.className = 'pip off';
           modelText.textContent = 'reconnecting...';
+          probeSession();
         }}, 1800);
       }}
       if (es && es.readyState === EventSource.CLOSED) {{
         es.close();
         es = null;
+        probeSession();
         scheduleReconnect();
       }}
     }};
   }}
 
-  document.addEventListener('visibilitychange', () => {{
-    if (document.visibilityState === 'visible') {{
-      lastHeaderKey = '';
-      refreshState();
-      if (!es || es.readyState === EventSource.CLOSED) connectEvents();
+  function syncViewportHeight() {{
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const atBottom = isNearBottom();
+    document.documentElement.style.setProperty('--app-h', Math.round(vv.height) + 'px');
+    if (window.scrollY) window.scrollTo(0, 0);
+    if (atBottom && !userTouching) {{
+      chatPane.scrollTop = chatPane.scrollHeight;
     }}
-  }});
-  window.addEventListener('online', () => {{
+    syncJumpButton();
+  }}
+  if (window.visualViewport) {{
+    window.visualViewport.addEventListener('resize', syncViewportHeight, {{ passive: true }});
+    window.visualViewport.addEventListener('scroll', syncViewportHeight, {{ passive: true }});
+    syncViewportHeight();
+  }}
+
+  function recoverConnection() {{
+    if (unreadDone) {{
+      unreadDone = false;
+      syncTitle(isBusy, prevApprovalsCount);
+    }}
     lastHeaderKey = '';
     refreshState();
-    if (!es || es.readyState === EventSource.CLOSED) connectEvents();
+    if (!sessionExpired && (!es || es.readyState === EventSource.CLOSED)) connectEvents();
+    flushQueue();
+    if (screenVisible() && (screenModal.open ? modalAutoChk.checked : autoScreenChk.checked)) {{
+      loadScreen();
+    }}
+  }}
+  document.addEventListener('visibilitychange', () => {{
+    if (document.visibilityState === 'visible') recoverConnection();
+    else if (screenTimer) {{ clearTimeout(screenTimer); screenTimer = null; }}
   }});
+  window.addEventListener('focus', () => {{
+    if (unreadDone) {{
+      unreadDone = false;
+      syncTitle(isBusy, prevApprovalsCount);
+    }}
+  }});
+  window.addEventListener('pageshow', recoverConnection);
+  window.addEventListener('online', recoverConnection);
 
   refreshState();
   connectEvents();
@@ -2926,9 +3476,14 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, data: dict[str, Any]) -> None:
         self._send_bytes(status, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
-    def _reject_cross_site(self, *, is_post: bool = False) -> bool:
+    def _reject_cross_site(self, *, is_post: bool = False, allow_navigate: bool = False) -> bool:
         site = (self.headers.get("Sec-Fetch-Site") or "").lower()
         if site == "cross-site":
+            if allow_navigate and not is_post:
+                mode = (self.headers.get("Sec-Fetch-Mode") or "").lower()
+                dest = (self.headers.get("Sec-Fetch-Dest") or "").lower()
+                if mode == "navigate" and dest in ("document", ""):
+                    return False
             if is_post:
                 self._drain_small_body()
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "cross-site request rejected"})
@@ -3019,7 +3574,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         bridge = self._bridge()
 
         if path == "/pair":
-            if self._reject_cross_site():
+            if self._reject_cross_site(allow_navigate=True):
                 return
             token = (parse_qs(parsed.query).get("t") or [""])[0]
             self._handle_pair(token, as_json=False)
@@ -3287,6 +3842,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             if not clean_payload:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "no settings supplied"})
                 return
+            if "target" in data:
+                if data["target"] not in ("phone", "laptop"):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid target"})
+                    return
+                clean_payload["target"] = data["target"]
             ok, msg = bridge.handlers.set_settings(clean_payload)
             self._send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, "message": msg})
             return

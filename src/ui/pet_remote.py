@@ -61,7 +61,7 @@ from src.ui.theme import (
 if TYPE_CHECKING:
     from src.ui.pet_window import PetWindow
 
-SCREEN_CACHE_S = 0.75
+SCREEN_CACHE_S = 0.35
 MAX_STAGED_UPLOADS = 40
 STAGED_UPLOAD_MAX_AGE_S = 24 * 3600
 
@@ -576,11 +576,13 @@ class RemoteController(QObject):
     def _sync_phone_plugin(self) -> None:
         laptop = self._win._state_machine.registry.get_plugin("ai")
         if isinstance(laptop, AiAssistPlugin):
+            base_changed = bool(self._phone_plugin.base_url and self._phone_plugin.base_url != laptop.base_url)
             self._phone_plugin.provider = laptop.provider
             self._phone_plugin.base_url = laptop.base_url
-            for key in ("model", "thinking", "screen_thinking", "auto"):
-                val = self._phone_overrides[key] if key in self._phone_overrides else getattr(laptop, key)
-                setattr(self._phone_plugin, key, val)
+            if self._phone_chat is None or base_changed:
+                for key in ("model", "thinking", "screen_thinking", "auto"):
+                    val = self._phone_overrides[key] if key in self._phone_overrides else getattr(laptop, key)
+                    setattr(self._phone_plugin, key, val)
 
     def _ensure_laptop_chat(self):
         chat = self._win._ai_chat
@@ -720,8 +722,11 @@ class RemoteController(QObject):
         return res if isinstance(res, tuple) else (False, "GUI unavailable")
 
     def _set_settings(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        req_target = payload.get("target")
+        target = req_target if req_target in ("phone", "laptop") else self._active_target
+
         def run(done: Callable[[Any], None]) -> None:
-            chat = self._active_chat()
+            chat = self._ensure_phone_chat() if target == "phone" else self._ensure_laptop_chat()
             if chat is None:
                 done((False, "AI chat unavailable"))
                 return
@@ -731,7 +736,7 @@ class RemoteController(QObject):
                 screen_thinking=payload.get("screen_thinking"),
                 auto=payload.get("auto"),
             )
-            if ok and self._active_target == "phone":
+            if ok and target == "phone":
                 for key in ("model", "thinking", "screen_thinking", "auto"):
                     if key in payload or key in self._phone_overrides:
                         self._phone_overrides[key] = getattr(self._phone_plugin, key)

@@ -72,6 +72,20 @@ def test_http_bridge_auth_csrf_headers_and_actions() -> None:
         cs_code, _, _ = _req(base + "/api/state", headers={"Sec-Fetch-Site": "cross-site", "Authorization": "Bearer sec_token_1234567890"})
         assert cs_code == 403
 
+        # Cross-site subresource/iframe /pair stays blocked, while top-level QR app navigation succeeds
+        cs_img, _, _ = _req(base + "/pair?t=sec_token_1234567890",
+                            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image"})
+        assert cs_img == 403
+        cs_iframe, _, _ = _req(base + "/pair?t=sec_token_1234567890",
+                               headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe"})
+        assert cs_iframe == 403
+        qr_jar = http.cookiejar.CookieJar()
+        qr_op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(qr_jar))
+        cs_nav, _, _ = _req(base + "/pair?t=sec_token_1234567890",
+                            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"},
+                            opener=qr_op)
+        assert cs_nav == 200
+
         # Wrong token fails; Bearer token accesses state, screen, send, approve, stop, new
         bad_code, _, _ = _req(base + "/api/state", headers={"Authorization": "Bearer wrong"})
         assert bad_code == 401
@@ -859,11 +873,50 @@ def test_mobile_html_new_controls_and_js_invariants() -> None:
         'class="screen-opts"',
         'name="mobile-web-app-capable"',
         'flex-wrap: wrap;',
+        'id="streamStatus"',
+        'id="alertsChk"',
+        'id="repairBanner"',
+        'id="repairBtn"',
+        'id="queueBar"',
+        'id="modalIntervalSelect"',
+        'id="modalStage"',
+        'id="fsExitFab"',
+        '[hidden] { display: none !important; }',
+        'fs-live',
+        'probeSession',
+        'approval-detail-bar',
+        'diff-add',
+        'flex-shrink: 0;',
+        'visualViewport',
+        "addEventListener('pageshow'",
+        'font-size: max(16px',
     ):
         assert req_id in doc
+    assert 'id="progressText"' not in doc
     assert "innerHTML" not in doc
     assert "\u2014" not in doc
     assert not re.search(r"<[a-zA-Z][^>]*\sstyle\s*=", doc)
+
+
+def test_desktop_stream_label_sizes_to_card_width_on_first_chunk() -> None:
+    from PyQt6.QtWidgets import QApplication
+    from src.ui.ai_chat import AiChat
+
+    _app = QApplication.instance() or QApplication([])
+    plugin = ai_assist.AiAssistPlugin()
+    plugin.base_url, plugin.model = "https://example.invalid/v1", "m1"
+    chat = AiChat(plugin)
+    try:
+        chat.show()
+        _app.processEvents()
+        chat._stream_text = "word " * 40
+        assert chat._sync_stream() is True
+        _app.processEvents()
+        assert chat._stream_label is not None
+        assert chat._stream_label.width() < 400
+        assert chat._stream_label.height() >= chat._stream_label.heightForWidth(chat._stream_label.width())
+    finally:
+        chat.close()
 
 
 def test_ai_chat_sync_signals_tool_details_agents_and_settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -1056,6 +1109,21 @@ def test_dedicated_phone_chat_isolation_and_deepseek_screen_guard(monkeypatch: p
         lap_snap = ctrl._get_state()
         assert lap_snap["target"] == "laptop" and lap_snap["history"][0]["text"] == "laptop msg"
         assert lap_snap["thinking"] == "high" and lap_snap["auto_mode"] is False
+
+        # Changing laptop thinking never overwrites an active phone chat, even if un-overridden,
+        # and explicit target routing keeps phone vs laptop settings strictly isolated.
+        ctrl3 = RemoteController(win, manage_tailscale=False, port=0)
+        try:
+            ph3 = ctrl3._ensure_phone_chat()
+            assert ph3._plugin.thinking == "high"
+            laptop._pick(thinking="off")
+            assert ctrl3._ensure_phone_chat()._plugin.thinking == "high"
+            ctrl3._set_target("laptop")
+            ok_t, _ = ctrl3._set_settings({"target": "phone", "thinking": "low"})
+            assert ok_t and ph3._plugin.thinking == "low" and ai_plugin.thinking == "off"
+        finally:
+            ctrl3.close()
+            laptop._pick(thinking="high")
 
         # DeepSeek off -> enabled screen_thinking guard prevents mid-answer 400
         seen_bodies: list[dict[str, Any]] = []
