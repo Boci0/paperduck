@@ -146,6 +146,29 @@ def test_http_bridge_auth_csrf_headers_and_actions() -> None:
         bridge.stop()
 
 
+def test_home_screen_install_assets_public_but_same_origin() -> None:
+    from src.ui.pet_remote import _touch_icon_png
+    icon = _touch_icon_png()
+    assert icon[1:4] == b"PNG"
+    bridge = PhoneBridge(_dummy_handlers({}, []), port=0, token="icon_tok_123456", manage_tailscale=False, icon_png=icon)
+    ok, base = bridge.start()
+    assert ok
+    try:
+        code, hdrs, body = _req(base + "/apple-touch-icon.png")
+        assert code == 200 and hdrs.get("content-type") == "image/png" and body == icon
+        code, hdrs, body = _req(base + "/manifest.webmanifest")
+        assert code == 200 and json.loads(body)["display"] == "standalone"
+        _, hdrs, html = _req(base + "/")
+        page = html.decode("utf-8")
+        assert "manifest-src 'self'" in hdrs.get("content-security-policy", "")
+        assert 'rel="apple-touch-icon"' in page and 'id="homeHint" hidden' in page
+        cs, _, _ = _req(base + "/apple-touch-icon.png", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "image"})
+        assert cs == 403
+        assert _req(base + "/api/state")[0] == 401
+    finally:
+        bridge.stop()
+
+
 def test_bridge_rate_limit_and_locked_screen_503() -> None:
     actions: list[tuple[str, Any]] = []
     bridge = PhoneBridge(_dummy_handlers({}, actions, screen_bytes=None), port=0, token="good_tok", manage_tailscale=False)

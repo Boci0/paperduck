@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.graphics.duck import render_icon
 from src.tools import computer
 from src.tools.ai_assist import THINKING_LEVELS, AiAssistPlugin, valid_model
 from src.tools.ai_tools import OFFICE_EXTS, _office_text, _pdf_text, scratch_dir
@@ -93,6 +94,16 @@ def _encode_image(image: Any, max_w: int, fmt: str = "png", quality: int = 78) -
 def _encode_png(image: Any, max_w: int) -> bytes | None:
     data, _mime = _encode_image(image, max_w, fmt="png")
     return data
+
+
+def _touch_icon_png() -> bytes:
+    """180px Home Screen icon: iOS paints transparency black and rounds the corners, so duck sits on paper with margin."""
+    image = QImage(180, 180, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor("#f4f0e7"))
+    painter = QPainter(image)
+    painter.drawImage(22, 22, render_icon(136))
+    painter.end()
+    return _encode_png(image, 180) or b""
 
 
 def _ordered_screens() -> list[Any]:
@@ -534,6 +545,7 @@ class RemoteController(QObject):
             ),
             port=port,
             manage_tailscale=manage_tailscale,
+            icon_png=_touch_icon_png(),
         )
 
     @property

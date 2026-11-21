@@ -259,6 +259,16 @@ def stop_tailscale_serve() -> None:
 # Mobile HTML UI (Paper-and-Ink palette, CSP nonces, zero innerHTML)
 # ---------------------------------------------------------------------------
 
+# Home Screen install: iOS reads apple-touch-icon, Android/Chrome read the manifest
+_INSTALL_LINKS = ('<link rel="apple-touch-icon" href="/apple-touch-icon.png">\n'
+                  '<link rel="manifest" href="/manifest.webmanifest">')
+_MANIFEST = json.dumps({
+    "name": "Paperduck", "short_name": "Paperduck", "start_url": "/", "scope": "/",
+    "display": "standalone", "background_color": "#f4f0e7", "theme_color": "#f4f0e7",
+    "icons": [{"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"}],
+}).encode("utf-8")
+
+
 def _app_html(nonce: str, csrf_token: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -269,6 +279,7 @@ def _app_html(nonce: str, csrf_token: str) -> str:
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Paperduck">
+{_INSTALL_LINKS}
 <meta name="csrf-token" content="{csrf_token}">
 <title>Paperduck</title>
 <style nonce="{nonce}">
@@ -3323,6 +3334,9 @@ def _login_html(nonce: str, error: str = "") -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Paperduck">
+{_INSTALL_LINKS}
 <title>Pair Paperduck</title>
 <style nonce="{nonce}">
 :root {{
@@ -3368,6 +3382,7 @@ input {{ border: 1px solid var(--line); background: var(--raised); color: var(--
 input:focus {{ outline: 2px solid var(--accent); outline-offset: -1px; }}
 button {{ border: none; background: var(--accent); color: var(--on-accent); font-weight: 700; cursor: pointer; }}
 .err {{ color: var(--danger); margin: 0; font-size: 0.86rem; font-weight: 600; }}
+.hint {{ margin: 0; padding: 0.55rem 0.7rem; border-radius: 6px; background: var(--raised); font-size: 0.84rem; line-height: 1.45; }}
 </style>
 </head>
 <body>
@@ -3381,6 +3396,7 @@ button {{ border: none; background: var(--accent); color: var(--on-accent); font
     <h1>Paperduck Remote</h1>
   </div>
   <p class="sub">Scan the QR code in Paperduck &gt; Phone Control, or paste your pairing token below.</p>
+  <p class="hint" id="homeHint" hidden>This Home Screen app keeps its own sign-in, separate from the browser. Scanning the QR code opens the browser instead, so copy the pairing token from Paperduck &gt; Phone Control and paste it here.</p>
   {err_html}
   <label for="tokenInput" class="visually-hidden">Pairing token</label>
   <input id="tokenInput" name="t" type="password" placeholder="Pairing token" autocomplete="current-password" required>
@@ -3389,6 +3405,9 @@ button {{ border: none; background: var(--accent); color: var(--on-accent); font
 <script nonce="{nonce}">
 const e = document.getElementById('errMsg');
 if (e) e.textContent = {json.dumps(error)};
+if (navigator.standalone || window.matchMedia('(display-mode: standalone)').matches) {{
+  document.getElementById('homeHint').hidden = false;
+}}
 </script>
 </body>
 </html>"""
@@ -3441,7 +3460,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self.send_header(
                 "Content-Security-Policy",
                 f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-                "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+                "img-src 'self' data: blob:; connect-src 'self'; manifest-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
             )
 
@@ -3594,6 +3613,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             return
 
         if self._reject_cross_site():
+            return
+        # Install assets hold nothing private and iOS may fetch them without the session cookie
+        if path == "/manifest.webmanifest":
+            self._send_bytes(HTTPStatus.OK, "application/manifest+json", _MANIFEST)
+            return
+        if path == "/apple-touch-icon.png" and bridge.icon_png:
+            self._send_bytes(HTTPStatus.OK, "image/png", bridge.icon_png)
             return
         ok, _csrf = self._auth_csrf()
         if not ok:
@@ -3933,8 +3959,9 @@ class PhoneBridge:
     """Lifecycle and auth manager for the local + Tailscale HTTP bridge."""
 
     def __init__(self, handlers: BridgeHandlers, *, port: int = DEFAULT_PORT,
-                 token: str | None = None, manage_tailscale: bool = True) -> None:
+                 token: str | None = None, manage_tailscale: bool = True, icon_png: bytes = b"") -> None:
         self.handlers = handlers
+        self.icon_png = icon_png
         self.preferred_port = port
         self._explicit_token = token
         self._token = token or ""
