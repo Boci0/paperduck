@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QCoreApplication, QMimeData, QObject, QRect, QStandardPaths, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QImage, QTextDocument
+from PyQt6.QtGui import QColor, QCursor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextDocument
 from PyQt6.QtWidgets import QFileDialog
 
 from src.tools import computer
@@ -302,6 +302,467 @@ def spot_changed(old: QImage, new: QImage, x: int, y: int) -> bool:
 
 
 FOLLOW_PX = 300  # how far up or down a moved target is looked for
+RULER_LEFT = 36
+RULER_TOP = 20
+MAX_SOM_BADGES = 120
+SOM_MAX_AREA_RATIO = 0.65
+MAX_SAMPLE_POINTS = 24
+MAX_PALETTE_SWATCHES = 12
+
+
+def changed_region(old: QImage, new: QImage, step: int = 2) -> tuple[int, int, int, int, int] | None:
+    """(x, y, w, h, pct) of pixels that changed between `old` and `new`, or (0, 0, 0, 0, 0) when unchanged (< 4 hits).
+    Returns None when either image is null or their sizes differ."""
+    if old.isNull() or new.isNull() or old.size() != new.size():
+        return None
+    a, b = old.convertToFormat(QImage.Format.Format_RGB32), new.convertToFormat(QImage.Format.Format_RGB32)
+    pa, pb = a.constBits(), b.constBits()
+    pa.setsize(a.sizeInBytes())
+    pb.setsize(b.sizeInBytes())
+    da, db, stride = bytes(pa), bytes(pb), a.bytesPerLine()
+    w, h = a.width(), a.height()
+    row_bytes = w * 4
+    min_x, min_y, max_x, max_y, hits = w, h, -1, -1, 0
+    for y in range(0, h, step):
+        i = y * stride
+        if da[i:i + row_bytes] == db[i:i + row_bytes]:
+            continue
+        for x in range(0, w, step):
+            j = i + 4 * x
+            if max(abs(da[j] - db[j]), abs(da[j + 1] - db[j + 1]), abs(da[j + 2] - db[j + 2])) > 24:
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
+                hits += 1
+    if hits < 4:
+        return (0, 0, 0, 0, 0)
+    bw = min(w, max_x + step) - min_x
+    bh = min(h, max_y + step) - min_y
+    total = max(1, ((w + step - 1) // step) * ((h + step - 1) // step))
+    return (min_x, min_y, bw, bh, round(hits * 100 / total))
+
+
+def diff_note(old: QImage, new: QImage) -> str:
+    """One-sentence post-action pixel-change summary for the model."""
+    res = changed_region(old, new)
+    if res is None:
+        return ""
+    x, y, w, h, pct = res
+    if w == 0:
+        return " Screen unchanged (0 pixels changed: target may have missed, lacked focus, or stayed in the same state)."
+    share = "<1%" if pct == 0 else f"~{pct}%"
+    return f" Screen changed in box {x},{y},{w}x{h} ({share} of screen)."
+
+
+def _ruler_step(span_px: int, out_px: int, min_gap: int) -> int:
+    scale = out_px / max(1, span_px)
+    for s in (25, 50, 100, 200, 250, 400, 500, 1000):
+        if s * scale >= min_gap:
+            return s
+    return 1000
+
+
+def render_screen_overlay(
+    image: QImage,
+    origin: tuple[int, int] = (0, 0),
+    items: dict[int, tuple[int, int, int, int, str]] | None = None,
+    ocr_ids: set[int] | None = None,
+    grid: bool = False,
+) -> QImage:
+    """Draw outer top/left true-screen-pixel coordinate rulers, optional coordinate grid lines, and optional
+    Set-of-Mark #id boxes/badges onto a copy of `image`, pre-scaled so total dimensions fit MAX_IMAGE_SIDE."""
+    from src.ui.chat_widgets import MAX_IMAGE_SIDE
+
+    max_w, max_h = MAX_IMAGE_SIDE - RULER_LEFT, MAX_IMAGE_SIDE - RULER_TOP
+    scaled = (image.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+              if image.width() > max_w or image.height() > max_h else image)
+    sx = scaled.width() / max(1, image.width())
+    sy = scaled.height() / max(1, image.height())
+    ox, oy = origin
+
+    canvas = QImage(scaled.width() + RULER_LEFT, scaled.height() + RULER_TOP, QImage.Format.Format_ARGB32)
+    canvas.fill(QColor("#1c212b"))
+    has_app = QGuiApplication.instance() is not None
+    painter = QPainter(canvas)
+    try:
+        painter.drawImage(RULER_LEFT, RULER_TOP, scaled)
+        sep_pen = QPen(QColor("#3c4657"), 1)
+        painter.setPen(sep_pen)
+        painter.drawLine(RULER_LEFT - 1, 0, RULER_LEFT - 1, canvas.height() - 1)
+        painter.drawLine(0, RULER_TOP - 1, canvas.width() - 1, RULER_TOP - 1)
+
+        font = None
+        if has_app:
+            font = QFont("Consolas", 8)
+            font.setStyleHint(QFont.StyleHint.Monospace)
+            painter.setFont(font)
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(QRect(2, 2, RULER_LEFT - 6, RULER_TOP - 4),
+                             Qt.AlignmentFlag.AlignCenter, "px")
+
+        minor_pen = QPen(QColor("#64748b"), 1)
+        major_pen = QPen(QColor("#cbd5e1"), 1)
+        grid_pen = QPen(QColor(0, 175, 230, 75), 1)
+        text_color = QColor("#f1f5f9")
+
+        # X ruler (top)
+        step_x = _ruler_step(image.width(), scaled.width(), 72)
+        minor_x = max(1, step_x // 2)
+        start_vx = (ox // minor_x) * minor_x
+        if start_vx < ox:
+            start_vx += minor_x
+        first_major_px: int | None = None
+        vx = start_vx
+        while vx < ox + image.width():
+            px = RULER_LEFT + round((vx - ox) * sx)
+            if RULER_LEFT <= px < canvas.width():
+                if vx % step_x == 0:
+                    if first_major_px is None:
+                        first_major_px = px
+                    painter.setPen(major_pen)
+                    painter.drawLine(px, RULER_TOP - 8, px, RULER_TOP - 1)
+                    if grid:
+                        painter.setPen(grid_pen)
+                        painter.drawLine(px, RULER_TOP, px, canvas.height() - 1)
+                    if has_app:
+                        painter.setPen(text_color)
+                        tx = min(px + 2, max(RULER_LEFT, canvas.width() - 34))
+                        painter.drawText(QRect(tx, 1, 34, RULER_TOP - 8),
+                                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, str(vx))
+                else:
+                    painter.setPen(minor_pen)
+                    painter.drawLine(px, RULER_TOP - 4, px, RULER_TOP - 1)
+            vx += minor_x
+        if has_app and (first_major_px is None or first_major_px > RULER_LEFT + 34):
+            painter.setPen(text_color)
+            painter.drawText(QRect(RULER_LEFT + 2, 1, 34, RULER_TOP - 8),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, str(ox))
+
+        # Y ruler (left)
+        step_y = _ruler_step(image.height(), scaled.height(), 56)
+        minor_y = max(1, step_y // 2)
+        start_vy = (oy // minor_y) * minor_y
+        if start_vy < oy:
+            start_vy += minor_y
+        first_major_py: int | None = None
+        vy = start_vy
+        while vy < oy + image.height():
+            py = RULER_TOP + round((vy - oy) * sy)
+            if RULER_TOP <= py < canvas.height():
+                if vy % step_y == 0:
+                    if first_major_py is None:
+                        first_major_py = py
+                    painter.setPen(major_pen)
+                    painter.drawLine(RULER_LEFT - 8, py, RULER_LEFT - 1, py)
+                    if grid:
+                        painter.setPen(grid_pen)
+                        painter.drawLine(RULER_LEFT, py, canvas.width() - 1, py)
+                    if has_app:
+                        painter.setPen(text_color)
+                        ty = max(RULER_TOP, min(py - 6, canvas.height() - 13))
+                        painter.drawText(QRect(0, ty, RULER_LEFT - 9, 12),
+                                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(vy))
+                else:
+                    painter.setPen(minor_pen)
+                    painter.drawLine(RULER_LEFT - 4, py, RULER_LEFT - 1, py)
+            vy += minor_y
+        if has_app and (first_major_py is None or first_major_py > RULER_TOP + 24):
+            painter.setPen(text_color)
+            painter.drawText(QRect(0, RULER_TOP + 1, RULER_LEFT - 9, 12),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(oy))
+
+        # Optional Set-of-Mark #id boxes and badges
+        if items:
+            vp = QRect(RULER_LEFT, RULER_TOP, scaled.width(), scaled.height())
+            painter.setClipRect(vp)
+            ocr_set = ocr_ids or set()
+            ordered = sorted(items.items(), key=lambda kv: (kv[0] in ocr_set, kv[0]))
+            placed: list[QRect] = []
+            badges = 0
+            vp_area = max(1, vp.width() * vp.height())
+            if has_app and font is not None:
+                badge_font = QFont(font)
+                badge_font.setPointSize(7)
+                badge_font.setBold(True)
+                painter.setFont(badge_font)
+
+            for n, (ix, iy, iw, ih, label) in ordered:
+                px = RULER_LEFT + round((ix - ox) * sx)
+                py = RULER_TOP + round((iy - oy) * sy)
+                pw = max(2, round(iw * sx))
+                ph = max(2, round(ih * sy))
+                box = QRect(px, py, pw, ph)
+                if box.intersected(vp).isEmpty() or pw * ph > SOM_MAX_AREA_RATIO * vp_area:
+                    continue
+                is_ocr = n in ocr_set
+                is_icon = not is_ocr and label == "(unlabeled)"
+                border_col = (QColor(245, 158, 11, 200) if is_ocr
+                              else QColor(192, 132, 252, 220) if is_icon
+                              else QColor(0, 180, 216, 215))
+                fill_col = (QColor(92, 45, 12, 235) if is_ocr
+                            else QColor(74, 29, 106, 235) if is_icon
+                            else QColor(11, 57, 84, 235))
+                painter.setPen(QPen(border_col, 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(px, py, pw - 1, ph - 1)
+
+                if badges < MAX_SOM_BADGES:
+                    tag = f"#{n}"
+                    bw = max(16, len(tag) * 5 + 5)
+                    bh = 11
+                    candidates = [
+                        QRect(px, py - bh, bw, bh),
+                        QRect(px, py, bw, bh),
+                        QRect(px + pw - bw, py - bh, bw, bh),
+                        QRect(px, py + ph, bw, bh),
+                    ]
+                    clamped = [
+                        QRect(
+                            max(vp.left(), min(c.x(), vp.right() - bw + 1)),
+                            max(vp.top(), min(c.y(), vp.bottom() - bh + 1)),
+                            bw,
+                            bh,
+                        )
+                        for c in candidates
+                    ]
+                    chosen = next((c for c in clamped if not any(c.intersects(p) for p in placed)), None)
+                    if chosen is not None:
+                        painter.setPen(QPen(border_col, 1))
+                        painter.setBrush(fill_col)
+                        painter.drawRoundedRect(chosen, 3, 3)
+                        if has_app:
+                            painter.setPen(QColor("#ffffff"))
+                            painter.drawText(chosen, Qt.AlignmentFlag.AlignCenter, tag)
+                        placed.append(chosen)
+                        badges += 1
+    finally:
+        painter.end()
+    return canvas
+
+
+def compose_side_by_side(before: QImage, after: QImage) -> QImage:
+    """Render `before` and `after` side-by-side with BEFORE / AFTER headers, scaled to fit MAX_IMAGE_SIDE."""
+    from src.ui.chat_widgets import MAX_IMAGE_SIDE
+
+    header_h, gap = 22, 4
+    max_panel_w = (MAX_IMAGE_SIDE - gap) // 2
+    max_panel_h = MAX_IMAGE_SIDE - header_h
+    before_s = (before.scaled(max_panel_w, max_panel_h, Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+                if before.width() > max_panel_w or before.height() > max_panel_h else before)
+    after_s = (after.scaled(before_s.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+               if after.size() != before_s.size() else after)
+    pw, ph = max(1, before_s.width()), max(1, before_s.height())
+    canvas = QImage(pw * 2 + gap, ph + header_h, QImage.Format.Format_ARGB32)
+    canvas.fill(QColor("#1c212b"))
+    has_app = QGuiApplication.instance() is not None
+    painter = QPainter(canvas)
+    try:
+        painter.drawImage(0, header_h, before_s)
+        painter.drawImage(pw + gap, header_h, after_s)
+        painter.setPen(QPen(QColor("#475569"), 1))
+        painter.drawLine(pw + gap // 2, 0, pw + gap // 2, canvas.height() - 1)
+        if has_app:
+            font = QFont("Consolas", 9)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#f1f5f9"))
+            painter.drawText(QRect(0, 0, pw, header_h), Qt.AlignmentFlag.AlignCenter, "BEFORE")
+            painter.drawText(QRect(pw + gap, 0, pw, header_h), Qt.AlignmentFlag.AlignCenter, "AFTER")
+    finally:
+        painter.end()
+    return canvas
+
+
+def analyze_colors(image: QImage, points: Any = None, region: Any = None, top: Any = 6) -> str:
+    """Sample exact #RRGGBB colors at `points` and/or dominant palette swatches inside `region`."""
+    if points is None and region is None:
+        return "error: give points, region, or both"
+    if isinstance(top, bool) or not isinstance(top, int) or not (1 <= top <= MAX_PALETTE_SWATCHES):
+        return f"error: top must be an integer from 1 to {MAX_PALETTE_SWATCHES}"
+
+    sections: list[str] = []
+    if points is not None:
+        if (not isinstance(points, list) or not (1 <= len(points) <= MAX_SAMPLE_POINTS)
+                or not all(isinstance(p, (list, tuple)) and len(p) == 2
+                           and not isinstance(p[0], bool) and not isinstance(p[1], bool)
+                           and isinstance(p[0], int) and isinstance(p[1], int) for p in points)):
+            return f"error: points must be 1 to {MAX_SAMPLE_POINTS} [x, y] pairs"
+        rgb_img = image.convertToFormat(QImage.Format.Format_RGB32)
+        bits = rgb_img.constBits()
+        bits.setsize(rgb_img.sizeInBytes())
+        data, stride = bytes(bits), rgb_img.bytesPerLine()
+        iw, ih = rgb_img.width(), rgb_img.height()
+        pt_lines = ["Point samples:"]
+        for x, y in points:
+            if not (0 <= x < iw and 0 <= y < ih):
+                pt_lines.append(f"- ({x}, {y}): off screen")
+                continue
+            j = y * stride + 4 * x
+            r, g, b = data[j + 2], data[j + 1], data[j]
+            sr = sg = sb = cnt = 0
+            for ny in range(max(0, y - 1), min(ih, y + 2)):
+                row = ny * stride
+                for nx in range(max(0, x - 1), min(iw, x + 2)):
+                    k = row + 4 * nx
+                    sr += data[k + 2]
+                    sg += data[k + 1]
+                    sb += data[k]
+                    cnt += 1
+            ar, ag, ab = round(sr / cnt), round(sg / cnt), round(sb / cnt)
+            luma = _luma(r, g, b)
+            tone = "dark" if luma < 0.18 else "mid" if luma < 0.65 else "light"
+            exact = f"#{r:02x}{g:02x}{b:02x}"
+            avg = f"#{ar:02x}{ag:02x}{ab:02x}"
+            extra = f"3x3 avg {avg}, " if avg != exact else ""
+            pt_lines.append(f"- ({x}, {y}): {exact} ({extra}luma {luma:.2f} {tone})")
+        sections.append("\n".join(pt_lines))
+
+    if region is not None:
+        if (not isinstance(region, list) or len(region) != 4
+                or any(isinstance(v, bool) or not isinstance(v, int) for v in region)):
+            return "error: region is [left, top, width, height] in screen pixels"
+        rect = QRect(*region).intersected(image.rect())
+        if rect.width() < 4 or rect.height() < 4:
+            return "error: the region is too small or off the screen"
+        data, stride, rw, rh = _rgb32_bytes(image, rect)
+        step = max(1, int(((rw * rh) / 4000) ** 0.5))
+        buckets: dict[tuple[int, int, int], list[int]] = {}
+        total = 0
+        for y in range(0, rh, step):
+            row = y * stride
+            for x in range(0, rw, step):
+                j = row + 4 * x
+                r, g, b = data[j + 2], data[j + 1], data[j]
+                key = (r >> 4, g >> 4, b >> 4)
+                acc = buckets.get(key)
+                if acc is None:
+                    buckets[key] = [1, r, g, b]
+                else:
+                    acc[0] += 1
+                    acc[1] += r
+                    acc[2] += g
+                    acc[3] += b
+                total += 1
+        ranked = sorted(buckets.values(), key=lambda v: v[0], reverse=True)[:top]
+        swatches = []
+        for cnt, sr, sg, sb in ranked:
+            mr, mg, mb = round(sr / cnt), round(sg / cnt), round(sb / cnt)
+            luma = _luma(mr, mg, mb)
+            swatches.append((f"#{mr:02x}{mg:02x}{mb:02x}", cnt * 100.0 / max(1, total), luma))
+        lumas = [s[2] for s in swatches]
+        min_l, max_l = min(lumas), max(lumas)
+        contrast = (max_l + 0.05) / (min_l + 0.05)
+        reg_lines = [
+            f"Region {rect.x()},{rect.y()},{rect.width()}x{rect.height()} palette "
+            f"({len(buckets)} tones, value range {min_l:.2f}-{max_l:.2f}, contrast {contrast:.1f}:1):"
+        ]
+        for hx, pct, luma in swatches:
+            reg_lines.append(f"- {hx} ({pct:.1f}%, luma {luma:.2f})")
+        sections.append("\n".join(reg_lines))
+
+    return "\n\n".join(sections)
+
+
+def detect_toolbar_icons(
+    image: QImage,
+    existing: list[tuple[int, int, int, int]],
+    max_icons: int = 40,
+) -> list[tuple[int, int, int, int]]:
+    """Fast edge/connected-component detector for unlabeled icons in toolbar strips (top 180px, left 120px,
+    or full image when <= 600x400). Returns (x, y, w, h) boxes not already covered by `existing`."""
+    iw, ih = image.width(), image.height()
+    if iw < 16 or ih < 16:
+        return []
+    strips = [(0, 0, iw, ih)] if iw * ih <= 600 * 400 else [
+        (0, 0, iw, min(ih, 180)),
+        (0, min(ih, 180), min(iw, 120), max(0, ih - 180)),
+    ]
+    found: list[tuple[int, int, int, int]] = []
+    step = 2
+
+    for sx, sy, sw, sh in strips:
+        if sw < 16 or sh < 16:
+            continue
+        rect = QRect(sx, sy, sw, sh)
+        bg = page_color(image, rect)
+        br, bg_g, bb = (bg >> 16) & 255, (bg >> 8) & 255, bg & 255
+        data, stride, rw, rh = _rgb32_bytes(image, rect)
+        gw, gh = (rw + step - 1) // step, (rh + step - 1) // step
+        fg = bytearray(gw * gh)
+        for gy in range(gh):
+            row = (gy * step) * stride
+            off = gy * gw
+            for gx in range(gw):
+                j = row + 4 * (gx * step)
+                if max(abs(data[j + 2] - br), abs(data[j + 1] - bg_g), abs(data[j] - bb)) > 28:
+                    fg[off + gx] = 1
+
+        visited = bytearray(gw * gh)
+        for gy in range(gh):
+            row_off = gy * gw
+            for gx in range(gw):
+                idx = row_off + gx
+                if not fg[idx] or visited[idx]:
+                    continue
+                visited[idx] = 1
+                stack = [(gx, gy)]
+                min_gx = max_gx = gx
+                min_gy = max_gy = gy
+                cells = 0
+                while stack:
+                    cx, cy = stack.pop()
+                    cells += 1
+                    if cx < min_gx:
+                        min_gx = cx
+                    elif cx > max_gx:
+                        max_gx = cx
+                    if cy < min_gy:
+                        min_gy = cy
+                    elif cy > max_gy:
+                        max_gy = cy
+                    for dy in (-1, 0, 1):
+                        ny = cy + dy
+                        if not (0 <= ny < gh):
+                            continue
+                        n_off = ny * gw
+                        for dx in (-1, 0, 1):
+                            if dx == 0 and dy == 0:
+                                continue
+                            nx = cx + dx
+                            if 0 <= nx < gw:
+                                n_idx = n_off + nx
+                                if fg[n_idx] and not visited[n_idx]:
+                                    visited[n_idx] = 1
+                                    stack.append((nx, ny))
+                bw = (max_gx - min_gx + 1) * step
+                bh = (max_gy - min_gy + 1) * step
+                if not (12 <= bw <= 64 and 12 <= bh <= 64):
+                    continue
+                aspect = bw / max(1, bh)
+                if not (0.4 <= aspect <= 2.5):
+                    continue
+                box_cells = (max_gx - min_gx + 1) * (max_gy - min_gy + 1)
+                fill = cells / max(1, box_cells)
+                if not (0.08 <= fill <= 0.92):
+                    continue
+                bx, by = sx + min_gx * step, sy + min_gy * step
+                bcx, bcy = bx + bw // 2, by + bh // 2
+                if any(ex <= bcx <= ex + ew and ey <= bcy <= ey + eh for ex, ey, ew, eh in existing):
+                    continue
+                if any(not (bx + bw <= fx or fx + fw <= bx or by + bh <= fy or fy + fh <= by)
+                       for fx, fy, fw, fh in found):
+                    continue
+                found.append((bx, by, bw, bh))
+    found.sort(key=lambda b: (b[1] // 16, b[0]))
+    return found[:max_icons]
 
 
 def _rows(img: QImage, rect: QRect) -> list[bytes]:
@@ -359,6 +820,7 @@ class AiToolHost(QObject):
         self.saved: list[Path] = []
         self._shot = ""
         self._ref: QImage | None = None  # the screen as the model last saw it: screen_map, then after each action
+        self._prev_ref: QImage | None = None  # screen before the latest action (used by peek_region(diff=True))
         self._maps = 0
         self._refused: tuple[int, int, int] | None = None  # (x, y, map) of the last click refused as stale
         self._in_batch = False
@@ -672,7 +1134,19 @@ class AiToolHost(QObject):
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
                 return "error: no screen grab"
-            return self._map(*got, region=args.get("region"))
+            return self._map(*got, region=args.get("region"), annotate=args.get("annotate") is True,
+                             grid=args.get("grid") is True)
+        if name == "peek_region":
+            got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
+            if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
+                return "error: no screen grab"
+            return self._peek_region(*got, region=args.get("region"), grid=args.get("grid") is True,
+                                     grayscale=args.get("grayscale") is True, diff=args.get("diff") is True)
+        if name == "sample_colors":
+            got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
+            if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
+                return "error: no screen grab"
+            return self._sample_colors(got[0], args.get("points"), args.get("region"), args.get("top"))
         if name == "layout_check":
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
@@ -857,6 +1331,14 @@ class AiToolHost(QObject):
             if note.startswith("error"):
                 return note
             args = {**args, "x": x, "y": y}
+        elif name == "mouse_path" and not getattr(self, "_batch_acted", False):
+            ox, oy = args["points"][0]
+            note, nx, ny = self._stale_click(ox, oy, target_label)
+            if note.startswith("error"):
+                return note
+            if (nx, ny) != (ox, oy):
+                dx, dy = nx - ox, ny - oy
+                args = {**args, "points": [[p[0] + dx, p[1] + dy] for p in args["points"]]}
         out = self._on_gui(lambda done: self._act(done, name, args), 90.0)  # up to 2000 chars at 20 ms
         return note + out if isinstance(out, str) else "error: the action did not finish in time"
 
@@ -875,7 +1357,7 @@ class AiToolHost(QObject):
             out.append(f"{x + dx},{y + dy},{w},{h}{tab}{rest}")
         return "\n".join(out)
 
-    def _map(self, image: QImage, hwnd: int, region: Any = None) -> str:
+    def _map(self, image: QImage, hwnd: int, region: Any = None, annotate: bool = False, grid: bool = False) -> str:
         """screen_map's text for a grab; the grab becomes what the next click is checked against. `region`
         ([left, top, width, height]) lists only what is inside it and sends just that part as the screenshot: the
         provider charges about the same per image whatever its size, so a crop shows more for the same tokens."""
@@ -894,18 +1376,104 @@ class AiToolHost(QObject):
             raw_ocr = pool.submit(self._ocr, shown, True).result()
             elements = controls.result()
         lines = self._offset_ocr_boxes(raw_ocr, clip[0], clip[1]) if clip else raw_ocr
+        ox, oy = (clip[0], clip[1]) if clip else (0, 0)
+        if annotate or elements.count("\n") < 12:
+            existing: list[tuple[int, int, int, int]] = []
+            for raw_line in (elements.splitlines() + lines.splitlines()):
+                box_part = raw_line.partition("\t")[0]
+                try:
+                    bx, by, bw, bh = (int(v) for v in box_part.split(","))
+                except ValueError:
+                    continue
+                existing.append((bx - ox, by - oy, bw, bh))
+            icons = detect_toolbar_icons(shown, existing)
+            if icons:
+                extra = "\n".join(f"{ix + ox},{iy + oy},{iw},{ih}\tIcon\t(unlabeled)" for ix, iy, iw, ih in icons)
+                elements = (elements.rstrip("\n") + "\n" + extra) if elements.strip() else extra
         from src.ui.chat_widgets import MAX_IMAGE_SIDE, image_data_url
 
+        max_side = MAX_IMAGE_SIDE - RULER_LEFT
         side = max(shown.width(), shown.height())
-        self._shot = image_data_url(shown)
-        self._ref, self._maps = image, self._maps + 1
-        note = (f"The screenshot you see is scaled down {side / MAX_IMAGE_SIDE:.2f}x: do not read pixels from "
-                "it, use the (x, y) listed here." if side > MAX_IMAGE_SIDE else "The screenshot is at full size.")
+        note = (f"The screenshot you see is scaled down {side / max_side:.2f}x: do not read pixels from "
+                "it, use the (x, y) listed here." if side > max_side else "The screenshot is at full size.")
+        note += " Top and left rulers mark true screen-pixel coordinates."
+        if annotate:
+            note += " #id boxes are drawn on the screenshot (teal = controls, violet = unlabeled icon, amber = OCR text)."
+        if grid:
+            note += " Faint grid lines match the ruler ticks."
         if clip:
             note = (f"Zoomed: only region {clip[0]},{clip[1]},{clip[2]}x{clip[3]} is listed and shown; (x, y) are "
                     "still screen pixels. " + note)
         self._items, self._ocr_ids = {}, set()  # the ids this map hands out; clicks and drags resolve `id` with them
-        return parse_boxes(lines, image.width(), image.height(), elements, note, self._items, clip, self._ocr_ids)
+        out = parse_boxes(lines, image.width(), image.height(), elements, note, self._items, clip, self._ocr_ids)
+        composed = render_screen_overlay(
+            shown,
+            origin=(clip[0], clip[1]) if clip else (0, 0),
+            items=self._items if annotate else None,
+            ocr_ids=self._ocr_ids if annotate else None,
+            grid=grid,
+        )
+        self._shot = image_data_url(composed)
+        if self._ref is not None:
+            self._prev_ref = self._ref
+        self._ref, self._maps = image, self._maps + 1
+        return out
+
+    def _peek_region(self, image: QImage, _hwnd: int, region: Any = None, grid: bool = False,
+                     grayscale: bool = False, diff: bool = False) -> str:
+        """Fast image-only look at `image` or a `region` crop, skipping UIA and OCR."""
+        clip = None
+        if region is not None:
+            if (not isinstance(region, list) or len(region) != 4
+                    or any(isinstance(v, bool) or not isinstance(v, int) for v in region)):
+                return "error: region is [left, top, width, height] in screen pixels"
+            rect = QRect(*region).intersected(image.rect())
+            if rect.width() < 8 or rect.height() < 8:
+                return "error: the region is (almost) off the screen"
+            clip = (rect.x(), rect.y(), rect.width(), rect.height())
+        shown = image.copy(QRect(*clip)) if clip else image
+        origin = (clip[0], clip[1]) if clip else (0, 0)
+        from src.ui.chat_widgets import image_data_url
+
+        modes: list[str] = []
+        dnote = ""
+        if diff and self._ref is not None and self._ref.size() == image.size():
+            prev_shown = self._ref.copy(QRect(*clip)) if clip else self._ref
+            if (changed_region(prev_shown, shown) == (0, 0, 0, 0, 0)
+                    and getattr(self, "_prev_ref", None) is not None and self._prev_ref.size() == image.size()):
+                prev_shown = self._prev_ref.copy(QRect(*clip)) if clip else self._prev_ref
+            dnote = diff_note(prev_shown, shown)
+            if grayscale:
+                prev_shown = prev_shown.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_ARGB32)
+                shown_view = shown.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_ARGB32)
+                modes.append("grayscale")
+            else:
+                shown_view = shown
+            composed = compose_side_by_side(prev_shown, shown_view)
+            modes.append("side-by-side BEFORE | AFTER")
+        else:
+            target_img = (shown.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_ARGB32)
+                          if grayscale else shown)
+            if grayscale:
+                modes.append("grayscale")
+            if grid:
+                modes.append("grid")
+            composed = render_screen_overlay(target_img, origin=origin, grid=grid)
+            if diff:
+                dnote = " No prior screen grab of matching size to diff against; showing current view."
+
+        self._shot = image_data_url(composed)
+        if self._ref is not None:
+            self._prev_ref = self._ref
+        self._ref = image
+        where = (f"region {clip[0]},{clip[1]},{clip[2]}x{clip[3]} of {image.width()}x{image.height()}"
+                 if clip else f"full screen {image.width()}x{image.height()}")
+        mode_note = f" ({', '.join(modes)})" if modes else ""
+        return f"Peeked {where}{mode_note}.{dnote}"
+
+    @staticmethod
+    def _sample_colors(image: QImage, points: Any = None, region: Any = None, top: Any = None) -> str:
+        return analyze_colors(image, points=points, region=region, top=6 if top is None else top)
 
     def _make_sheet(self, args: dict[str, Any]) -> str:
         """make_sheet: render in the scratch folder, then copy to Documents\\Paperduck under a name nothing has."""
@@ -1149,13 +1717,36 @@ class AiToolHost(QObject):
                 if name == "mouse_click":
                     computer.click(args["x"], args["y"], args.get("button") or "left", bool(args.get("double")))
                     result = "clicked"
+                elif name == "mouse_hover":
+                    wait_ms = int(args["wait_ms"]) if args.get("wait_ms") is not None else 500
+                    computer.hover(args["x"], args["y"], wait_ms)
+                    chain = computer.uia_at(args["x"], args["y"])
+                    picks = [f'[{k}] "{lbl[:50]}"' if k else f'"{lbl[:50]}"'
+                             for k, lbl in chain if lbl.strip()][:2]
+                    under = f"; under cursor: {', '.join(picks)}" if picks else ""
+                    result = f"hovered at ({args['x']}, {args['y']}){under}"
                 elif name == "paste_text":
                     time.sleep(0.05)  # the app reads the clipboard on ctrl+v; give the copy a moment to land
                     computer.press(computer.parse_keys("ctrl+v"))
                     result = f"pasted {len(args['text'])} characters"
                 elif name == "mouse_drag":
-                    computer.drag(args["x"], args["y"], args["to_x"], args["to_y"])
+                    computer.drag(
+                        args["x"], args["y"], args["to_x"], args["to_y"],
+                        button=args.get("button") or "left",
+                        modifiers=computer.parse_modifiers(args.get("modifiers")),
+                    )
                     result = "dragged"
+                elif name == "mouse_path":
+                    pts = [(p[0], p[1]) for p in args["points"]]
+                    done_pts = computer.path(
+                        pts,
+                        button=args.get("button") or "left",
+                        modifiers=computer.parse_modifiers(args.get("modifiers")),
+                        step_px=int(args["step_px"]) if args.get("step_px") is not None else 8,
+                        stop=self.cancel,
+                    )
+                    result = (f"error: stopped by the user after {done_pts} points" if self.cancel.is_set()
+                              else f"traced {done_pts}-point path")
                 elif name == "type_text":
                     typed = computer.type_text(args["text"], stop=self.cancel)
                     result = (f"error: stopped by the user after {typed} characters" if self.cancel.is_set()
@@ -1177,23 +1768,42 @@ class AiToolHost(QObject):
                 else:
                     computer.click_through(int(w.winId()), False)
             tail = "" if in_batch else " Call screen_map for details."
-            text = (result + "." + computer.front_note(before[0], computer.front_state()) + tail
+            base = (result + "." + computer.front_note(before[0], computer.front_state())
                     if not result.startswith("error") else result)
             if self._ref is None or in_batch:
-                done(text)
+                done(base + tail if not result.startswith("error") else base)
                 return
 
             def keep(got: Any) -> None:  # what this action left is what a planned next click aims at
+                dnote = ""
                 if isinstance(got, tuple) and isinstance(got[0], QImage) and not got[0].isNull():
+                    if not result.startswith("error") and self._ref is not None:
+                        dnote = diff_note(self._ref, got[0])
+                        if name == "mouse_hover" and callable(getattr(self, "_ocr", None)):
+                            res = changed_region(self._ref, got[0])
+                            if res is not None and 0 < res[2] * res[3] <= 300_000:
+                                crop = got[0].copy(QRect(res[0], res[1], res[2], res[3]))
+                                self._prev_ref = self._ref
+                                self._ref = got[0]
+
+                                def read_tip() -> None:
+                                    tip = " ".join((self._ocr(crop, empty="") or "").split())[:120]
+                                    tip_note = f' Hover text: "{tip}".' if tip else ""
+                                    done(base + dnote + tip_note + tail)
+
+                                threading.Thread(target=read_tip, daemon=True).start()
+                                return
+                    if self._ref is not None:
+                        self._prev_ref = self._ref
                     self._ref = got[0]
-                done(text)
+                done(base + dnote + tail if not result.startswith("error") else base)
 
             self._grab_screen(keep, primary=True)
 
         def work() -> None:
             result = act()
             # back on the Qt thread; the app needs a moment to react before the next look
-            delay = 50 if in_batch else 250
+            delay = 80 if in_batch else 250
             self._call.emit((lambda _done: QTimer.singleShot(delay, lambda: finish(result)),
                              {"event": threading.Event(), "result": None}))
 

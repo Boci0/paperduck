@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import threading
 import time
@@ -14,6 +15,10 @@ from src.tools.watch import is_private_title
 
 MAX_TYPE_CHARS = 2000
 MAX_SCROLL = 20
+MAX_PATH_POINTS = 200
+MAX_PATH_INTERP = 600
+MAX_HOVER_MS = 2000
+_DRAG_MODS = {"shift": 0x10, "ctrl": 0x11, "control": 0x11, "alt": 0x12}
 
 _VK = {"enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20, "backspace": 0x08,
        "delete": 0x2E, "del": 0x2E, "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27, "home": 0x24, "end": 0x23,
@@ -46,6 +51,28 @@ def parse_keys(keys: object) -> list[int]:
             raise ValueError(f"unknown key {part!r}")
     if len(codes) > 4 or codes[-1] in _MODIFIERS and len(codes) > 1:
         raise ValueError("use up to three modifiers and one key, e.g. ctrl+shift+s")
+    return codes
+
+
+def parse_modifiers(modifiers: object) -> list[int]:
+    """['shift', 'ctrl'] or 'ctrl+shift' -> deduplicated virtual-key codes; ValueError on invalid entries."""
+    if modifiers is None or modifiers == [] or modifiers == "":
+        return []
+    if isinstance(modifiers, str):
+        parts = [p.strip().lower() for p in modifiers.split("+") if p.strip()]
+    elif isinstance(modifiers, (list, tuple)):
+        if not all(isinstance(p, str) for p in modifiers):
+            raise ValueError("modifiers may only be shift, ctrl or alt")
+        parts = [p.strip().lower() for p in modifiers if p.strip()]
+    else:
+        raise ValueError("modifiers may only be shift, ctrl or alt")
+    codes: list[int] = []
+    for part in parts:
+        vk = _DRAG_MODS.get(part)
+        if vk is None:
+            raise ValueError("modifiers may only be shift, ctrl or alt")
+        if vk not in codes:
+            codes.append(vk)
     return codes
 
 
@@ -106,12 +133,16 @@ def virtual_screen_bounds() -> tuple[int, int, int, int]:
     return user32.GetSystemMetrics(76), user32.GetSystemMetrics(77), vw, vh
 
 
-def _move(x: int, y: int) -> None:
+def _check_point(x: int, y: int) -> tuple[int, int]:
     vx, vy, width, height = virtual_screen_bounds()
     if not (vx - 2 <= x < vx + width + 2 and vy - 2 <= y < vy + height + 2):
         raise ValueError(f"({x}, {y}) is off the screen, which is {width}x{height}")
     # a hair past the edge (the taskbar's corner, a centre rounded up) lands on the last pixel instead of failing
-    x, y = max(vx, min(x, vx + width - 1)), max(vy, min(y, vy + height - 1))
+    return max(vx, min(x, vx + width - 1)), max(vy, min(y, vy + height - 1))
+
+
+def _move(x: int, y: int) -> None:
+    x, y = _check_point(x, y)
     _user32().SetCursorPos(x, y)
     time.sleep(0.05)
 
@@ -122,22 +153,110 @@ def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
     _move(x, y)
     down, up = _MOUSE_FLAGS[button]
     for _ in range(2 if double else 1):
-        _send(_mouse(down), _mouse(up))
+        _send(_mouse(down))
+        time.sleep(0.03)
+        _send(_mouse(up))
         time.sleep(0.06)
 
 
-def drag(x: int, y: int, to_x: int, to_y: int, steps: int = 12) -> None:
-    """Left-button drag in small moves (web canvases such as Canva ignore a jump); the button always comes back up."""
-    _move(to_x, to_y)  # checks the end is on screen before anything is pressed
+def drag(x: int, y: int, to_x: int, to_y: int, steps: int = 12, button: str = "left",
+         modifiers: list[int] | None = None) -> None:
+    """Button drag in small moves (web canvases such as Canva ignore a jump); button and modifiers always come back up."""
+    if button not in _MOUSE_FLAGS:
+        raise ValueError("button is left or right")
+    _check_point(to_x, to_y)  # checks the end is on screen before anything is pressed without warping there
     _move(x, y)
-    _send(_mouse(_MOUSE_FLAGS["left"][0]))
+    mods = list(modifiers or ())
+    down, up = _MOUSE_FLAGS[button]
+    if mods:
+        _send(*[_key(vk) for vk in mods])
+        try:
+            _send(_mouse(down))
+            try:
+                time.sleep(0.08)
+                for i in range(1, steps + 1):
+                    _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
+                time.sleep(0.08)
+            finally:
+                _send(_mouse(up))
+        finally:
+            _send(*[_key(vk, flags=_KEYUP) for vk in reversed(mods)])
+    else:
+        _send(_mouse(down))
+        try:
+            time.sleep(0.08)
+            for i in range(1, steps + 1):
+                _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
+            time.sleep(0.08)
+        finally:
+            _send(_mouse(up))
+
+
+def path(points: list[tuple[int, int]], button: str = "left", modifiers: list[int] | None = None,
+         step_px: int = 8, delay: float = 0.016, stop: threading.Event | None = None) -> int:
+    """Trace a smooth multi-point stroke while holding `button` and optional `modifiers`. Returns vertices reached."""
+    if button not in _MOUSE_FLAGS:
+        raise ValueError("button is left or right")
+    if not (2 <= len(points) <= MAX_PATH_POINTS):
+        raise ValueError(f"give 2 to {MAX_PATH_POINTS} points")
+    if not (2 <= step_px <= 40):
+        raise ValueError("step_px must be between 2 and 40")
+    clamped = [_check_point(int(px), int(py)) for px, py in points]
+
+    raw_segs: list[list[tuple[int, int]]] = []
+    for (x0, y0), (x1, y1) in zip(clamped, clamped[1:]):
+        segs = max(1, min(60, round(math.hypot(x1 - x0, y1 - y0) / step_px)))
+        raw_segs.append([(round(x0 + (x1 - x0) * i / segs), round(y0 + (y1 - y0) * i / segs))
+                         for i in range(1, segs + 1)])
+    total_steps = sum(len(s) for s in raw_segs)
+    if total_steps > MAX_PATH_INTERP:
+        ratio = MAX_PATH_INTERP / total_steps
+        trimmed: list[list[tuple[int, int]]] = []
+        for s in raw_segs:
+            keep_n = max(1, round(len(s) * ratio))
+            if keep_n >= len(s):
+                trimmed.append(s)
+            else:
+                step_pts = [s[min(len(s) - 1, round(k * (len(s) - 1) / max(1, keep_n - 1)))]
+                            for k in range(keep_n)]
+                step_pts[-1] = s[-1]
+                trimmed.append(step_pts)
+        raw_segs = trimmed
+
+    _move(*clamped[0])
+    mods = list(modifiers or ())
+    down, up = _MOUSE_FLAGS[button]
+    user32 = _user32()
+    vx, vy, vw, vh = virtual_screen_bounds()
+    if mods:
+        _send(*[_key(vk) for vk in mods])
+    reached = 1
     try:
-        time.sleep(0.08)
-        for i in range(1, steps + 1):
-            _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
-        time.sleep(0.08)
+        _send(_mouse(down))
+        try:
+            time.sleep(0.06)
+            for seg in raw_segs:
+                for cx, cy in seg:
+                    if stop is not None and stop.is_set():
+                        return reached
+                    ax = round((cx - vx) * 65535 / max(1, vw - 1))
+                    ay = round((cy - vy) * 65535 / max(1, vh - 1))
+                    _send(_Input(type=0, mi=_Mouse(ax, ay, 0, 0x8001 | 0x4000, 0, 0)))  # MOVE|ABSOLUTE|VIRTUALDESK
+                    time.sleep(delay)
+                reached += 1
+            time.sleep(0.06)
+        finally:
+            _send(_mouse(up))
     finally:
-        _send(_mouse(_MOUSE_FLAGS["left"][1]))
+        if mods:
+            _send(*[_key(vk, flags=_KEYUP) for vk in reversed(mods)])
+    return reached
+
+
+def hover(x: int, y: int, wait_ms: int = 500) -> None:
+    """Move the cursor to (x, y) without clicking and pause for tooltips/hover state."""
+    _move(x, y)
+    time.sleep(max(0, min(wait_ms, MAX_HOVER_MS)) / 1000.0)
 
 
 def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
@@ -182,28 +301,74 @@ if (-not ('BS.Dpi' -as [type])) {  # a warm worker runs this again in the same p
 }
 [void][BS.Dpi]::SetThreadDpiAwarenessContext([IntPtr]-4)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-if (-not $script:paperduckUiaCond) {
+if (-not $script:paperduckUiaCond2) {
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     $A = [System.Windows.Automation.AutomationElement]
     $CT = [System.Windows.Automation.ControlType]
     $types = @($CT::Button, $CT::CheckBox, $CT::ComboBox, $CT::Edit, $CT::Hyperlink, $CT::ListItem, $CT::MenuItem,
-        $CT::RadioButton, $CT::TabItem, $CT::TreeItem, $CT::SplitButton, $CT::Slider, $CT::DataItem, $CT::Document)
+        $CT::RadioButton, $CT::TabItem, $CT::TreeItem, $CT::SplitButton, $CT::Slider, $CT::DataItem, $CT::Document,
+        $CT::Custom, $CT::Image)
     $any = [System.Windows.Automation.OrCondition]::new([System.Windows.Automation.Condition[]]@(
         $types | ForEach-Object { [System.Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $_) }))
     $visible = [System.Windows.Automation.PropertyCondition]::new($A::IsOffscreenProperty, $false)
-    $script:paperduckUiaCond = [System.Windows.Automation.AndCondition]::new($any, $visible)
+    $script:paperduckUiaCond2 = [System.Windows.Automation.AndCondition]::new($any, $visible)
 }
 $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
 $count = 0
-foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond)) {
+foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond2)) {
     try {
         $r = $e.Current.BoundingRectangle
         if ($r.IsEmpty -or $r.Width -lt 4 -or $r.Height -lt 4) { continue }
         $name = $e.Current.Name
         if (-not $name) { $name = $e.Current.AutomationId }
         if (-not $name) { $name = $e.Current.HelpText }
+        if ($name) { $name = ($name -replace '[\r\n\t]+', ' ').Trim() } else { $name = '' }
         $kind = $e.Current.ControlType.ProgrammaticName -replace '^ControlType\.', ''
-        "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name"
+        $tags = @()
+        if (-not $e.Current.IsEnabled) { $tags += 'disabled' }
+        if ($e.Current.HasKeyboardFocus) { $tags += 'focus' }
+        $acc = $e.Current.AcceleratorKey
+        if ($acc) {
+            $accClean = ($acc -replace '[\r\n\t]+', ' ').Trim()
+            if ($accClean.Length -gt 20) { $accClean = $accClean.Substring(0, 20) }
+            if ($accClean) { $tags += "key=$accClean" }
+        }
+        $tp = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
+            $ts = $tp.Current.ToggleState.ToString()
+            if ($ts -eq 'On') { $tags += 'on' }
+            elseif ($ts -eq 'Off') { $tags += 'off' }
+            elseif ($ts -eq 'Indeterminate') { $tags += 'mixed' }
+        }
+        $sp = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sp)) {
+            if ($sp.Current.IsSelected) { $tags += 'selected' }
+        }
+        $ep = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep)) {
+            if ($ep.Current.ExpandCollapseState.ToString() -eq 'Expanded') { $tags += 'expanded' }
+        }
+        $rv = $null
+        $vp = $null
+        if ($e.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rv)) {
+            $tags += "val=$([math]::Round($rv.Current.Value, 2))/$([math]::Round($rv.Current.Maximum, 2))"
+        } elseif ($kind -ne 'Document' -and $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+            $v = $vp.Current.Value
+            if ($v) {
+                $vClean = ($v -replace '[\r\n\t]+', ' ').Trim()
+                if ($vClean.Length -gt 30) { $vClean = $vClean.Substring(0, 30) }
+                if ($vClean) { $tags += "val=$vClean" }
+            }
+        }
+        if ($kind -in @('Custom', 'Image') -and -not $name -and $tags.Count -eq 0) {
+            $ip = $null
+            if (-not $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) { continue }
+        }
+        if ($tags.Count -gt 0) {
+            "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name`t$($tags -join ', ')"
+        } else {
+            "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name"
+        }
         $count++
         if ($count -ge 400) { break }
     } catch { }

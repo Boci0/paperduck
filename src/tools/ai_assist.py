@@ -235,6 +235,12 @@ SYSTEM_PROMPT = (
     "it overflows or reads badly), then for Canva upload its PNG (Uploads, Upload files), add it on a blank page and "
     "right-click it, Set image as background, instead of building the page by hand; never stop at the upload. "
     "The rules below are for editing an existing design on screen. "
+    "When a screen action reports 0 pixels changed, check focus or target before repeating; use "
+    "screen_map(annotate=True) on dense or unlabeled toolbars, screen_map(grid=True) on canvases or design layouts, "
+    "peek_region for fast visual/grayscale/before-after checks without re-listing controls, sample_colors for exact "
+    "#RRGGBB values or region palettes, "
+    "mouse_hover to read tooltips on unlabeled icons, mouse_drag modifiers (shift/ctrl/alt) for constrained transforms, "
+    "and mouse_path for smooth curves or strokes. "
     "Layout or template work on screen (a Canva design, slides, a form): first list every slot and placeholder "
     "screen_map shows and plan what goes in each; fit content to each box's width and height (shorten the text "
     "or lower the font size rather than let it overflow); move and resize with mouse_drag by #id and handle, "
@@ -1275,7 +1281,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     spent = [0, 0, 0, 0]  # prompt, completion, reasoning, total tokens over every round
     paid = 0  # billable tokens (see _billable)
     used: list[tuple[str, str]] = []
-    shot_at: list[int] = []  # indexes in `messages` of the screenshot messages still sent
+    shot_at: list[tuple[int, str]] = []  # (index in `messages`, shot role) of screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
     fails: list[Any] = [0, 0, None, [], None, set()]
     blind_told = wrapped = pushed = False
@@ -1325,7 +1331,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                     raise ValueError("refused mid-answer") from None
                 raise
             _NO_VISION.add((base_url, model))  # this model refuses the screenshot: go on with the text lists
-            for i in shot_at:
+            for i, _r in shot_at:
                 messages[i] = {"role": "user", "content": "(this model cannot see screenshots; use the text lists)"}
             shot_at = []
             continue
@@ -1367,6 +1373,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                 named = [(c["function"]["name"], c["function"].get("arguments")) for c in calls]
                 ready = [None] * len(calls) if cut else _run_calls(
                     named, host, _grow_seen(seen_buf, messages) if read_local else None, progress)
+                turn_roles: list[str] = []
                 for call, result in zip(calls, ready):
                     _check(cancel)
                     fn = call["function"]
@@ -1387,6 +1394,7 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                     shot = _take_shot(host)
                     if shot:
                         shots.append(shot)
+                        turn_roles.append(_shot_role(fn["name"], fn.get("arguments")))
                 _check(cancel)  # a stopped answer must not take steer text meant for the next one
                 if said := _steered(steer, host):
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + said}
@@ -1395,11 +1403,14 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                         {"type": "text", "text": "Image from that tool:"
                          if len(shots) == 1 else f"The {len(shots)} images from those tools, in call order:"},
                         *({"type": "image_url", "image_url": {"url": u}} for u in shots)]})
-                    shot_at.append(len(messages) - 1)
+                    role = "ref" if "ref" in turn_roles else (turn_roles[-1] if turn_roles else "full")
+                    shot_at.append((len(messages) - 1, role))
                     if len(shot_at) > KEEP_SHOTS:  # old ones go in one batch, so the prompt cache holds in between
-                        for i in shot_at[:-1]:
-                            messages[i] = {"role": "user", "content": "(earlier screenshot removed)"}
-                        shot_at = shot_at[-1:]
+                        keep = _prune_shot_keys(shot_at, max(1, KEEP_SHOTS - 1))
+                        for i, _r in shot_at:
+                            if i not in keep:
+                                messages[i] = {"role": "user", "content": "(earlier screenshot removed)"}
+                        shot_at = [entry for entry in shot_at if entry[0] in keep]
                 elif shots and not blind_told:  # once per answer: paging a blind model through screen_map wastes rounds
                     messages[-1] = {**messages[-1], "content": messages[-1]["content"] + BLIND_NOTE}
                     blind_told = True
@@ -1583,15 +1594,65 @@ def _strip_thinking(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for i, t in enumerate(turns)]
 
 
+def _shot_role(name: str, arguments: Any) -> str:
+    """Classify a tool screenshot as 'ref' (reference/preview), 'detail' (zoomed/layout), or 'full'."""
+    if name in ("view_image", "preview_document", "make_sheet"):
+        return "ref"
+    if name == "layout_check":
+        return "detail"
+    if name in ("screen_map", "peek_region"):
+        try:
+            args = arguments if isinstance(arguments, dict) else json.loads(arguments or "{}")
+        except (ValueError, TypeError, RecursionError):
+            args = None
+        if isinstance(args, dict) and args.get("region"):
+            return "detail"
+    return "full"
+
+
+def _prune_shot_keys(tagged: list[tuple[Any, str]], keep_max: int) -> set[Any]:
+    """Choose which screenshot keys to keep when pruning: always the newest, plus at most one earlier
+    complementary shot ('ref' preferred, or 'full' vs 'detail' pair) when `keep_max >= 2`."""
+    if not tagged:
+        return set()
+    newest_key, newest_role = tagged[-1]
+    keep = {newest_key}
+    if keep_max < 2:
+        return keep
+    want_roles = ("ref",) if newest_role == "full" else ("ref", "full") if newest_role == "detail" else ("full", "detail")
+    for want in want_roles:
+        match = next((k for k, r in reversed(tagged[:-1]) if r == want and k != newest_key), None)
+        if match is not None:
+            keep.add(match)
+            break
+    return keep
+
+
 def _drop_old_shots(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Claude: earlier tool results (all but the last turn) keep their text but lose their screenshot (each costs
-    tokens and request size); see _strip_thinking."""
+    """Claude: drop older screenshots while keeping the newest turn's shots and one pinned complementary shot
+    (such as a reference image or full-screen overview) when available; see _strip_thinking."""
+    roles_by_id = {
+        b.get("id"): _shot_role(b.get("name", ""), b.get("input"))
+        for t in turns if t["role"] == "assistant" and isinstance(t["content"], list)
+        for b in t["content"] if b.get("type") == "tool_use" and b.get("id")
+    }
+    tagged: list[tuple[tuple[int, int], str]] = []
+    for i, turn in enumerate(turns):
+        content = turn["content"]
+        if turn["role"] == "user" and isinstance(content, list):
+            for j, b in enumerate(content):
+                if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+                    tagged.append(((i, j), roles_by_id.get(b.get("tool_use_id"), "full")))
+    keep = (_prune_shot_keys(tagged, max(1, KEEP_SHOTS - 1))
+            if tagged and tagged[-1][0][0] == len(turns) - 1 else set())
+    keep |= {key for key, _r in tagged if key[0] == len(turns) - 1}
     out = []
     for i, turn in enumerate(turns):
         content = turn["content"]
         if turn["role"] == "user" and isinstance(content, list) and i < len(turns) - 1:
             content = [{**b, "content": b["content"][0]["text"]} if b.get("type") == "tool_result"
-                       and isinstance(b.get("content"), list) else b for b in content]
+                       and isinstance(b.get("content"), list) and (i, j) not in keep else b
+                       for j, b in enumerate(content)]
             turn = {**turn, "content": content}
         out.append(turn)
     return _strip_thinking(out)

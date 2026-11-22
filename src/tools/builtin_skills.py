@@ -420,6 +420,81 @@ see in ONE script, preview once more, stop.
 """
 
 # name -> (description for the system prompt, body, helper script, its file name)
+DESIGN_HELPERS_PS = r"""# Paperduck visual-design geometry helpers (written by load_skill). Dot-source in run_powershell.
+# Emits exact [[x,y],...] JSON waypoints for mouse_path and [x,y,w,h] layout slot boxes.
+
+function New-CirclePoints([double]$Cx, [double]$Cy, [double]$Rx, [double]$Ry = 0, [int]$Steps = 32) {
+    if ($Ry -le 0) { $Ry = $Rx }
+    $pts = for ($i = 0; $i -le $Steps; $i++) {
+        $a = 2.0 * [math]::PI * $i / $Steps
+        ,@([int][math]::Round($Cx + $Rx * [math]::Cos($a)), [int][math]::Round($Cy + $Ry * [math]::Sin($a)))
+    }
+    "[" + (($pts | ForEach-Object { "[$($_[0]),$($_[1])]" }) -join ",") + "]"
+}
+
+function New-ArcPoints([double]$Cx, [double]$Cy, [double]$Rx, [double]$Ry, [double]$StartDeg, [double]$EndDeg, [int]$Steps = 24) {
+    if ($Ry -le 0) { $Ry = $Rx }
+    $pts = for ($i = 0; $i -le $Steps; $i++) {
+        $deg = $StartDeg + ($EndDeg - $StartDeg) * $i / $Steps
+        $a = $deg * [math]::PI / 180.0
+        ,@([int][math]::Round($Cx + $Rx * [math]::Cos($a)), [int][math]::Round($Cy + $Ry * [math]::Sin($a)))
+    }
+    "[" + (($pts | ForEach-Object { "[$($_[0]),$($_[1])]" }) -join ",") + "]"
+}
+
+function New-BezierPoints([double]$X0, [double]$Y0, [double]$X1, [double]$Y1, [double]$X2, [double]$Y2, [double]$X3, [double]$Y3, [int]$Steps = 20) {
+    $pts = for ($i = 0; $i -le $Steps; $i++) {
+        $t = $i / [double]$Steps
+        $u = 1.0 - $t
+        $x = $u*$u*$u*$X0 + 3*$u*$u*$t*$X1 + 3*$u*$t*$t*$X2 + $t*$t*$t*$X3
+        $y = $u*$u*$u*$Y0 + 3*$u*$u*$t*$Y1 + 3*$u*$t*$t*$Y2 + $t*$t*$t*$Y3
+        ,@([int][math]::Round($x), [int][math]::Round($y))
+    }
+    "[" + (($pts | ForEach-Object { "[$($_[0]),$($_[1])]" }) -join ",") + "]"
+}
+
+function New-RectPoints([double]$X, [double]$Y, [double]$W, [double]$H) {
+    $x0 = [int][math]::Round($X); $y0 = [int][math]::Round($Y)
+    $x1 = [int][math]::Round($X + $W); $y1 = [int][math]::Round($Y + $H)
+    $pts = @(@($x0, $y0), @($x1, $y0), @($x1, $y1), @($x0, $y1), @($x0, $y0))
+    "[" + (($pts | ForEach-Object { "[$($_[0]),$($_[1])]" }) -join ",") + "]"
+}
+
+function New-GridSlots([double]$X, [double]$Y, [double]$W, [double]$H, [int]$Cols, [int]$Rows, [double]$Margin = 20, [double]$Gap = 16) {
+    $cw = ($W - 2 * $Margin - ($Cols - 1) * $Gap) / [math]::Max(1, $Cols)
+    $ch = ($H - 2 * $Margin - ($Rows - 1) * $Gap) / [math]::Max(1, $Rows)
+    $slots = @()
+    for ($r = 0; $r -lt $Rows; $r++) {
+        for ($c = 0; $c -lt $Cols; $c++) {
+            $sx = [int][math]::Round($X + $Margin + $c * ($cw + $Gap))
+            $sy = [int][math]::Round($Y + $Margin + $r * ($ch + $Gap))
+            $slots += ,@($sx, $sy, [int][math]::Round($cw), [int][math]::Round($ch))
+        }
+    }
+    "[" + (($slots | ForEach-Object { "[$($_[0]),$($_[1]),$($_[2]),$($_[3])]" }) -join ",") + "]"
+}
+"""
+
+VISUAL_DESIGN = r"""Visual design, illustration and painting workflow (app-agnostic: Paint, Krita, Photoshop, Figma, Inkscape, Blender, slides, whiteboards).
+
+## 1. Execution hierarchy (pick the highest precision tier that reaches the target)
+1. Native file / scripting API first (SVG, HTML/CSS, Python `bpy`, PowerShell COM, app scripts).
+2. Numeric inspector fields (`X`, `Y`, `W`, `H`, `#RRGGBB`, font size) and keyboard shortcuts (`Ctrl+K`, tool keys, `Ctrl+Z`) second.
+3. Computed `mouse_path` and modifier `mouse_drag` (`shift` for straight lines / locked aspect ratio, `ctrl`/`alt` per app) third: dot-source the geometry helpers in `run_powershell` instead of eyeballing coordinates:
+```
+. "{helpers}"
+New-CirclePoints 640 360 120 120 32
+New-BezierPoints 400 450 520 300 740 300 860 450 24
+New-GridSlots 120 140 1000 600 3 2 24 16
+```
+
+## 2. Four-phase coarse-to-fine workflow
+1. **Calibrate Workspace**: Call `screen_map(annotate=True)` to locate the canvas box, active tool/state tags, zoom (set to Fit or 100%), Undo (`Ctrl+Z`), and color picker. Use `mouse_hover(id=...)` to read tooltips on any unlabeled `[Icon]` controls before clicking them.
+2. **Spatial Blueprint**: Before making the first mark, commit the canvas rect, safe margins, focal grid, 3 to 5 `#RRGGBB` palette colors (verify text/foreground contrast with `calculate("contrast('#fg', '#bg')")`), and back-to-front layer order (`Background -> Base Color Blocking -> Mid Forms -> Details/Text -> Highlights`).
+3. **Atomic Undo-Safe Execution**: Work one logical layer/group per step and check with `peek_region(region=..., diff=True)` or `sample_colors`. Strict undo rule: if any stroke, drag, or resize lands off-target, press `Ctrl+Z` immediately before retrying (never paint over mistakes). If an action reports `0 pixels changed`, check window focus, active tool, and selected color before repeating.
+4. **Squint Test + Fresh Critic Sub-Agent**: Run `peek_region(region=..., grayscale=True)` to judge tonal/value hierarchy and silhouette clarity (and `layout_check` for text/card layouts). For major deliverables, save/capture a clean view and `spawn_agent` as a fresh read-only Critic (`view_image`) to score composition, alignment, contrast, and stray artifacts and list the top 3 pixel-level fixes; apply one focused polish pass and stop.
+"""
+
 BUILTIN = {
     "word-docs": ("Load before building or styling a Word document through COM: tested helper functions, the COM "
                   "traps that waste runs, and the build, preview, fix loop", WORD_DOCS, WORD_HELPERS_PS,
@@ -430,6 +505,9 @@ BUILTIN = {
     "excel-sheets": ("Load before building or styling an Excel workbook through COM: tested helpers for tables, "
                      "number formats, banding, data bars, charts and print setup, and the build, preview, fix loop",
                      EXCEL_SHEETS, SHEET_HELPERS_PS, "sheet_helpers.ps1"),
+    "visual-design": ("Load before visual design, layout, illustration or painting on screen: execution hierarchy, "
+                      "geometry helpers for mouse_path, coarse-to-fine workflow, undo discipline and critic review",
+                      VISUAL_DESIGN, DESIGN_HELPERS_PS, "design_helpers.ps1"),
 }
 
 

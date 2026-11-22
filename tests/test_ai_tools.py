@@ -317,8 +317,8 @@ def test_load_skill_returns_listed_bodies_only(tmp_path: Path) -> None:
     assert load_skill(root, " tidy ") == "Sort imports."
     assert load_skill(root, "huge").endswith("(skill cut off)") and len(load_skill(root, "huge")) < MAX_SKILL_CHARS + 30
     for bad in ("../secret", "..", str(tmp_path / "secret"), "tidy/../../secret", None, 3):
-        assert load_skill(root, bad).startswith("error: no such skill. Skills: excel-sheets, huge, slides, tidy, word-docs")
-    assert load_skill(tmp_path / "missing", "tidy") == "error: no such skill. Skills: excel-sheets, slides, word-docs"
+        assert load_skill(root, bad).startswith("error: no such skill. Skills: excel-sheets, huge, slides, tidy, visual-design, word-docs")
+    assert load_skill(tmp_path / "missing", "tidy") == "error: no such skill. Skills: excel-sheets, slides, visual-design, word-docs"
     assert any(s["function"]["name"] == "load_skill" for s in TOOL_SPECS)
 
 

@@ -113,7 +113,7 @@ def test_drag_moves_in_steps_and_always_releases(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(computer.time, "sleep", lambda _s: None)
     monkeypatch.setattr(computer, "_send", lambda *inputs: events.append(inputs[0].mi.flags))
     computer.drag(100, 100, 200, 140, steps=4)
-    assert events == [(200, 140), (100, 100), 0x2, (125, 110), (150, 120), (175, 130), (200, 140), 0x4]
+    assert events == [(100, 100), 0x2, (125, 110), (150, 120), (175, 130), (200, 140), 0x4]
 
     events.clear()  # an end off the screen fails before the button goes down
     with pytest.raises(ValueError, match="off the screen"):
@@ -378,4 +378,498 @@ def test_lru_sprite_cache_evicts_oldest_not_all(qapp: QApplication) -> None:
     assert len(pet._image_cache) == 96
     assert ("k", 0, False, 128) in pet._image_cache
     assert ("k", 1, False, 128) not in pet._image_cache  # oldest untouched entry evicted
+
+
+# --- screen vision upgrades: pixel diff, coordinate ruler, grid, SoM overlay ------------------------------
+
+def test_changed_region_and_diff_note_detect_boxes_and_zero_changes() -> None:
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui.ai_tool_host import changed_region, diff_note
+
+    a = QImage(200, 120, QImage.Format.Format_RGB32)
+    a.fill(QColor("#ffffff"))
+    b = a.copy()
+    assert changed_region(a, b) == (0, 0, 0, 0, 0)
+    assert "0 pixels changed" in diff_note(a, b)
+
+    # 1px flicker (< 4 sampled hits) is ignored
+    b.setPixel(10, 10, 0xFF000000)
+    assert changed_region(a, b) == (0, 0, 0, 0, 0)
+
+    # Localized rectangle change (fresh copy without the 1px dot at 10, 10)
+    b = a.copy()
+    for x in range(40, 80):
+        for y in range(20, 50):
+            b.setPixel(x, y, 0xFF112233)
+    res = changed_region(a, b)
+    assert res is not None and res[:2] == (40, 20) and 38 <= res[2] <= 42 and 28 <= res[3] <= 32
+    note = diff_note(a, b)
+    assert "Screen changed in box 40,20," in note and "of screen)." in note
+
+    # Mismatched sizes return None / ""
+    assert changed_region(a, a.scaled(100, 60)) is None
+    assert diff_note(a, a.scaled(100, 60)) == ""
+
+
+def test_render_screen_overlay_rulers_grid_som_and_scale_cap(qapp: QApplication) -> None:
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui.ai_tool_host import RULER_LEFT, RULER_TOP, render_screen_overlay
+    from src.ui.chat_widgets import MAX_IMAGE_SIDE
+
+    # Large 2560x1440 input stays within MAX_IMAGE_SIDE including rulers
+    big = QImage(2560, 1440, QImage.Format.Format_RGB32)
+    big.fill(QColor("#203040"))
+    out_big = render_screen_overlay(big)
+    assert max(out_big.width(), out_big.height()) <= MAX_IMAGE_SIDE
+    assert out_big.width() > RULER_LEFT and out_big.height() > RULER_TOP
+
+    # Small input keeps exact 1:1 image pixels at (RULER_LEFT, RULER_TOP)
+    small = QImage(240, 160, QImage.Format.Format_RGB32)
+    small.fill(QColor("#ffffff"))
+    plain = render_screen_overlay(small, origin=(100, 50))
+    assert (plain.width(), plain.height()) == (240 + RULER_LEFT, 160 + RULER_TOP)
+    assert plain.pixelColor(RULER_LEFT + 10, RULER_TOP + 10) == QColor("#ffffff")
+
+    # Grid lines are drawn inside the viewport at major ruler ticks (100, 200...)
+    gridded = render_screen_overlay(small, origin=(0, 0), grid=True)
+    assert gridded.pixelColor(RULER_LEFT + 100, RULER_TOP + 10) != QColor("#ffffff")
+
+    # SoM draws teal control boxes, amber OCR boxes, and skips giant full-screen containers
+    items = {
+        1: (10, 10, 220, 140, "Giant Canvas"),  # > 65% area -> skipped
+        2: (20, 30, 60, 24, "Save"),
+        3: (100, 80, 70, 20, "OCR Text"),
+    }
+    som = render_screen_overlay(small, origin=(0, 0), items=items, ocr_ids={3})
+    assert som.pixelColor(RULER_LEFT + 20, RULER_TOP + 30) != QColor("#ffffff")
+    assert som.pixelColor(RULER_LEFT + 100, RULER_TOP + 80) != QColor("#ffffff")
+
+
+def test_map_supports_annotate_and_grid_and_exposes_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+    from types import SimpleNamespace
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui.ai_tool_host import RULER_LEFT, RULER_TOP, AiToolHost
+
+    spec = next(s for s in ai_tools.TOOL_SPECS if s["function"]["name"] == "screen_map")
+    props = spec["function"]["parameters"]["properties"]
+    assert props["annotate"]["type"] == "boolean" and props["grid"]["type"] == "boolean"
+
+    image = QImage(400, 300, QImage.Format.Format_ARGB32)
+    image.fill(QColor("#ffffff"))
+    monkeypatch.setattr(computer, "ui_elements", lambda _hwnd: "110,60,80,26\tButton\tApply\n")
+    fake = SimpleNamespace(
+        _ocr=lambda _img, boxes=False: "120,100,70,18\tCanvas",
+        _offset_ocr_boxes=AiToolHost._offset_ocr_boxes,
+        _items={},
+        _ocr_ids=set(),
+        _shot="",
+        _ref=None,
+        _maps=0,
+    )
+    out = AiToolHost._map(fake, image, 0, region=[100, 50, 200, 150], annotate=True, grid=True)
+    assert "Top and left rulers mark true screen-pixel coordinates." in out
+    assert "#id boxes are drawn on the screenshot" in out
+    assert "Faint grid lines match the ruler ticks." in out
+    assert "#1 [Button]" in out and "#2 (255, 159)" in out
+    assert fake._shot.startswith("data:image/png;base64,")
+    decoded = QImage.fromData(base64.b64decode(fake._shot.split(",", 1)[1]))
+    assert (decoded.width(), decoded.height()) == (200 + RULER_LEFT, 150 + RULER_TOP)
+
+
+def test_act_reports_post_action_pixel_diff(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui import ai_tool_host
+    from src.ui.ai_tool_host import AiToolHost
+
+    before = QImage(200, 150, QImage.Format.Format_RGB32)
+    before.fill(QColor("#ffffff"))
+    changed = before.copy()
+    for x in range(30, 60):
+        for y in range(20, 40):
+            changed.setPixel(x, y, 0xFF000000)
+
+    monkeypatch.setattr(ai_tool_host, "_ours", lambda _w: [])
+    monkeypatch.setattr(computer, "focus_front_app", lambda: 0)
+    monkeypatch.setattr(computer, "front_state", lambda: ("Paint", False))
+    monkeypatch.setattr(computer, "click", lambda *_a, **_kw: None)
+    monkeypatch.setattr(QTimer, "singleShot", staticmethod(lambda _ms, fn: fn()))
+
+    grabs = iter([before.copy(), changed])
+
+    def fake_emit(item):
+        fn, box = item
+        fn(lambda v: box.__setitem__("result", v))
+
+    results: list[str] = []
+    fake = SimpleNamespace(
+        _win=None,
+        _in_batch=False,
+        _ref=before,
+        cancel=threading.Event(),
+        _call=SimpleNamespace(emit=fake_emit),
+        _grab_screen=lambda done, primary=True: done((next(grabs), 1)),
+    )
+
+    AiToolHost._act(fake, results.append, "mouse_click", {"x": 45, "y": 30})
+    assert "Screen unchanged (0 pixels changed" in results[-1]
+    assert results[-1].endswith("Call screen_map for details.")
+
+    AiToolHost._act(fake, results.append, "mouse_click", {"x": 45, "y": 30})
+    assert "Screen changed in box 30,20," in results[-1]
+    assert results[-1].endswith("Call screen_map for details.")
+    assert fake._ref == changed
+
+
+# --- Track 2: motor primitives + semantic UIA state ------------------------------------------------------
+
+def test_parse_modifiers_modifier_drag_path_and_hover(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert computer.parse_modifiers(None) == []
+    assert computer.parse_modifiers(["shift", "ctrl", "shift"]) == [0x10, 0x11]
+    assert computer.parse_modifiers("ctrl+alt") == [0x11, 0x12]
+    with pytest.raises(ValueError, match="modifiers"):
+        computer.parse_modifiers(["win"])
+
+    events: list = []
+
+    class U32:
+        def SetCursorPos(self, x, y):  # noqa: N802
+            events.append((x, y))
+
+    monkeypatch.setattr(computer, "screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(computer, "_user32", U32)
+    monkeypatch.setattr(computer.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(computer, "_send", lambda *inputs: events.append(
+        tuple((i.ki.vk, i.ki.flags) if i.type == 1 else ("M", i.mi.flags) for i in inputs)))
+
+    # Modifier drag presses Shift before mouse-down and releases Shift after mouse-up
+    computer.drag(10, 10, 30, 10, steps=2, button="right", modifiers=[0x10])
+    assert events == [
+        (10, 10),
+        ((0x10, 0),), (("M", 0x8),),
+        (20, 10), (30, 10),
+        (("M", 0x10),), ((0x10, 0x2),),
+    ]
+
+    # path validates all points before pressing anything
+    events.clear()
+    with pytest.raises(ValueError, match="off the screen"):
+        computer.path([(10, 10), (5000, 10)])
+    assert events == []
+
+    # path traces and stops cleanly on cancel, still releasing button and modifier
+    stop = threading.Event()
+    moves = 0
+
+    def send_stop(*inputs):
+        nonlocal moves
+        events.append(tuple((i.ki.vk, i.ki.flags) if i.type == 1 else ("M", i.mi.flags) for i in inputs))
+        if any(i.type == 0 and (i.mi.flags & 0x1) for i in inputs):
+            moves += 1
+            if moves >= 2:
+                stop.set()
+
+    monkeypatch.setattr(computer, "_send", send_stop)
+    reached = computer.path([(0, 0), (40, 0), (80, 0)], modifiers=[0x11], step_px=20, stop=stop)
+    assert reached == 2
+    assert (("M", 0x2),) in events and (("M", 0x4),) in events
+    assert events[-2:] == [(("M", 0x4),), ((0x11, 0x2),)]
+
+    # hover moves without mouse clicks
+    events.clear()
+    computer.hover(50, 60, wait_ms=10)
+    assert events == [(50, 60)]
+
+
+def test_parse_boxes_and_find_control_handle_uia_state_and_prioritize_non_items() -> None:
+    raw_uia = (
+        "10,10,40,24\tButton\tBrush\ton, key=B\n"
+        "60,10,40,24\tEdit\tSize\tval=12px, focus\n"
+    )
+    mapped = ai_tools.parse_boxes("", 1920, 1080, raw_uia)
+    assert '#1 [Button] "Brush" [on, key=B] (30, 22) box 10,10,40x24' in mapped
+    assert '#2 [Edit] "Size" [val=12px, focus] (80, 22) box 60,10,40x24' in mapped
+    assert ai_tools.find_control(raw_uia, "", "Brush", "", 1920, 1080) == (30, 22, "Brush")
+
+    # Past 150 controls, non-DataItem/TreeItem controls are kept ahead of list/tree items
+    many = "".join(f"10,{i},20,10\tDataItem\tRow{i}\n" for i in range(160))
+    many += "500,500,60,24\tButton\tSave\n"
+    prioritized = ai_tools.parse_boxes("", 1920, 1080, many)
+    assert '[Button] "Save"' in prioritized
+
+
+def test_resolve_target_and_computer_action_for_hover_drag_mods_and_path() -> None:
+    items = {1: (100, 100, 20, 20, "Pencil")}
+    assert ai_tools.resolve_target("mouse_hover", {"id": 1, "wait_ms": 300}, items) == {
+        "x": 110, "y": 110, "wait_ms": 300, "target": '#1 "Pencil"'
+    }
+    assert ai_tools.computer_action("mouse_hover", {"x": 110, "y": 110, "target": '#1 "Pencil"'}) == (
+        'hover on #1 "Pencil" at (110, 110)', ""
+    )
+    assert ai_tools.computer_action(
+        "mouse_drag", {"x": 1, "y": 2, "to_x": 30, "to_y": 40, "modifiers": ["shift"], "button": "right"}
+    ) == ("shift+right-drag from (1, 2) to (30, 40)", "")
+    assert ai_tools.computer_action(
+        "mouse_path", {"points": [[10, 20], [30, 40], [50, 20]], "modifiers": ["ctrl"]}
+    ) == ("ctrl+trace 3-point path from (10, 20) to (50, 20)", "")
+    with pytest.raises(ValueError, match="points"):
+        ai_tools.computer_action("mouse_path", {"points": [[10, 20]]})
+    with pytest.raises(ValueError, match="modifiers"):
+        ai_tools.computer_action("mouse_path", {"points": [[10, 20], [30, 40]], "modifiers": ["bad"]})
+
+
+def test_act_handles_mouse_hover_tooltip_ocr_and_mouse_path(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui import ai_tool_host
+    from src.ui.ai_tool_host import AiToolHost
+
+    before = QImage(200, 150, QImage.Format.Format_RGB32)
+    before.fill(QColor("#ffffff"))
+    hovered = before.copy()
+    for x in range(50, 110):
+        for y in range(40, 60):
+            hovered.setPixel(x, y, 0xFF222222)
+
+    monkeypatch.setattr(ai_tool_host, "_ours", lambda _w: [])
+    monkeypatch.setattr(computer, "focus_front_app", lambda: 0)
+    monkeypatch.setattr(computer, "front_state", lambda: ("Krita", False))
+    monkeypatch.setattr(computer, "hover", lambda *_a, **_kw: None)
+    monkeypatch.setattr(computer, "uia_at", lambda _x, _y: [("button", "Freehand Brush")])
+    monkeypatch.setattr(computer, "path", lambda pts, **_kw: len(pts))
+    monkeypatch.setattr(QTimer, "singleShot", staticmethod(lambda _ms, fn: fn()))
+
+    grabs = iter([hovered, hovered])
+
+    def fake_emit(item):
+        fn, box = item
+        fn(lambda v: box.__setitem__("result", v))
+
+    done_ev = threading.Event()
+    results: list[str] = []
+
+    def record(txt: str) -> None:
+        results.append(txt)
+        done_ev.set()
+
+    fake = SimpleNamespace(
+        _win=None,
+        _in_batch=False,
+        _ref=before,
+        cancel=threading.Event(),
+        _call=SimpleNamespace(emit=fake_emit),
+        _grab_screen=lambda done, primary=True: done((next(grabs), 1)),
+        _ocr=lambda _img, empty="": "Freehand Brush Tool (B)",
+    )
+
+    AiToolHost._act(fake, record, "mouse_hover", {"x": 40, "y": 30, "wait_ms": 200})
+    assert done_ev.wait(3.0)
+    assert 'under cursor: [button] "Freehand Brush"' in results[-1]
+    assert 'Hover text: "Freehand Brush Tool (B)".' in results[-1]
+
+    done_ev.clear()
+    AiToolHost._act(fake, record, "mouse_path", {"points": [[10, 10], [50, 50], [90, 20]]})
+    assert done_ev.wait(3.0)
+    assert "traced 3-point path." in results[-1]
+
+
+# --- Track 3: canvas vision instruments + smart screenshot retention -------------------------------------
+
+def test_analyze_colors_points_palette_and_validation() -> None:
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui.ai_tool_host import analyze_colors
+
+    img = QImage(100, 80, QImage.Format.Format_RGB32)
+    img.fill(QColor("#ffffff"))
+    for x in range(10, 50):
+        for y in range(10, 40):
+            img.setPixel(x, y, 0xFF112233)
+
+    out = analyze_colors(img, points=[[20, 20], [80, 60], [500, 500]], region=[0, 0, 100, 80], top=3)
+    assert "(20, 20): #112233" in out and "dark)" in out
+    assert "(80, 60): #ffffff" in out and "light)" in out
+    assert "(500, 500): off screen" in out
+    assert "Region 0,0,100x80 palette" in out and "#ffffff" in out and "#112233" in out and "contrast" in out
+
+    assert analyze_colors(img).startswith("error: give points")
+    assert analyze_colors(img, points=[[1, 1]], top=0).startswith("error: top must be")
+    assert analyze_colors(img, points=[[1, 1]] * 25).startswith("error: points must be")
+
+
+def test_peek_region_grayscale_diff_and_skips_ocr_uia(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+    from types import SimpleNamespace
+    from PyQt6.QtGui import QColor, QImage
+    from src.ui.ai_tool_host import RULER_LEFT, RULER_TOP, AiToolHost
+    from src.ui.chat_widgets import MAX_IMAGE_SIDE
+
+    monkeypatch.setattr(computer, "ui_elements", lambda *_a: (_ for _ in ()).throw(AssertionError("no uia")))
+    before = QImage(200, 150, QImage.Format.Format_RGB32)
+    before.fill(QColor("#2080d0"))
+    after = before.copy()
+    for x in range(40, 80):
+        for y in range(30, 70):
+            after.setPixel(x, y, 0xFFE04020)
+
+    fake = SimpleNamespace(_ref=None, _shot="")
+    # Grayscale + grid peek without prior ref
+    out1 = AiToolHost._peek_region(fake, before, 0, region=[20, 10, 120, 90], grid=True, grayscale=True, diff=True)
+    assert "grayscale" in out1 and "No prior screen grab" in out1
+    img1 = QImage.fromData(base64.b64decode(fake._shot.split(",", 1)[1]))
+    assert (img1.width(), img1.height()) == (120 + RULER_LEFT, 90 + RULER_TOP)
+    px = img1.pixelColor(RULER_LEFT + 10, RULER_TOP + 10)
+    assert px.red() == px.green() == px.blue()  # grayscale
+
+    # Side-by-side BEFORE | AFTER diff against prior ref
+    out2 = AiToolHost._peek_region(fake, after, 0, region=[20, 10, 120, 90], diff=True)
+    assert "side-by-side BEFORE | AFTER" in out2 and "Screen changed in box" in out2
+    img2 = QImage.fromData(base64.b64decode(fake._shot.split(",", 1)[1]))
+    assert max(img2.width(), img2.height()) <= MAX_IMAGE_SIDE
+    assert img2.width() > 200  # two panels side by side
+
+    # When _ref already matches current screen (post-action), diff falls back to _prev_ref
+    out3 = AiToolHost._peek_region(fake, after, 0, region=[20, 10, 120, 90], diff=True)
+    assert "side-by-side BEFORE | AFTER" in out3 and "Screen changed in box" in out3
+
+
+def test_smart_screenshot_retention_pins_ref_or_overview_while_keeping_homogeneous_trim() -> None:
+    from src.tools import ai_assist
+
+    assert ai_assist._shot_role("view_image", {"path": "ref.png"}) == "ref"
+    assert ai_assist._shot_role("screen_map", "{}") == "full"
+    assert ai_assist._shot_role("peek_region", '{"region": [0, 0, 100, 100]}') == "detail"
+
+    # Homogeneous full-screen shots prune down to just the newest (1)
+    assert ai_assist._prune_shot_keys([(1, "full"), (2, "full"), (3, "full"), (4, "full")], 2) == {4}
+    # Mixed ref + detail shots pin the ref alongside the newest detail
+    assert ai_assist._prune_shot_keys([(1, "ref"), (2, "detail"), (3, "detail"), (4, "detail")], 2) == {1, 4}
+    # Mixed full + detail shots pin the newest full view alongside the newest detail
+    assert ai_assist._prune_shot_keys([(1, "full"), (2, "detail"), (3, "detail"), (4, "detail")], 2) == {1, 4}
+
+    # Claude _drop_old_shots keeps the pinned view_image reference turn intact
+    img_block = [{"type": "text", "text": "ok"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]
+    turns = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "view_image", "input": {"path": "r.png"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": list(img_block)}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "peek_region", "input": {"region": [0, 0, 50, 50]}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": list(img_block)}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t3", "name": "peek_region", "input": {"region": [10, 10, 50, 50]}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": list(img_block)}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t4", "name": "peek_region", "input": {"region": [20, 20, 50, 50]}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t4", "content": list(img_block)}]},
+    ]
+    pruned = ai_assist._drop_old_shots(turns)
+    assert isinstance(pruned[1]["content"][0]["content"], list)  # pinned ref kept
+    assert isinstance(pruned[3]["content"][0]["content"], str)   # intermediate detail dropped
+    assert isinstance(pruned[5]["content"][0]["content"], str)   # intermediate detail dropped
+    assert isinstance(pruned[7]["content"][0]["content"], list)  # newest turn kept
+
+
+# --- Track 4 & 5: visual-design skill, check_layout upgrades, unlabeled icon detector ------------------
+
+def test_visual_design_skill_and_geometry_helpers_run_in_powershell(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    from src.tools.builtin_skills import helpers_path
+
+    body = ai_tools.load_skill(tmp_path / "skills", "visual-design")
+    hp = helpers_path("visual-design")
+    assert f'. "{hp}"' in body and "mouse_hover" in body and "spawn_agent" in body
+    assert hp.is_file()
+
+    script = (
+        f'. "{hp}"\n'
+        '$sun = New-CirclePoints 100 100 20 20 8\n'
+        'Write-Output $sun\n'
+        'New-BezierPoints 0 0 10 20 30 20 40 0 4\n'
+        'New-GridSlots 10 20 220 120 2 1 10 20\n'
+    )
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 3
+    circle = json.loads(lines[0])
+    bezier = json.loads(lines[1])
+    slots = json.loads(lines[2])
+    assert len(circle) == 9 and circle[0] == [120, 100] and circle[-1] == [120, 100]
+    assert len(bezier) == 5 and bezier[0] == [0, 0] and bezier[-1] == [40, 0]
+    assert slots == [[20, 30, 90, 100], [130, 30, 90, 100]]
+
+
+def test_check_layout_detects_alignment_drift_and_visual_imbalance() -> None:
+    page = (100, 100, 800, 1000)
+    # Balanced page with 20px drift between #2 and #3 (intentional offset > 14px) -> clean
+    ink_bal = [(y, 160, 840) for y in range(160, 1040, 3)]
+    items_ok = {
+        1: (160, 160, 500, 48, "TITLE"),
+        2: (160, 240, 400, 20, "First block"),
+        3: (160, 300, 400, 20, "Aligned block"),
+        4: (160, 360, 400, 20, "Third block"),
+    }
+    assert ai_tools.check_layout(page, items_ok, ink_bal) == []
+
+    # 8px left-edge drift between #2 and #3 -> flagged
+    items_drift = {**items_ok, 3: (168, 300, 400, 20, "Drifted block")}
+    assert any("near-aligned left edges" in p for p in ai_tools.check_layout(page, items_drift, ink_bal))
+
+    # Narrow content heavily leaning left -> flagged
+    ink_left = [(y, 160, 320) for y in range(160, 1040, 3)]
+    assert any("visual weight leans heavily to the left" in p
+               for p in ai_tools.check_layout(page, items_ok, ink_left))
+
+
+def test_detect_toolbar_icons_finds_unlabeled_icons_and_integrates_with_map(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from PyQt6.QtGui import QColor, QImage, QPainter, QPen
+    from src.ui.ai_tool_host import AiToolHost, detect_toolbar_icons
+
+    img = QImage(400, 300, QImage.Format.Format_ARGB32)
+    img.fill(QColor("#f3f4f6"))
+    p = QPainter(img)
+    try:
+        p.setPen(QPen(QColor("#1f2937"), 2))
+        # Icon 1 at (20, 20, 24x24): hollow square + diagonal
+        p.drawRect(20, 20, 22, 22)
+        p.drawLine(20, 20, 42, 42)
+        # Icon 2 at (70, 20, 24x24): hollow circle
+        p.drawEllipse(70, 20, 22, 22)
+        # Covered by existing UIA control at (120, 20, 24x24) -> should be skipped
+        p.drawRect(120, 20, 22, 22)
+    finally:
+        p.end()
+
+    icons = detect_toolbar_icons(img, existing=[(115, 15, 34, 34)])
+    assert len(icons) == 2
+    assert any(16 <= x <= 24 and 16 <= y <= 24 for x, y, _w, _h in icons)
+    assert any(66 <= x <= 74 and 16 <= y <= 24 for x, y, _w, _h in icons)
+
+    monkeypatch.setattr(computer, "ui_elements", lambda _hwnd: "115,15,34,34\tButton\tBrush\n")
+    fake = SimpleNamespace(
+        _ocr=lambda _img, boxes=False: "",
+        _offset_ocr_boxes=AiToolHost._offset_ocr_boxes,
+        _items={},
+        _ocr_ids=set(),
+        _shot="",
+        _ref=None,
+        _maps=0,
+    )
+    out = AiToolHost._map(fake, img, 0, annotate=True)
+    assert '[Icon] "(unlabeled)"' in out
+    assert "violet = unlabeled icon" in out
+
+
+
+
 
