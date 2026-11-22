@@ -53,6 +53,7 @@ from src.tools.ai_tools import (CHAIN_NOTE, SCREEN_TOOLS, MEMORY_HEADER, scratch
                                 rules_prompt, load_skill, skills_dir, skills_prompt, skills_recall)
 from src.tools.errands import ERRAND_MARK
 from src.tools.mcp_client import SEP as MCP_SEP, ensure_config
+from src.tools.qt_relay import emit_later, ensure_relay
 
 logger = logging.getLogger(__name__)
 
@@ -2252,6 +2253,7 @@ class AiJob(QObject):
     finished = pyqtSignal(object, str)
 
     def start(self, call: Callable[[], Any]) -> None:
+        ensure_relay()
         threading.Thread(target=self._run, args=(call,), daemon=True).start()
 
     def _run(self, call: Callable[[], Any]) -> None:
@@ -2262,10 +2264,7 @@ class AiJob(QObject):
         except Exception:  # a bug in a reply parser or tool must not leave the chat busy for good
             logger.exception("call failed")
             result, error = None, "bad reply"
-        try:
-            self.finished.emit(result, error)
-        except RuntimeError:  # the chat that started it was closed (app quit) while the call ran
-            pass
+        emit_later(self, "finished", result, error)  # skipped if the chat that started it was closed meanwhile
 
 
 class AiAssistPlugin:

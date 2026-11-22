@@ -23,6 +23,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader
 
 from src.tools.file_forge import _unique_output_path
+from src.tools.qt_relay import emit_later, ensure_relay
 
 MAX_WEB_IMAGE_BYTES: int = 20 * 1024 * 1024
 FETCH_TIMEOUT_S: float = 15.0
@@ -168,6 +169,7 @@ class WebImageJob(QObject):
     finished = pyqtSignal(object, str)
 
     def start(self, source: str | QImage, dest_dir: Path) -> None:
+        ensure_relay()
         threading.Thread(target=self._run, args=(source, dest_dir), daemon=True).start()
 
     def _run(self, source: str | QImage, dest_dir: Path) -> None:
@@ -178,6 +180,6 @@ class WebImageJob(QObject):
                 image = decode_image_bytes(fetch_image_bytes(source))
                 path = save_clean_png(image, dest_dir, web_image_stem(source), source)
         except (ValueError, OSError, http.client.HTTPException) as exc:
-            self.finished.emit(None, str(exc))
+            emit_later(self, "finished", None, str(exc))
             return
-        self.finished.emit(path, "")
+        emit_later(self, "finished", path, "")

@@ -16,6 +16,8 @@ from PyQt6.QtCore import QObject, QPoint, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
 
+from src.tools.qt_relay import emit_later, ensure_relay
+
 SNIP_MODES: tuple[str, ...] = ("image", "text", "color")
 
 # ---------------------------------------------------------------------------
@@ -325,6 +327,7 @@ class OcrJob(QObject):
         tmp_dir = Path(tempfile.mkdtemp(prefix="paperduck_ocr_"))
         png = tmp_dir / "snip.png"
         image.save(str(png), "PNG")
+        ensure_relay()
         threading.Thread(target=self._run, args=(png,), daemon=True).start()
 
     def _run(self, png: Path) -> None:
@@ -332,7 +335,7 @@ class OcrJob(QObject):
         for leftover in (png, png.with_suffix(".ps1")):
             leftover.unlink(missing_ok=True)
         png.parent.rmdir()
-        self.finished.emit(text)
+        emit_later(self, "finished", text)
 
 
 # ---------------------------------------------------------------------------

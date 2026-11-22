@@ -33,6 +33,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from src import __version__
 from src.signing import verify
+from src.tools.qt_relay import emit_later, ensure_relay
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,7 @@ class UpdateJob(QObject):
     progress = pyqtSignal(int)  # percent of the bundle downloaded
 
     def start(self, *, install: bool) -> None:
+        ensure_relay()
         threading.Thread(target=self._run, args=(install,), daemon=True).start()
 
     def _run(self, install: bool) -> None:
@@ -391,24 +393,24 @@ class UpdateJob(QObject):
             tag, zip_url, sig_url = latest_release()
             if not is_newer(tag):
                 shutil.rmtree(APP_DIR.parent / CACHE_NAME, ignore_errors=True)  # the cached update is installed
-                self.finished.emit("current", tag)
+                emit_later(self, "finished", "current", tag)
                 return
             if not is_installed():
-                self.finished.emit("available", tag)
+                emit_later(self, "finished", "available", tag)
                 return
             if not install:  # the quiet startup check: fetch it now, at whatever speed GitHub gives
                 try:
                     _bundle(tag, zip_url, sig_url)
                 except (OSError, ValueError, zipfile.BadZipFile, http.client.HTTPException) as exc:
                     logger.warning("prefetching update %s failed: %s: %s", tag, type(exc).__name__, exc)
-                    self.finished.emit("available", tag)  # still say it exists; installing retries and explains
+                    emit_later(self, "finished", "available", tag)  # still say it exists; installing retries and explains
                     return
-                self.finished.emit("ready", tag)
+                emit_later(self, "finished", "ready", tag)
                 return
             apply = install_frozen_zip if FROZEN else install_source_zip
-            apply(_bundle(tag, zip_url, sig_url, self.progress.emit))
+            apply(_bundle(tag, zip_url, sig_url, lambda pct: emit_later(self, "progress", pct)))
         except (OSError, ValueError, KeyError, zipfile.BadZipFile, http.client.HTTPException) as exc:
             logger.warning("update %s failed: %s: %s", tag or "check", type(exc).__name__, exc)
-            self.finished.emit("error", str(exc) or tag)
+            emit_later(self, "finished", "error", str(exc) or tag)
             return
-        self.finished.emit("installed", tag)
+        emit_later(self, "finished", "installed", tag)
