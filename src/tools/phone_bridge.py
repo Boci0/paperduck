@@ -12,10 +12,12 @@ import base64
 import binascii
 import ctypes
 import ctypes.wintypes as wintypes
+import hashlib
 import hmac
 import http.cookies
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -27,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -40,14 +42,27 @@ MAX_REMOTE_ATTACHMENTS = 4
 MAX_REMOTE_FILE_BYTES = 4 * 1024 * 1024
 MAX_PROMPT_CHARS = 32_000
 MAX_SESSIONS = 16
+MAX_REVOKED = 256
+MAX_ACTIVE_CONNECTIONS = 32
+REQUEST_TIMEOUT_S = 15.0
 RATE_WINDOW_S = 60.0
 RATE_MAX_FAILS = 10
 COOKIE_MAX_AGE_S = 30 * 24 * 3600
+CLOCK_SKEW_S = 60
 SSE_MIN_INTERVAL_S = 0.15
 REMOTE_CRED_TARGET = "Paperduck Remote/pairing-token"
 COOKIE_NAME = "pd_remote"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
 _SID_RE = re.compile(r"^[0-9a-f]{12}$")
+_UNSET = object()
+
+
+def _default_revoked_path() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Paperduck" / "remote_revoked.json"
+
+
+def _sid_digest(sid: str) -> str:
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32]
 
 
 def sanitize_attachment_name(raw: str) -> str:
@@ -3423,11 +3438,29 @@ class _BridgeHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address: tuple[str, int], bridge: PhoneBridge) -> None:
         self.bridge = bridge
+        self._conn_sem = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
         super().__init__(server_address, _BridgeHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_sem.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = REQUEST_TIMEOUT_S
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         logger.debug("remote: " + format, *args)
@@ -3516,6 +3549,14 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def _reject_bad_host(self, *, is_post: bool = False) -> bool:
+        if self._bridge()._host_allowed(self.headers.get("Host") or ""):
+            return False
+        if is_post:
+            self._drain_small_body()
+        self._send_json(HTTPStatus.MISDIRECTED_REQUEST, {"error": "unknown host"})
+        return True
+
     def _cookie_session(self) -> str | None:
         raw = self.headers.get("Cookie") or ""
         if not raw:
@@ -3591,6 +3632,8 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
         bridge = self._bridge()
+        if self._reject_bad_host():
+            return
 
         if path == "/pair":
             if self._reject_cross_site(allow_navigate=True):
@@ -3707,7 +3750,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         path = parsed.path
         bridge = self._bridge()
 
-        if self._reject_cross_site(is_post=True):
+        if self._reject_bad_host(is_post=True) or self._reject_cross_site(is_post=True):
             return
 
         if path == "/pair":
@@ -3959,13 +4002,15 @@ class PhoneBridge:
     """Lifecycle and auth manager for the local + Tailscale HTTP bridge."""
 
     def __init__(self, handlers: BridgeHandlers, *, port: int = DEFAULT_PORT,
-                 token: str | None = None, manage_tailscale: bool = True, icon_png: bytes = b"") -> None:
+                 token: str | None = None, manage_tailscale: bool = True, icon_png: bytes = b"",
+                 revoked_path: Path | None | object = _UNSET) -> None:
         self.handlers = handlers
         self.icon_png = icon_png
         self.preferred_port = port
         self._explicit_token = token
         self._token = token or ""
         self._manage_tailscale = manage_tailscale
+        self._revoked_path: Path | None = (_default_revoked_path() if token is None else None) if revoked_path is _UNSET else revoked_path  # type: ignore[assignment]
         self._server: _BridgeHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -3973,16 +4018,18 @@ class PhoneBridge:
         self.version = 0
         self._snap_lock = threading.Lock()
         self._snap_cache: tuple[int, bytes] | None = None
-        self._revoked: deque[str] = deque(maxlen=MAX_SESSIONS * 4)
+        self._revoked: dict[str, int] = {}
         self._fails: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
         self.bound_host = ""
         self.bound_port = 0
         self.public_url = ""
+        self._alias_hosts: frozenset[str] = frozenset()  # other tailnet names (IP, MagicDNS short name)
         self.mode = ""  # "tailscale_serve" | "tailscale_ip" | "loopback"
         self.last_error = ""
         self.status_note = ""
         self._serve_owned = False
+        self._load_revoked()
 
     @property
     def running(self) -> bool:
@@ -4039,6 +4086,16 @@ class PhoneBridge:
                 q.popleft()
             return len(q) >= RATE_MAX_FAILS
 
+    def _host_allowed(self, host_header: str) -> bool:
+        """DNS-rebinding guard: a page that rebinds its own name to this PC sends that name as Host."""
+        raw = host_header.strip()
+        if not raw or any(c in raw for c in "@/\\?# "):
+            return False
+        name = (urlsplit(f"//{raw}").hostname or "").rstrip(".")
+        allowed = {"127.0.0.1", "localhost", "::1", self.bound_host.lower(),
+                   (urlsplit(self.public_url).hostname or "").lower(), *self._alias_hosts}
+        return bool(name) and name in allowed
+
     def _origin_allowed(self, origin: str, host_header: str) -> bool:
         netloc = urlsplit(origin).netloc.lower()
         if not netloc:
@@ -4065,39 +4122,109 @@ class PhoneBridge:
             q.append(now)
         return False
 
+    def _prune_revoked_locked(self, now: int) -> None:
+        expired = [k for k, exp in self._revoked.items() if exp <= now]
+        for k in expired:
+            del self._revoked[k]
+        if len(self._revoked) > MAX_REVOKED:
+            newest = sorted(self._revoked.items(), key=lambda kv: kv[1], reverse=True)[:MAX_REVOKED]
+            self._revoked = dict(newest)
+
+    def _load_revoked(self) -> None:
+        path = self._revoked_path
+        if path is None:
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        now = int(time.time())
+        loaded = {
+            str(k): int(v)
+            for k, v in raw.items()
+            if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) > now
+        }
+        with self._lock:
+            self._revoked = loaded
+            self._prune_revoked_locked(now)
+
+    def _save_revoked_locked(self) -> None:
+        path = self._revoked_path
+        if path is None:
+            return
+        try:
+            if not self._revoked:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._revoked), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _parse_session(sid: str) -> tuple[str, int, str] | None:
+        parts = sid.rsplit(".", 2)
+        if len(parts) != 3:
+            return None
+        nonce, issued_str, sig = parts
+        if not nonce or not sig or not issued_str.isdigit():
+            return None
+        return nonce, int(issued_str), sig
+
     def _create_session(self) -> str:
         nonce = secrets.token_urlsafe(16)
+        issued_at = int(time.time())
+        payload = f"{nonce}.{issued_at}"
         key = self._token.encode("utf-8")
-        sig = hmac.new(key, b"sid:" + nonce.encode("utf-8"), "sha256").hexdigest()[:24]
-        return f"{nonce}.{sig}"
+        sig = hmac.new(key, b"sid:" + payload.encode("utf-8"), "sha256").hexdigest()[:32]
+        return f"{payload}.{sig}"
 
     def _session_csrf(self, sid: str) -> str | None:
         if not sid or not self._token:
             return None
-        with self._lock:
-            if sid in self._revoked:
-                return None
-        nonce, sep, sig = sid.partition(".")
-        if not sep or not nonce:
+        parsed = self._parse_session(sid)
+        if parsed is None:
             return None
+        nonce, issued_at, sig = parsed
+        now = int(time.time())
+        if issued_at > now + CLOCK_SKEW_S or (now - issued_at) > COOKIE_MAX_AGE_S:
+            return None
+        payload = f"{nonce}.{issued_at}"
         key = self._token.encode("utf-8")
-        expected = hmac.new(key, b"sid:" + nonce.encode("utf-8"), "sha256").hexdigest()[:24]
+        expected = hmac.new(key, b"sid:" + payload.encode("utf-8"), "sha256").hexdigest()[:32]
         if not hmac.compare_digest(sig, expected):
             return None
+        digest = _sid_digest(sid)
+        with self._lock:
+            if digest in self._revoked:
+                if self._revoked[digest] > now:
+                    return None
+                del self._revoked[digest]
+                self._save_revoked_locked()
         return hmac.new(key, b"csrf:" + sid.encode("utf-8"), "sha256").hexdigest()[:24]
 
     def _drop_session(self, sid: str) -> None:
         if not sid:
             return
+        now = int(time.time())
+        parsed = self._parse_session(sid)
+        exp = (parsed[1] + COOKIE_MAX_AGE_S) if parsed is not None else (now + COOKIE_MAX_AGE_S)
+        digest = _sid_digest(sid)
         with self._lock:
-            if sid not in self._revoked:
-                self._revoked.append(sid)
+            self._revoked[digest] = min(exp, now + COOKIE_MAX_AGE_S)
+            self._prune_revoked_locked(now)
+            self._save_revoked_locked()
 
     def rotate_token(self) -> str:
         self._token = generate_token() if self._explicit_token is not None else rotate_remote_token()
         with self._lock:
             self._revoked.clear()
             self._fails.clear()
+            self._save_revoked_locked()
         return self._token
 
     def start(self) -> tuple[bool, str]:
@@ -4120,6 +4247,9 @@ class PhoneBridge:
 
         local_port = int(srv.server_address[1])
         self._serve_owned = False
+        self._alias_hosts = frozenset(
+            h.lower().rstrip(".") for h in ((info.ip, info.dns_name, info.host_name) if info is not None else ()) if h
+        )
         if self._manage_tailscale and info is not None:
             ok, res = ((True, start_tailscale_serve(local_port, info)) if info.serve_enabled
                        else (False, (False, "HTTPS certificates not enabled on tailnet")))
@@ -4197,4 +4327,5 @@ class PhoneBridge:
             self._serve_owned = False
             stop_tailscale_serve()
         self.bound_host = self.public_url = self.mode = ""
+        self._alias_hosts = frozenset()
         self.bound_port = 0

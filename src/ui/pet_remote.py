@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter
 from PyQt6.QtWidgets import (
     QDialog,
@@ -31,6 +31,7 @@ from src.graphics.duck import render_icon
 from src.tools import computer
 from src.tools.ai_assist import THINKING_LEVELS, AiAssistPlugin, valid_model
 from src.tools.ai_tools import OFFICE_EXTS, _office_text, _pdf_text, scratch_dir
+from src.tools.hints import PRIVATE_APPS, foreground_app, foreground_title
 from src.tools.phone_bridge import (
     DEFAULT_PORT,
     BridgeHandlers,
@@ -39,6 +40,7 @@ from src.tools.phone_bridge import (
     sanitize_attachment_name,
 )
 from src.tools.qr import qr_matrix
+from src.tools.watch import is_private_title
 from src.tools.web_drop import sniff_image_format
 from src.ui.ai_chat import AiChat
 from src.ui.ai_tool_host import AiToolHost, _ours, show_quietly
@@ -63,8 +65,33 @@ if TYPE_CHECKING:
     from src.ui.pet_window import PetWindow
 
 SCREEN_CACHE_S = 0.35
+WATCH_INDICATOR_S = 6.0
 MAX_STAGED_UPLOADS = 40
 STAGED_UPLOAD_MAX_AGE_S = 24 * 3600
+
+
+def copy_private_text(text: str) -> bool:
+    """Copy `text` to the clipboard marked private so Windows Clipboard History and ClipVault skip it."""
+    cb = QGuiApplication.clipboard()
+    if cb is None or not text:
+        return False
+    mime = QMimeData()
+    mime.setText(text)
+    mime.setData('application/x-qt-windows-mime;value="ExcludeClipboardContentFromMonitorProcessing"', b"\x00")
+    mime.setData('application/x-qt-windows-mime;value="CanIncludeInClipboardHistory"', b"\x00\x00\x00\x00")
+    mime.setData('application/x-qt-windows-mime;value="Clipboard Viewer Ignore"', b"\x00")
+    cb.setMimeData(mime)
+    return True
+
+
+def private_screen_reason() -> str:
+    """Return a non-empty pause reason when a password manager or credential/private window is in front."""
+    app = (foreground_app() or "").lower()
+    if app in PRIVATE_APPS:
+        return "Screen paused (password manager in front)"
+    if is_private_title(foreground_title() or ""):
+        return "Screen paused (private or credential window in front)"
+    return ""
 
 
 def _encode_image(image: Any, max_w: int, fmt: str = "png", quality: int = 78) -> tuple[bytes | None, str]:
@@ -365,9 +392,7 @@ class _PairingDialog(QDialog):
         self._show_tok_btn.setText("Hide" if hidden else "Show")
 
     def _copy(self, text: str, note: str) -> None:
-        cb = QGuiApplication.clipboard()
-        if cb is not None and text:
-            cb.setText(text)
+        if copy_private_text(text):
             self._flash_note = note
             self._note.setText(note)
 
@@ -508,6 +533,7 @@ class RemoteController(QObject):
     """Owns PhoneBridge lifecycle and marshals HTTP callbacks safely onto the Qt GUI thread."""
 
     _call = pyqtSignal(object)
+    _watch_ping = pyqtSignal()
     bridge_state_changed = pyqtSignal()
 
     def __init__(self, win: PetWindow, *, manage_tailscale: bool = True, port: int = DEFAULT_PORT) -> None:
@@ -518,6 +544,10 @@ class RemoteController(QObject):
         self._dialog: _PairingDialog | None = None
         self._screen_lock = threading.Lock()
         self._last_screen: tuple[float, int, int, str, int, bytes, str] | None = None
+        self._last_watch_at: float = 0.0
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setSingleShot(True)
+        self._watch_timer.timeout.connect(self._on_watch_expired)
         self._op_lock = threading.Lock()
         self._transitioning = False
         self._active_target: str = "phone"
@@ -525,6 +555,8 @@ class RemoteController(QObject):
         self._phone_chat: AiChat | None = None
         self._phone_overrides: dict[str, Any] = {}
         self._call.connect(self._on_call)
+        self._watch_ping.connect(self._on_watch_ping)
+        self.bridge_state_changed.connect(self._on_bridge_state)  # queued onto the GUI thread from the toggle worker
         self.bridge = PhoneBridge(
             BridgeHandlers(
                 get_state=self._get_state,
@@ -555,6 +587,30 @@ class RemoteController(QObject):
     @property
     def transitioning(self) -> bool:
         return self._transitioning
+
+    @property
+    def screen_watched(self) -> bool:
+        return self.running and self._last_watch_at > 0.0 and (time.monotonic() - self._last_watch_at) <= WATCH_INDICATOR_S
+
+    def _on_watch_ping(self) -> None:
+        if self._win._is_shutting_down:
+            return
+        was_watched = self.screen_watched
+        self._last_watch_at = time.monotonic()
+        self._watch_timer.start(int(WATCH_INDICATOR_S * 1000) + 150)
+        if not was_watched:
+            self._win.update()
+            self._win._show_toast("PHONE VIEW", QColor("#FFCD75"))
+
+    def _on_watch_expired(self) -> None:
+        if not self._win._is_shutting_down:
+            self._win.update()
+
+    def _on_bridge_state(self) -> None:
+        if not self.running:
+            self._watch_timer.stop()
+        if not self._win._is_shutting_down:
+            self._win.update()  # drop the LIVE badge once the bridge stops
 
     def _on_call(self, payload: tuple[Callable[[Callable[[Any], None]], None], dict[str, Any]]) -> None:
         fn, box = payload
@@ -798,6 +854,10 @@ class RemoteController(QObject):
         return res if isinstance(res, tuple) else (False, "GUI unavailable")
 
     def _grab_screen_opts(self, max_w: int, monitor: int = 0, fmt: str = "png", quality: int = 78) -> tuple[bytes | None, str, str]:
+        if reason := private_screen_reason():
+            with self._screen_lock:
+                self._last_screen = None
+            return None, "", reason
         fmt_norm = "jpeg" if fmt.lower() in ("jpg", "jpeg") else "png"
         q_norm = max(40, min(95, quality)) if fmt_norm == "jpeg" else 0
         now = time.monotonic()
@@ -805,6 +865,7 @@ class RemoteController(QObject):
             if self._last_screen is not None:
                 ts, c_mon, c_w, c_fmt, c_q, c_bytes, c_mime = self._last_screen
                 if now - ts < SCREEN_CACHE_S and c_mon == monitor and c_w == max_w and c_fmt == fmt_norm and c_q == q_norm:
+                    self._watch_ping.emit()
                     return c_bytes, c_mime, ""
 
         def trigger(done: Callable[[Any], None]) -> None:
@@ -824,6 +885,7 @@ class RemoteController(QObject):
         if data is not None:
             with self._screen_lock:
                 self._last_screen = (time.monotonic(), monitor, max_w, fmt_norm, q_norm, data, mime)
+            self._watch_ping.emit()
         return data, mime, err
 
     def _grab_screen(self, max_w: int) -> tuple[bytes | None, str]:
@@ -838,7 +900,9 @@ class RemoteController(QObject):
         return ok, info
 
     def stop(self) -> None:
+        # Runs on the stop_async worker too: no widget or timer calls here (they corrupted Qt), see _on_bridge_state
         self.enabled = False
+        self._last_watch_at = 0.0
         self.bridge.stop()
         self.bridge_state_changed.emit()
 
@@ -935,6 +999,8 @@ class RemoteController(QObject):
             self.start()
 
     def close(self) -> None:
+        self._last_watch_at = 0.0
+        self._watch_timer.stop()
         if self._dialog is not None:
             self._dialog.close()
             self._dialog = None

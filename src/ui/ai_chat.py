@@ -941,10 +941,16 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         link.setCursor(Qt.CursorShape.PointingHandCursor)
         link.setToolTip("Copy this message exactly as sent")
 
+        # Owned by the link: a bare singleShot outlived a row cleared within 1.5 s and aborted on the dead label
+        revert = QTimer(link)
+        revert.setSingleShot(True)
+        revert.setInterval(1500)
+        revert.timeout.connect(lambda: link.setText("Copy"))
+
         def copy() -> None:
             QGuiApplication.clipboard().setText(text)
             link.setText("Copied")
-            QTimer.singleShot(1500, lambda: link.setText("Copy"))
+            revert.start()
 
         link.clicked.connect(copy)
         return link

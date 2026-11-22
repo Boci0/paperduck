@@ -60,6 +60,8 @@ class PaintMixin:
         errands = self._errands()
         if errands is not None and errands.errands:
             self._paint_errand_tag(painter, len(errands.errands))
+        if getattr(self, "remote", None) is not None and self.remote.screen_watched:
+            self._paint_watch_badge(painter)
 
         if self._hint is not None:
             self._paint_hint(painter)
@@ -172,6 +174,23 @@ class PaintMixin:
         painter.setFont(ui_font(6.5, bold=True))
         painter.setPen(QColor(TEXT_HEX))
         painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, str(count))
+        painter.restore()
+
+    def _paint_watch_badge(self, painter: QPainter) -> None:
+        """Subtle indicator near the pet while a paired remote session is actively polling the screen."""
+        s = self._sprite_rect
+        pill = QRect(min(self.width() - 40, s.right() - 34), max(2, s.top() + 2), 36, 13)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        paint_panel(painter, pill, radius=6, fold=False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#EE7A5C"))
+        painter.drawEllipse(QRectF(pill.left() + 4, pill.center().y() - 2.0, 4.5, 4.5))
+        painter.setFont(ui_font(6.0, bold=True))
+        painter.setPen(QColor(TEXT_HEX))
+        painter.drawText(QRect(pill.left() + 9, pill.top(), pill.width() - 11, pill.height()),
+                         Qt.AlignmentFlag.AlignCenter, "LIVE")
         painter.restore()
 
     def _paint_toast(self, painter: QPainter) -> None:

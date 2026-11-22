@@ -202,6 +202,31 @@ def test_copy_links_put_the_exact_prompt_and_reply_on_the_clipboard() -> None:
         chat.deleteLater()
 
 
+def test_copy_link_reverts_and_its_timer_dies_with_a_cleared_chat() -> None:
+    from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+    from PyQt6.QtGui import QGuiApplication
+    from PyQt6.QtTest import QTest
+
+    from src.ui.chat_widgets import _ClickLabel
+
+    chat = _chat()  # creates the QApplication the clipboard needs
+    clip = QGuiApplication.clipboard()
+    saved = clip.text()
+    try:
+        chat._add_row("user", "hello")
+        link = next(w for w in chat.findChildren(_ClickLabel) if w.text() == "Copy")
+        QTest.mouseClick(link, Qt.MouseButton.LeftButton)
+        QTest.qWait(1700)
+        assert link.text() == "Copy"
+
+        QTest.mouseClick(link, Qt.MouseButton.LeftButton)
+        chat.deleteLater()  # chat cleared before the 1.5 s revert: the old bare singleShot aborted the process
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        QTest.qWait(1700)
+    finally:
+        clip.setText(saved)
+
+
 def test_delete_this_chat_removes_only_the_open_chat() -> None:
     keep = new_id()
     save_session(keep, HISTORY)

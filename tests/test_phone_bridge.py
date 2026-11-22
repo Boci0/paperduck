@@ -6,6 +6,7 @@ import http.cookiejar
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
@@ -327,6 +328,10 @@ def test_encode_png_and_remote_controller_roundtrip(monkeypatch: pytest.MonkeyPa
     scaled = QImage.fromData(png, "PNG")
     assert scaled.width() == 320 and scaled.height() == 180
 
+    from src.tools.system_monitor import SystemMonitorPlugin
+
+    # The live CPU/RAM alert would turn the pet HUNGRY whenever this machine is busy (as under the full suite)
+    monkeypatch.setattr(SystemMonitorPlugin, "desired_state", lambda self: None)
     sm = PetStateMachine(PetStats())
     win = PetWindow(state_machine=sm, animation_controller=AnimationController(size=32), auto_wander=False)
     ctrl = RemoteController(win, manage_tailscale=False, port=0)
@@ -1027,6 +1032,7 @@ def test_remote_controller_focus_safe_capture_jpeg_pruning_and_dialog(monkeypatc
     assert len(list(staged_dir.iterdir())) <= MAX_STAGED_UPLOADS
 
     # Focus-safe capture never invokes focus_front_app()
+    monkeypatch.setattr(pet_remote, "private_screen_reason", lambda: "")
     monkeypatch.setattr(computer, "focus_front_app", lambda: (_ for _ in ()).throw(AssertionError("must not steal focus")))
     fake_screen = SimpleNamespace(
         name=lambda: "DISPLAY1",
@@ -1232,6 +1238,202 @@ def test_phone_context_laptop_chat_tool_and_capture_safety(monkeypatch: pytest.M
         monkeypatch.setattr(phone._tool_host, "_allowed", lambda _k, _t, _w: True)
         res = phone._tool_host.run("laptop_chat", {"action": "send", "message": "hi laptop"})
         assert res == "Laptop chat: sent" and sent == ["hi laptop"]
+    finally:
+        ctrl.close()
+        win.shutdown()
+        win.close()
+
+
+def test_persistent_revocation_expiry_socket_timeout_and_privacy_hardening(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import socket
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QColor, QGuiApplication, QImage
+    from PyQt6.QtWidgets import QApplication
+    from src.tools.clip_vault import clipboard_is_private
+    from src.tools.phone_bridge import COOKIE_MAX_AGE_S, REQUEST_TIMEOUT_S, _BridgeHandler
+    from src.ui import pet_remote
+    from src.ui.pet_remote import RemoteController, _PairingDialog, copy_private_text
+    from src.ui.pet_window import PetWindow
+
+    # 1. Persistent logout revocation across bridge restarts + server-side session expiry
+    revoked_file = tmp_path / "remote_revoked.json"
+    b1 = PhoneBridge(_dummy_handlers({"busy": False}, []), port=0, token="persist_tok_1234",
+                     manage_tailscale=False, revoked_path=revoked_file)
+    ok1, base1 = b1.start()
+    assert ok1
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    try:
+        p_code, _, html = _req(base1 + "/pair?t=persist_tok_1234", opener=opener)
+        assert p_code == 200
+        sid = next(c.value for c in jar if c.name == phone_bridge.COOKIE_NAME)
+        csrf = re.search(r'<meta name="csrf-token" content="([^"]+)"', html.decode("utf-8")).group(1)
+        assert _req(base1 + "/api/state", opener=opener)[0] == 200
+        out_code, _, _ = _req(base1 + "/api/logout", method="POST", body=b"{}",
+                              headers={"Content-Type": "application/json", "X-CSRF-Token": csrf}, opener=opener)
+        assert out_code == 200
+        assert _req(base1 + "/api/state", opener=opener)[0] == 401
+        assert _req(base1 + "/api/state", headers={"Cookie": f"{phone_bridge.COOKIE_NAME}={sid}"})[0] == 401
+        assert revoked_file.is_file()
+    finally:
+        b1.stop()
+
+    b2 = PhoneBridge(_dummy_handlers({"busy": False}, []), port=0, token="persist_tok_1234",
+                     manage_tailscale=False, revoked_path=revoked_file)
+    ok2, base2 = b2.start()
+    assert ok2
+    try:
+        # Replay the pre-logout cookie against a fresh PhoneBridge instance after restart
+        assert _req(base2 + "/api/state", headers={"Cookie": f"{phone_bridge.COOKIE_NAME}={sid}"})[0] == 401
+
+        # Expired session rejected server-side even if cookie was never logged out
+        now = 2_000_000_000
+        monkeypatch.setattr(phone_bridge.time, "time", lambda: now - COOKIE_MAX_AGE_S - 10)
+        old_sid = b2._create_session()
+        monkeypatch.setattr(phone_bridge.time, "time", lambda: now)
+        assert b2._session_csrf(old_sid) is None
+
+        # Socket timeout configured on handler
+        assert _BridgeHandler.timeout == REQUEST_TIMEOUT_S
+        host, port = b2.bound_host, b2.bound_port
+        with socket.create_connection((host, port), timeout=3) as sock:
+            sock.sendall(b"GET /api/state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            resp = sock.recv(4096)
+            assert b"401" in resp
+    finally:
+        b2.stop()
+
+    # 2. Clipboard privacy flags + Screen-watch privacy shield + desktop indicator
+    _app = QApplication.instance() or QApplication([])
+    assert copy_private_text("secret_pair_token") is True
+    cb = QGuiApplication.clipboard()
+    assert cb.text() == "secret_pair_token"
+    assert clipboard_is_private(cb.mimeData()) is True
+
+    img = QImage(320, 180, QImage.Format.Format_ARGB32)
+    img.fill(QColor("#a86f00"))
+    fake_screen = SimpleNamespace(
+        name=lambda: "DISPLAY1",
+        geometry=lambda: SimpleNamespace(width=lambda: 1920, height=lambda: 1080),
+        grabWindow=lambda _id: SimpleNamespace(toImage=lambda: img),
+    )
+    monkeypatch.setattr(pet_remote, "_ordered_screens", lambda: [fake_screen])
+
+    sm = PetStateMachine(PetStats())
+    win = PetWindow(state_machine=sm, animation_controller=AnimationController(size=32), auto_wander=False)
+    ctrl = RemoteController(win, manage_tailscale=False, port=0)
+    ctrl.bridge._explicit_token = "shield_tok"
+    ctrl.bridge._revoked_path = None
+    ok, base = ctrl.start()
+    assert ok
+    try:
+        # Password manager in front pauses capture (503) and clears watch flag
+        monkeypatch.setattr(pet_remote, "foreground_app", lambda: "KeePassXC.exe")
+        monkeypatch.setattr(pet_remote, "foreground_title", lambda: "Main Window")
+        code_pm, _, body_pm = _req(base + "/api/screen", headers={"Authorization": "Bearer shield_tok"})
+        assert code_pm == 503 and "password manager" in json.loads(body_pm)["error"]
+        assert ctrl.screen_watched is False
+
+        # Private title in front pauses capture (503)
+        monkeypatch.setattr(pet_remote, "foreground_app", lambda: "chrome.exe")
+        monkeypatch.setattr(pet_remote, "foreground_title", lambda: "Sign in - My Bank")
+        code_t, _, body_t = _req(base + "/api/screen", headers={"Authorization": "Bearer shield_tok"})
+        assert code_t == 503 and "private" in json.loads(body_t)["error"]
+
+        # Normal window allows capture and turns on desktop watch indicator
+        monkeypatch.setattr(pet_remote, "foreground_app", lambda: "code.exe")
+        monkeypatch.setattr(pet_remote, "foreground_title", lambda: "README.md - Visual Studio Code")
+        box: dict[str, Any] = {}
+
+        def hit_ok() -> None:
+            box["resp"] = _req(base + "/api/screen", headers={"Authorization": "Bearer shield_tok"})
+            QTimer.singleShot(0, _app.quit)
+
+        t = threading.Thread(target=hit_ok, daemon=True)
+        t.start()
+        _app.exec()
+        t.join(timeout=3.0)
+        assert box["resp"][0] == 200
+        assert ctrl.screen_watched is True
+
+        # Render pet window with LIVE badge active
+        shot = QImage(win.size(), QImage.Format.Format_ARGB32)
+        win.render(shot)
+        assert not shot.isNull()
+
+        # Pairing dialog Copy Token sets privacy flags on clipboard
+        dlg = _PairingDialog(ctrl, win)
+        try:
+            dlg._copy_tok.click()
+            assert clipboard_is_private(QGuiApplication.clipboard().mimeData()) is True
+        finally:
+            dlg.close()
+            dlg.deleteLater()
+
+        ctrl.stop()
+        assert ctrl.screen_watched is False
+    finally:
+        ctrl.close()
+        win.shutdown()
+        win.close()
+
+
+def test_dns_rebinding_host_rejected_before_pair_rate_limit() -> None:
+    bridge = PhoneBridge(_dummy_handlers({}, []), port=0, token="rebind_tok_123456", manage_tailscale=False,
+                         revoked_path=None)
+    ok, base = bridge.start()
+    assert ok
+    try:
+        port = bridge.bound_port
+        evil = {"Host": f"evil.example:{port}", "Origin": f"http://evil.example:{port}",
+                "Content-Type": "application/x-www-form-urlencoded"}
+        for _ in range(RATE_MAX_FAILS + 3):
+            code, _h, _b = _req(base + "/pair", method="POST", body=b"t=guess", headers=evil)
+            assert code == 421
+        assert _req(base + "/api/state", headers={"Host": f"evil.example:{port}"})[0] == 421
+        # Rejected before /pair, so the shared loopback bucket (all tailscale serve traffic) stays open
+        code, _h, _b = _req(base + "/pair", method="POST", body=b'{"t": "rebind_tok_123456"}',
+                            headers={"Content-Type": "application/json"})
+        assert code == 200
+        assert bridge._host_allowed(f"localhost:{port}") and bridge._host_allowed(f"[::1]:{port}")
+        assert not bridge._host_allowed("evil@127.0.0.1") and not bridge._host_allowed("")
+        bridge._alias_hosts = frozenset({"laptop", "laptop.tail1234.ts.net", "100.64.0.7"})
+        assert bridge._host_allowed("laptop:48791") and bridge._host_allowed("LAPTOP.tail1234.ts.net.")
+    finally:
+        bridge.stop()
+
+
+def test_stop_async_keeps_widget_and_timer_calls_on_the_gui_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QWidget
+    from src.ui.pet_remote import RemoteController
+    from src.ui.pet_window import PetWindow
+
+    app = QApplication.instance() or QApplication([])  # noqa: F841 - must stay referenced or Qt aborts
+    threads: list[threading.Thread] = []
+
+    def recording_update(self: QWidget, *args: Any) -> None:
+        threads.append(threading.current_thread())
+        QWidget.update(self, *args)
+
+    monkeypatch.setattr(PetWindow, "update", recording_update)
+    win = PetWindow(state_machine=PetStateMachine(PetStats()), animation_controller=AnimationController(size=32),
+                    auto_wander=False)
+    ctrl = RemoteController(win, manage_tailscale=False, port=0)
+    ctrl.bridge._explicit_token = "async_tok_123456"
+    try:
+        assert ctrl.start()[0]
+        ctrl._last_watch_at = time.monotonic()
+        ctrl._watch_timer.start(60_000)
+        ctrl.stop_async()
+        for _ in range(100):
+            QTest.qWait(20)
+            if not ctrl.transitioning and not ctrl.running:
+                break
+        QTest.qWait(50)  # let the queued bridge_state_changed reach the GUI thread
+        # Stopping a QTimer (or repainting) from the worker is refused or corrupts Qt; the GUI-thread slot must do it
+        assert not ctrl.running and not ctrl._watch_timer.isActive() and not ctrl.screen_watched
+        assert threads and all(t is threading.main_thread() for t in threads)
     finally:
         ctrl.close()
         win.shutdown()
