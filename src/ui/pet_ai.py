@@ -270,6 +270,11 @@ class AiMixin:
         if callback_id == "ai:chat":
             self.open_ai_chat()
             return
+        if callback_id == "ai:logins":
+            from src.ui.saved_logins import SavedLoginsDialog
+
+            SavedLoginsDialog(self).exec()
+            return
         if callback_id == "ai:skills":
             self.open_output_folder(skills_dir())
             return

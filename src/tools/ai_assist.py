@@ -2364,6 +2364,7 @@ class AiAssistPlugin:
             ToolMenuItem(label="Open Skills Folder", callback_id="ai:skills", submenu=sub),
             ToolMenuItem(label="Edit Global Rules...", callback_id="ai:rules", submenu=sub),
             ToolMenuItem(label="Open Memory File", callback_id="ai:memory", submenu=sub),
+            ToolMenuItem(label="Saved Logins...", callback_id="ai:logins", submenu=sub),
             ToolMenuItem(label="Remove API Key", callback_id="ai:forget", enabled=self.has_key(), submenu=sub),
             ToolMenuItem(label="Remove Search Key", callback_id="ai:forget_search",
                          enabled=bool(load_key(BRAVE_URL)), submenu=sub),

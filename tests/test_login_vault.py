@@ -262,3 +262,32 @@ def test_typed_password_is_watched_by_hash_and_blocks_shots_when_readable(monkey
         monkeypatch.setattr(lv.warm_ps, "run", lambda *a, _o=answers[case], **k: _o)
         assert lv.typed_password_shown() is want, case
     assert lv.blocked_at > 0
+
+
+@win
+def test_saved_logins_dialog_lists_sites_hides_passwords_and_forgets_on_a_second_click(monkeypatch, tmp_path):
+    from PyQt6.QtWidgets import QApplication, QLabel
+
+    from src.ui.saved_logins import EMPTY_NOTE, SavedLoginsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(lv, "vault_path", lambda: tmp_path / "logins.bin")
+    lv.store("identity.unimas.my", "100360", "hunter2-Secret")
+    lv.store("b.example", "", "pw-two")
+    dlg = SavedLoginsDialog()
+    rows = [dlg.list.item(i).text() for i in range(dlg.list.count())]
+    assert rows[0].startswith("b.example") and "(no username)" in rows[0] and "100360" in rows[1]
+    shown = " ".join(rows + [w.text() for w in dlg.findChildren(QLabel)] + [dlg.forget_btn.text()])
+    assert "hunter2" not in shown and "pw-two" not in shown
+    dlg.list.setCurrentRow(1)
+    dlg.forget_btn.click()  # arms only
+    assert "identity.unimas.my" in lv.load() and "Click again" in dlg.forget_btn.text()
+    dlg.list.setCurrentRow(0)  # changing the selection disarms
+    dlg.forget_btn.click()
+    assert set(lv.load()) == {"identity.unimas.my", "b.example"}
+    dlg.forget_btn.click()
+    assert set(lv.load()) == {"identity.unimas.my"} and dlg.list.count() == 1
+    dlg.forget_btn.click()
+    dlg.forget_btn.click()
+    assert lv.load() == {} and dlg.status.text() == EMPTY_NOTE and not dlg.forget_btn.isEnabled()
+    app.processEvents()

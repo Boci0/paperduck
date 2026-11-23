@@ -1689,6 +1689,7 @@ dialog.screen-modal.fs-live:not(.hud-hidden) .fs-exit-fab {{
   let lastHistoryKey = '';
   let lastStreamKey = '';
   let lastApprovalsKey = '';
+  const loginCards = new Map();  // open login cards kept across redraws, so typing survives a new approval
   let screenTimer = null;
   let screenOpen = false;
   let settingsOpen = false;
@@ -2494,8 +2495,18 @@ dialog.screen-modal.fs-live:not(.hud-hidden) .fs-exit-fab {{
     if (approvalsKey !== lastApprovalsKey) {{
       lastApprovalsKey = approvalsKey;
       shouldScroll = true;
+      const focused = document.activeElement;
       approvalsEl.textContent = '';
+      for (const id of [...loginCards.keys()]) {{
+        if (!approvals.some((a) => a.id === id)) loginCards.delete(id);
+      }}
       for (const ap of approvals) {{
+        if (ap.kind === 'login' && loginCards.has(ap.id)) {{
+          const kept = loginCards.get(ap.id);
+          approvalsEl.appendChild(kept);
+          if (focused && kept.contains(focused)) focused.focus();
+          continue;
+        }}
         const card = document.createElement('section');
         card.className = 'approval' + (ap.danger ? ' danger' : '');
         const head = document.createElement('div');
@@ -2542,6 +2553,7 @@ dialog.screen-modal.fs-live:not(.hud-hidden) .fs-exit-fab {{
           cancel.addEventListener('click', () => sendLogin(true));
           acts.appendChild(save); acts.appendChild(cancel); btns.push(save, cancel);
           card.appendChild(acts);
+          loginCards.set(ap.id, card);
           approvalsEl.appendChild(card);
           continue;
         }}
