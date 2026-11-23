@@ -566,6 +566,7 @@ class RemoteController(QObject):
                 stop_chat=self._stop_chat,
                 new_chat=self._new_chat,
                 resolve_approval=self._resolve_approval,
+                resolve_login=self._resolve_login,
                 grab_screen=self._grab_screen,
                 send_attachments=self._send_attachments,
                 set_settings=self._set_settings,
@@ -775,6 +776,13 @@ class RemoteController(QObject):
         def run(done: Callable[[Any], None]) -> None:
             chat = self._existing_active_chat()
             done(chat.resolve_approval(approval_id, choice) if chat is not None else False)
+
+        return bool(self._on_gui(run))
+
+    def _resolve_login(self, login_id: str, username: str | None, password: str | None) -> bool:
+        def run(done: Callable[[Any], None]) -> None:
+            chat = self._existing_active_chat()
+            done(chat.resolve_login(login_id, username, password) if chat is not None else False)
 
         return bool(self._on_gui(run))
 

@@ -116,6 +116,7 @@ class BridgeHandlers:
     delete_session: Callable[[str], tuple[bool, str]] | None = None
     stop_proc: Callable[[str], tuple[bool, str]] | None = None
     grab_screen_opts: Callable[[int, int, str, int], tuple[bytes | None, str, str]] | None = None
+    resolve_login: Callable[[str, str | None, str | None], bool] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1141,7 @@ main > * {{
 }}
 .approval.danger {{ border-left-color: var(--danger); }}
 .approval-head {{ font-weight: 700; font-size: 0.88rem; }}
+.login-box {{ display: block; inline-size: 100%; box-sizing: border-box; margin-block: 0.35rem; padding: 0.5rem 0.6rem; font: inherit; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 6px; }}
 .approval pre {{
   margin: 0;
   background: var(--raised);
@@ -2500,6 +2502,49 @@ dialog.screen-modal.fs-live:not(.hud-hidden) .fs-exit-fab {{
         head.className = 'approval-head';
         head.textContent = ap.title || 'Permission needed';
         card.appendChild(head);
+        if (ap.kind === 'login') {{
+          // masked boxes: values go to the PC's encrypted vault only, and the boxes are cleared once sent
+          const note = document.createElement('div');
+          note.textContent = 'The AI wants to sign in to ' + ap.site + '. Your login is saved encrypted on the PC, '
+            + 'typed only into ' + ap.site + ' pages, and never shown to the AI. Save it only if ' + ap.site
+            + ' is the site you expect.';
+          card.appendChild(note);
+          const mk = (type, ph, ac) => {{
+            const box = document.createElement('input');
+            box.type = type; box.placeholder = ph; box.maxLength = 512; box.autocomplete = ac;
+            box.autocapitalize = 'off'; box.spellcheck = false; box.className = 'login-box';
+            card.appendChild(box);
+            return box;
+          }};
+          const userBox = mk('text', 'Username (optional)', 'username');
+          const pwBox = mk('password', 'Password', 'current-password');
+          const acts = document.createElement('div');
+          acts.className = 'approval-actions';
+          const btns = [];
+          async function sendLogin(cancel) {{
+            if (!cancel && !pwBox.value) {{ showToast('Type the password first'); return; }}
+            for (const b of btns) b.disabled = true;
+            const body = cancel ? {{ id: ap.id, password: null }} : {{ id: ap.id, username: userBox.value, password: pwBox.value }};
+            userBox.value = ''; pwBox.value = '';
+            try {{
+              const out = await apiPost('/api/login', body);
+              if (!out || !out.ok) {{ showToast((out && out.error) || 'This login card expired'); for (const b of btns) b.disabled = false; }}
+            }} catch (_e) {{
+              showToast('Network error, nothing was saved');
+              for (const b of btns) b.disabled = false;
+            }}
+          }}
+          const save = document.createElement('button');
+          save.type = 'button'; save.className = 'btn sm primary'; save.textContent = 'Save and type';
+          save.addEventListener('click', () => sendLogin(false));
+          const cancel = document.createElement('button');
+          cancel.type = 'button'; cancel.className = 'btn sm danger'; cancel.textContent = 'Cancel';
+          cancel.addEventListener('click', () => sendLogin(true));
+          acts.appendChild(save); acts.appendChild(cancel); btns.push(save, cancel);
+          card.appendChild(acts);
+          approvalsEl.appendChild(card);
+          continue;
+        }}
         if (ap.review) {{
           const rev = document.createElement('div');
           rev.textContent = 'Reviewer: ' + ap.review;
@@ -3871,6 +3916,17 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         if path == "/api/new":
             started, msg = bridge.handlers.new_chat()
             self._send_json(HTTPStatus.OK if started else HTTPStatus.CONFLICT, {"ok": started, "message": msg})
+            return
+
+        if path == "/api/login":
+            lid, user, pw = data.get("id"), data.get("username"), data.get("password")
+            if (not isinstance(lid, str) or bridge.handlers.resolve_login is None
+                    or not (pw is None or (isinstance(pw, str) and 0 < len(pw) <= 512))
+                    or not (user is None or (isinstance(user, str) and len(user) <= 512))):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid login payload"})
+                return
+            resolved = bridge.handlers.resolve_login(lid, user, pw)
+            self._send_json(HTTPStatus.OK if resolved else HTTPStatus.NOT_FOUND, {"ok": resolved})
             return
 
         if path == "/api/approve":

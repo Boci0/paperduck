@@ -215,6 +215,15 @@ TOOL_SPECS: list[dict[str, Any]] = [
         ("points",)),
     _fn("type_text", "Type text into whatever has keyboard focus (click the field first). A newline presses Enter.",
         {"text": {"type": "string"}}, ("text",)),
+    _fn("type_login", "Type the user's saved username or password into the focused box of the browser page in "
+        "front (click the box first; one field per call, so call it twice for a username then password). You never "
+        "see the value: the pet picks the login saved for this exact https site, shows the user a card to save one "
+        "if there is none, and checks the box belongs to that site. Use this for any sign-in; never ask the user "
+        "to type a password into the chat, and never reveal a typed password (the eye button). PIN pads and "
+        "on-screen keyboards cannot be typed: ask the user to do that step.",
+        {"field": {"type": "string", "enum": ["username", "password"]},
+         "reenter": {"type": "boolean", "description": "Ask the user to save the login again (the saved one was wrong)"}},
+        ("field",)),
     _fn("paste_text", "Paste text into whatever has keyboard focus (puts it on the clipboard, then ctrl+v): "
         "much faster than type_text for more than a line, and keeps line breaks inside one text box. With html "
         "true the text is simple HTML (<b>, <i>, <br>, <ul><li>): apps with rich paste (Canva, Word, Docs, mail) keep "

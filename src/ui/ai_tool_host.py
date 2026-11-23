@@ -27,7 +27,7 @@ from PyQt6.QtCore import QCoreApplication, QMimeData, QObject, QRect, QStandardP
 from PyQt6.QtGui import QColor, QCursor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextDocument
 from PyQt6.QtWidgets import QFileDialog
 
-from src.tools import computer
+from src.tools import computer, login_vault
 from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool_note
 from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
@@ -1152,6 +1152,13 @@ class AiToolHost(QObject):
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
                 return "error: no screen grab"
             return self._layout_check(*got, args.get("page"))
+        if name == "type_login":
+            if not _GUI_CONTROL_LOCK.acquire(blocking=False):
+                return "error: another chat is currently controlling the screen; try again once it finishes"
+            try:
+                return self._type_login(args)
+            finally:
+                _GUI_CONTROL_LOCK.release()
         if name in COMPUTER_TOOLS or name == "computer_batch":
             if not _GUI_CONTROL_LOCK.acquire(blocking=False):
                 return "error: another chat is currently controlling the screen; try again once it finishes"
@@ -1863,6 +1870,65 @@ class AiToolHost(QObject):
     def _project(self) -> Path | None:
         repo = getattr(self._win._state_machine.registry.get_plugin("project"), "repo", None)
         return repo if repo is not None and Path(repo).is_dir() else None  # a deleted folder would fail every command
+
+    def _type_login(self, args: dict[str, Any]) -> str:
+        """type_login: the saved value for the exact https host of the page that owns the focused box, typed by the
+        pet. Order: code checks the box (Chromium, focused Edit inside an https page, password box for a password),
+        a missing login is asked for on a masked card, then each use is approved one at a time (auto mode: the
+        reviewer; a box that is not a real password box always asks the user), the focus is checked again and only
+        then typed. The value never reaches the model, the chat history or the log."""
+        field = args.get("field")
+        if field not in login_vault.FIELDS:
+            return "error: field is username or password"
+        computer.focus_front_app()
+        target = login_vault.focused_field()
+        if isinstance(target, str):
+            return target
+        if field == "username" and target.password:
+            return "error: the focused box is a password box; click the username box first"
+        try:
+            entry = login_vault.load().get(target.site)
+        except OSError as exc:
+            return f"error: {exc}"
+        chat = _host_chat(self)
+        fresh = entry is None or args.get("reenter") is True
+        if fresh:
+            got = self._waiting(lambda done: chat.ask_login(target.site, done))
+            if not isinstance(got, tuple):
+                return f"error: the user did not save a login for {target.site}"
+            try:
+                login_vault.store(target.site, *got)
+            except (OSError, ValueError) as exc:
+                return f"error: {exc}"
+            entry = {"username": got[0], "password": got[1]}
+        value = entry[field]
+        if not value:
+            return f"error: the login saved for {target.site} has no {field}; call again with reenter true"
+        page = "\n\n" + target.url[:300]
+        if field == "password" and not target.password:
+            # a quirky page (a text box styled to hide letters): the user decides every time, auto mode or not
+            text = (f"The model wants to type your saved password for {target.site} into a box this page does not "
+                    "mark as a password box, so it may show the password on screen. Allow only if it is the "
+                    f"password box you expect.{page}")
+            ok = self._waiting(lambda done: chat.confirm(
+                "login", text, f"saved password for {target.site}", done,
+                review=(False, "not a real password box, so you decide")))
+            if ok is not True:
+                return "error: the user declined typing the password into a box that is not a password box"
+        elif not fresh and not self._allowed(
+                "login", f"The model wants to type your saved {field} for {target.site} into the focused {field} "
+                f"box of this page. The pet checked the page is {target.site} itself, where the user saved this "
+                f"login; the model never sees the value.{page}", f"saved {field} for {target.site}"):
+            return "error: the user declined typing the saved login"
+        computer.focus_front_app()  # an answer on the chat card took the keyboard
+        now = login_vault.focused_field()
+        if not isinstance(now, login_vault.Field) or (now.site, now.password, now.hwnd) != (
+                target.site, target.password, target.hwnd):
+            return "error: the focus moved before typing, so nothing was typed; click the box and try again"
+        typed = computer.type_text(value, stop=self.cancel)
+        if self.cancel.is_set() and typed < len(value):
+            return "error: stopped by the user part way through typing"
+        return f"typed the saved {field} for {target.site}"
 
     def _allowed(self, key: str, text: str, what: str, risk: str = "") -> bool:
         """The user's answer in the chat; no answer within APPROVE_TIMEOUT_S counts as declined.

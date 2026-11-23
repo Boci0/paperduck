@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -71,6 +72,7 @@ from src.tools.ai_sessions import (
     save_session,
 )
 from src.tools.errands import ERRAND_MARK, Errand
+from src.tools.login_vault import MAX_VALUE_CHARS
 from src.tools.errands import describe as describe_errand
 from src.ui.agent_sheets import AgentSheets
 from src.ui.ai_tool_host import APPROVE_TIMEOUT_S, ERRAND_APPROVE_S
@@ -115,6 +117,8 @@ from src.ui.theme import (
     rgba_css,
     ui_font,
 )
+
+NEVER_REMEMBERED = frozenset({"login"})  # typing a saved login is approved one use at a time
 
 # Auto mode (`self._plugin.auto`) answers approval prompts itself, logging an "Auto-approved" card, except those its
 # reviewer (`ai_assist.review_action`, run by the tool host) sends back to the user.
@@ -171,6 +175,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._pending: list[Callable[[str | None], None]] = []  # open Allow/Deny prompts (parallel calls can ask at once)
         self._remote_approvals: list[dict[str, Any]] = []
         self._approval_answers: dict[str, Callable[[str | None], None]] = {}
+        self._login_answers: dict[str, Callable[[Any], None]] = {}
         self._remote_error: str = ""
         self._models_job: AiJob | None = None
         self._models: dict[str, list[ModelInfo]] = {}  # base URL -> its /models list, fetched on first open
@@ -1036,7 +1041,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         choices = ([("Allow once", "once"), ("Allow for this chat", "chat")] if once and not danger and not untrusted
-                   else [("Allow once", "once")] if danger or untrusted else [("Allow", "chat")]) + [("Deny", None)]
+                   and key not in NEVER_REMEMBERED
+                   else [("Allow once", "once")] if danger or untrusted or key in NEVER_REMEMBERED
+                   else [("Allow", "chat")]) + [("Deny", None)]
         btns: list[QPushButton] = []
 
         aid = uuid.uuid4().hex[:10]
@@ -1100,6 +1107,84 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         if not self._remote_only:
             self.show()
         self._relayout()
+
+    def ask_login(self, site: str, done: Callable[[Any], None]) -> None:
+        """A masked card asking the user to save their login for `site`, answerable here or on the phone:
+        done((username, password)) or done(None). The values go only to the vault: never the history, the phone
+        snapshot or the model."""
+        card = _Card(f"Save your login for {site}", ACCENT_HEX)
+        card.body.addWidget(ChatText(
+            f"The AI wants to sign in to {site}. Your login is saved encrypted on this PC, typed only into {site} "
+            f"pages, and never shown to the AI. Save it only if {site} is the site you expect.", pt=9))
+        user, pw = QLineEdit(), QLineEdit()
+        user.setPlaceholderText("Username (optional)")
+        pw.setPlaceholderText("Password")
+        pw.setEchoMode(QLineEdit.EchoMode.Password)
+        for box in (user, pw):
+            box.setMaxLength(MAX_VALUE_CHARS)
+            box.setStyleSheet(f"QLineEdit {{ background: {rgba_css(GLASS_RAISED_RGBA)}; color: {TEXT_HEX}; "
+                              f"border: 1px solid {rgba_css(OUTLINE_RGBA)}; border-radius: 6px; padding: 5px 7px; }}")
+            card.body.addWidget(box)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        save_btn, cancel_btn = QPushButton("Save and type"), QPushButton("Cancel")
+        save_btn.setStyleSheet(_ALLOW_CSS)
+        cancel_btn.setStyleSheet(_DENY_CSS)
+        lid = uuid.uuid4().hex[:10]
+        entry: dict[str, Any] = {"id": lid, "kind": "login", "site": site, "key": "login", "title": card._head.text(),
+                                 "what": f"login for {site}", "intro": f"Save your login for {site}", "detail": "",
+                                 "danger": "", "untrusted": False, "review": "", "choices": []}
+
+        def close(header: str) -> None:
+            self._pending.remove(answer)
+            self._login_answers.pop(lid, None)
+            self._remote_approvals[:] = [a for a in self._remote_approvals if a["id"] != lid]
+            user.clear()
+            pw.clear()
+            for w in (user, pw, save_btn, cancel_btn):
+                w.hide()
+            card.set_header(header, TEXT_DIM_HEX)
+            QTimer.singleShot(0, self._relayout)
+            self.remote_changed.emit()
+
+        def answer(got: Any) -> None:
+            if answer not in self._pending:
+                return
+            ok = (isinstance(got, tuple) and len(got) == 2 and all(isinstance(v, str) for v in got) and bool(got[1])
+                  and all(len(v) <= MAX_VALUE_CHARS for v in got))
+            close(f"Saved login for {site}" if ok else f"Cancelled  -  login for {site}")
+            done(got if ok else None)
+
+        save_btn.clicked.connect(lambda: pw.text() and answer((user.text(), pw.text())))
+        pw.returnPressed.connect(save_btn.click)
+        cancel_btn.clicked.connect(lambda: answer(None))
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        buttons.addStretch(1)
+        card.body.addLayout(buttons)
+        self._append(card)
+        self._pending.append(answer)
+        self._login_answers[lid] = answer
+        self._remote_approvals.append(entry)
+        self.remote_changed.emit()
+
+        def expire() -> None:
+            if answer in self._pending:
+                close(f"Timed out  -  login for {site}")
+
+        QTimer.singleShot(int(getattr(self._tool_host, "approve_s", APPROVE_TIMEOUT_S) * 1000), expire)
+        if not self._remote_only:
+            self.show()
+        self._relayout()
+        (user if self.isVisible() else pw).setFocus()
+
+    def resolve_login(self, login_id: str, username: str | None, password: str | None) -> bool:
+        """Answer an open login card from the phone; a None password cancels it."""
+        fn = self._login_answers.get(login_id)
+        if fn is None:
+            return False
+        fn(None if password is None else (username or "", password))
+        return True
 
     def resolve_approval(self, approval_id: str, choice: str | None) -> bool:
         """Resolve an open confirmation card by ID from the remote phone bridge."""
