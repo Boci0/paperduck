@@ -51,7 +51,9 @@ WRITING_SITES = ("google docs", "notion", "word")
 
 # Window titles that mean the screen may hold credentials, money or private browsing: no lens offers there
 _PRIVATE_TITLE = re.compile(r"password|passkey|sign[ -]?in|log[ -]?in|\bbank|incognito|inprivate|private browsing"
-                            r"|checkout|payment|billing|credential|keepass|bitwarden|dashlane|enpass|nordpass|roboform", re.I)
+                            r"|checkout|payment|billing|credential|keepass|bitwarden|dashlane|enpass|nordpass|roboform"
+                            r"|\bsso\b|single sign[- ]on|authenticator|two[- ]factor|\b2fa\b|\botp\b"
+                            r"|one[- ]time (?:code|password)|verification code", re.I)
 _ERROR_TEXT = re.compile(r"Traceback \(most recent call last\)|\b\w+(?:Error|Exception)\b[:\s]|npm ERR!"
                          r"|\berror(?:\[E\d+\])?:|\bfatal:|Segmentation fault|\bat [\w.$<>]{1,120}\([^)\n]{0,200}:\d+\)")
 _ERROR_TITLE = re.compile(r"\b(?:error|exception|has stopped working|not responding|crash(?:ed)?|fatal)\b", re.I)

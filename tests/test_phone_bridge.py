@@ -1340,9 +1340,16 @@ def test_persistent_revocation_expiry_socket_timeout_and_privacy_hardening(monke
         code_t, _, body_t = _req(base + "/api/screen", headers={"Authorization": "Bearer shield_tok"})
         assert code_t == 503 and "private" in json.loads(body_t)["error"]
 
+        # Login page whose title has no sign-in word: a password box on screen pauses capture
+        monkeypatch.setattr(pet_remote, "foreground_title", lambda: "UNIMAS Identity - Microsoft Edge")
+        monkeypatch.setattr(pet_remote, "foreground_has_password_field", lambda: True)
+        code_pw, _, body_pw = _req(base + "/api/screen", headers={"Authorization": "Bearer shield_tok"})
+        assert code_pw == 503 and "password box" in json.loads(body_pw)["error"]
+
         # Normal window allows capture and turns on desktop watch indicator
         monkeypatch.setattr(pet_remote, "foreground_app", lambda: "code.exe")
         monkeypatch.setattr(pet_remote, "foreground_title", lambda: "README.md - Visual Studio Code")
+        monkeypatch.setattr(pet_remote, "foreground_has_password_field", lambda: False)
         box: dict[str, Any] = {}
 
         def hit_ok() -> None:

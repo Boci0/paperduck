@@ -136,6 +136,41 @@ def foreground_title() -> str:
     return buf.value
 
 
+# Any password box in the window, found by UI Automation (Chromium and Edge mark <input type=password> IsPassword)
+_PASSWORD_PS = r"""
+param([long]$Hwnd)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$A = [System.Windows.Automation.AutomationElement]
+$c = [System.Windows.Automation.PropertyCondition]::new($A::IsPasswordProperty, $true)
+if ($A::FromHandle([IntPtr]$Hwnd).FindFirst([System.Windows.Automation.TreeScope]::Descendants, $c)) { '1' } else { '0' }
+"""
+PASSWORD_RECHECK_S = 4.0  # a login form can appear without the title changing (SPA, same-title redirect)
+_password_seen: tuple[int, str, float, bool] = (0, "", 0.0, False)
+
+
+def foreground_has_password_field() -> bool:
+    """True when the foreground window shows a password box. Cached per window and title for PASSWORD_RECHECK_S.
+    Fails open (False) when UI Automation cannot answer, so a broken worker never freezes the screen stream."""
+    global _password_seen
+    if sys.platform != "win32":
+        return False
+    from src.tools import warm_ps
+
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = int(user32.GetForegroundWindow() or 0)
+    if not hwnd:
+        return False
+    title = foreground_title()
+    h, t, at, found = _password_seen
+    if h == hwnd and t == title and time.monotonic() - at < PASSWORD_RECHECK_S:
+        return found
+    found = (warm_ps.run("password", _PASSWORD_PS, {"Hwnd": hwnd}, 3.0) or "").strip() == "1"
+    _password_seen = (hwnd, title, time.monotonic(), found)
+    return found
+
+
 class HintsPlugin:
     """Rule state: dwell tracking, clipboard change detection, per-rule cooldowns and session mutes."""
 

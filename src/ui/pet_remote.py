@@ -31,7 +31,7 @@ from src.graphics.duck import render_icon
 from src.tools import computer
 from src.tools.ai_assist import THINKING_LEVELS, AiAssistPlugin, valid_model
 from src.tools.ai_tools import OFFICE_EXTS, _office_text, _pdf_text, scratch_dir
-from src.tools.hints import PRIVATE_APPS, foreground_app, foreground_title
+from src.tools.hints import PRIVATE_APPS, foreground_app, foreground_has_password_field, foreground_title
 from src.tools.phone_bridge import (
     DEFAULT_PORT,
     BridgeHandlers,
@@ -91,6 +91,8 @@ def private_screen_reason() -> str:
         return "Screen paused (password manager in front)"
     if is_private_title(foreground_title() or ""):
         return "Screen paused (private or credential window in front)"
+    if foreground_has_password_field():
+        return "Screen paused (password box on screen)"
     return ""
 
 
