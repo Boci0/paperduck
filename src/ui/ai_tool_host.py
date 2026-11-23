@@ -148,6 +148,9 @@ def grab_screen(win: Any, done: Callable[[Any], None], primary: bool = False, wi
     """Grab the screen under the cursor (or the primary one, with the front app's handle; or with `window`,
     just the front app's window) on the Qt thread, with the pet `win` and its chat left out of the shot.
     They stay on screen (excluded from capture); only where Windows cannot exclude them are they hidden."""
+    if login_vault.typed_password_shown():  # a typed password shown in plain text never leaves in a shot
+        done((None, 0) if primary else None)
+        return
     shown = _ours(win)
     hidden = [w for w in shown if not computer.exclude_from_capture(int(w.winId()), True)]
     for w in hidden:
@@ -896,6 +899,8 @@ class AiToolHost(QObject):
         ran, out = self.ran, "error: did not finish"  # this answer's list: a stopped worker's late tool stays in it
         try:
             out = self._run(name, args)
+            if out.startswith("error: no screen grab") and time.monotonic() - login_vault.blocked_at < 10:
+                out = login_vault.BLOCK_NOTE
             return out
         finally:
             ran.append((tool_note(name, args), out))
@@ -1727,7 +1732,7 @@ class AiToolHost(QObject):
                 elif name == "mouse_hover":
                     wait_ms = int(args["wait_ms"]) if args.get("wait_ms") is not None else 500
                     computer.hover(args["x"], args["y"], wait_ms)
-                    chain = computer.uia_at(args["x"], args["y"])
+                    chain = [] if login_vault.typed_password_shown() else computer.uia_at(args["x"], args["y"])
                     picks = [f'[{k}] "{lbl[:50]}"' if k else f'"{lbl[:50]}"'
                              for k, lbl in chain if lbl.strip()][:2]
                     under = f"; under cursor: {', '.join(picks)}" if picks else ""
@@ -1925,9 +1930,23 @@ class AiToolHost(QObject):
         if not isinstance(now, login_vault.Field) or (now.site, now.password, now.hwnd) != (
                 target.site, target.password, target.hwnd):
             return "error: the focus moved before typing, so nothing was typed; click the box and try again"
-        typed = computer.type_text(value, stop=self.cancel)
-        if self.cancel.is_set() and typed < len(value):
-            return "error: stopped by the user part way through typing"
+        def still_there(n: int) -> bool:  # before each character (about 15 ms): same window in front, same box
+            if computer.foreground_window() != target.hwnd:
+                return False
+            if n == 0:  # just checked above
+                return True
+            got = login_vault.focused_field()
+            return isinstance(got, login_vault.Field) and (got.site, got.password, got.hwnd) == (
+                target.site, target.password, target.hwnd)
+
+        if field == "password":
+            login_vault.remember_typed(target.hwnd, value)  # before typing: a partial reveal is watched too
+        typed = computer.type_text(value, stop=self.cancel, guard=still_there)
+        if typed < len(value):
+            if self.cancel.is_set():
+                return "error: stopped by the user part way through typing"
+            return ("error: the focus left the box part way through, so typing stopped there; click the box, clear "
+                    "it (ctrl+a, backspace) and call type_login again")
         return f"typed the saved {field} for {target.site}"
 
     def _allowed(self, key: str, text: str, what: str, risk: str = "") -> bool:

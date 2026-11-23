@@ -8,11 +8,15 @@ domain or an injected instruction cannot route a password to another site. Nothi
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import ctypes.wintypes as wintypes
+import hashlib
 import json
 import os
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -49,6 +53,73 @@ for ($i = 0; $i -lt 80 -and $e; $i++) {
 $c = $f.Current
 "$($c.ProcessId)`t$($c.ControlType.ProgrammaticName)`t$($c.IsPassword)`t$($c.IsEnabled)`t$doc`t$($url -replace '[\t\r\n]', '')"
 """
+
+
+# Values of every on-screen non-password box in one window, base64 so a value cannot break the line format
+_VALUES_PS = r"""
+param([long]$Hwnd)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$A = [System.Windows.Automation.AutomationElement]
+$P = [System.Windows.Automation.PropertyCondition]
+$cond = [System.Windows.Automation.AndCondition]::new([System.Windows.Automation.Condition[]]@(
+    $P::new($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit),
+    $P::new($A::IsPasswordProperty, $false), $P::new($A::IsOffscreenProperty, $false)))
+'ok'
+foreach ($e in $A::FromHandle([IntPtr]$Hwnd).FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)) {
+    $vp = $null
+    if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp) -and $vp.Current.Value) {
+        [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($vp.Current.Value))
+    }
+}
+"""
+REVEAL_WATCH_S = 1800.0  # a typed password is watched for this long, or until its window closes
+BLOCK_NOTE = ("error: a password the pet typed is readable on screen (a show-password button, or a box that does "
+              "not mask it), so no screenshot is sent to you. Hide it again or submit the form (press_key enter), "
+              "or ask the user to do the step.")
+# (window, length, sha256): never the value itself; guarded by _typed_lock
+_typed: list[tuple[int, int, bytes, float]] = []
+_typed_lock = threading.Lock()
+blocked_at = 0.0  # monotonic time of the last withheld screenshot, so the host can explain an empty grab
+
+
+def remember_typed(hwnd: int, value: str) -> None:
+    """Watch window `hwnd` for this password showing up in plain text."""
+    with _typed_lock:
+        _typed.append((hwnd, len(value), hashlib.sha256(value.encode("utf-8")).digest(),
+                       time.monotonic() + REVEAL_WATCH_S))
+
+
+def _shows(text: str, length: int, digest: bytes) -> bool:
+    return any(hashlib.sha256(text[i:i + length].encode("utf-8")).digest() == digest
+               for i in range(len(text) - length + 1))
+
+
+def typed_password_shown() -> bool:
+    """True when a password the pet typed is readable in a non-password box of its window, or when that cannot be
+    checked (fails closed). Free when nothing was typed: only then does it ask UI Automation."""
+    global blocked_at
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.windll.user32
+    now = time.monotonic()
+    with _typed_lock:
+        _typed[:] = [t for t in _typed if t[3] > now and user32.IsWindow(wintypes.HWND(t[0]))]
+        watched = list(_typed)
+    for hwnd in {t[0] for t in watched}:
+        out = warm_ps.run("login", _VALUES_PS, {"Hwnd": hwnd}, 3.0)
+        lines = (out or "").split()
+        shown = not lines or lines[0] != "ok"
+        for line in lines[1:]:
+            try:
+                text = base64.b64decode(line).decode("utf-8")
+            except ValueError:
+                continue
+            shown = shown or any(_shows(text, n, d) for h, n, d, _ in watched if h == hwnd)
+        if shown:
+            blocked_at = time.monotonic()
+            return True
+    return False
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ import math
 import os
 import threading
 import time
+from collections.abc import Callable
 from ctypes import wintypes
 
 from src.tools.ports import process_name
@@ -266,11 +267,13 @@ def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
     _send(_mouse(_WHEEL, -max(-MAX_SCROLL, min(MAX_SCROLL, amount)) * 120))
 
 
-def type_text(text: str, delay: float = 0.008, stop: threading.Event | None = None) -> int:
-    """Types `text`; returns how many characters went out (fewer once `stop` is set: Stop ends it mid-text)."""
+def type_text(text: str, delay: float = 0.008, stop: threading.Event | None = None,
+              guard: Callable[[int], bool] | None = None) -> int:
+    """Types `text`; returns how many characters went out (fewer once `stop` is set: Stop ends it mid-text, or
+    once `guard(n)`, asked before character n, says False)."""
     chars = text.replace("\r\n", "\n")[:MAX_TYPE_CHARS]  # one Enter per line break, not two
     for n, char in enumerate(chars):
-        if stop is not None and stop.is_set():
+        if (stop is not None and stop.is_set()) or (guard is not None and not guard(n)):
             return n
         if char in "\r\n":
             _send(_key(0x0D), _key(0x0D, flags=_KEYUP))

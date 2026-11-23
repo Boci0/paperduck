@@ -78,7 +78,15 @@ def _host(monkeypatch, tmp_path, chat: _Chat, fields: list[Any], allowed: bool =
     monkeypatch.setattr(lv, "vault_path", lambda: tmp_path / "logins.bin")
     monkeypatch.setattr(lv, "focused_field", lambda: fields.pop(0) if len(fields) > 1 else fields[0])
     monkeypatch.setattr(ai_tool_host.computer, "focus_front_app", lambda: 0)
-    monkeypatch.setattr(ai_tool_host.computer, "type_text", lambda text, stop=None: typed.append(text) or len(text))
+    monkeypatch.setattr(ai_tool_host.computer, "foreground_window", lambda: 7)
+    monkeypatch.setattr(lv, "remember_typed", lambda hwnd, value: None)
+
+    def type_text(text, stop=None, guard=None):  # honours the guard like the real one, character by character
+        n = next((i for i in range(len(text)) if guard is not None and not guard(i)), len(text))
+        typed.append(text[:n])
+        return n
+
+    monkeypatch.setattr(ai_tool_host.computer, "type_text", type_text)
     reviews: list[str] = []
 
     def review(key, text, what, risk=""):  # stands in for the reviewer / Allow card
@@ -216,3 +224,41 @@ def test_chat_login_card_keeps_values_out_of_the_snapshot_and_clears_its_boxes()
     assert chat._remote_approvals[-1]["choices"] == ["once"]
     chat.resolve_approval(chat._remote_approvals[-1]["id"], "once")
     assert answers == [True] and "login" not in chat._allowed
+
+
+@win
+def test_typing_stops_when_the_window_or_box_changes_part_way(monkeypatch, tmp_path):
+    from src.ui import ai_tool_host
+
+    lv.store("identity.unimas.my", "100360", "hunter2-Secret", tmp_path / "logins.bin")
+    host, typed, _ = _host(monkeypatch, tmp_path, _Chat(), [PW])
+    fronts = iter([7, 7, 7, 99])  # a popup takes the front before the 4th character
+    monkeypatch.setattr(ai_tool_host.computer, "foreground_window", lambda: next(fronts, 99))
+    out = _run(host, {"field": "password"})
+    assert "focus left the box" in out and typed == ["hun"] and "hunter2" not in out
+
+    # same window, but the page moved the focus to another box: caught before the next character
+    other_box = lv.Field("identity.unimas.my", "https://identity.unimas.my/login", False, 7)
+    host, typed, _ = _host(monkeypatch, tmp_path, _Chat(), [PW, PW, PW, PW, other_box])
+    assert "focus left the box" in _run(host, {"field": "password"}) and typed == ["hun"]
+
+
+def test_typed_password_is_watched_by_hash_and_blocks_shots_when_readable(monkeypatch):
+    import base64
+    import hashlib
+
+    monkeypatch.setattr(lv, "_typed", [])
+    monkeypatch.setattr(lv, "blocked_at", 0.0)
+    if sys.platform == "win32":
+        monkeypatch.setattr(lv.ctypes.windll.user32, "IsWindow", lambda _h: True, raising=False)
+    assert lv.typed_password_shown() is False  # nothing typed: no UI Automation call at all
+    lv.remember_typed(7, "hunter2-Secret")
+    assert all("hunter2" not in repr(t) for t in lv._typed)  # only a length and a hash are kept
+    assert lv._typed[0][2] == hashlib.sha256(b"hunter2-Secret").digest()
+    b64 = lambda s: base64.b64encode(s.encode()).decode()  # noqa: E731
+    answers = {"masked": "ok\n" + b64("100360"), "shown": "ok\n" + b64("100360") + "\n" + b64("xxhunter2-Secretyy"),
+               "failed": "", "none": None}
+    for case, want in (("masked", False), ("shown", True), ("failed", True), ("none", True)):
+        monkeypatch.setattr(lv.warm_ps, "run", lambda *a, _o=answers[case], **k: _o)
+        assert lv.typed_password_shown() is want, case
+    assert lv.blocked_at > 0
