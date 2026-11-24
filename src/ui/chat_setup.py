@@ -313,6 +313,19 @@ class ChatSetupMixin:
                 action.setChecked(level == (fit_thinking(p.base_url, p.screen_thinking, p.model)
                                             if p.screen_thinking else ""))
                 action.triggered.connect(lambda _c=False, t=level: self._pick(screen_thinking=t))
+        helper = style_menu(QMenu("Helper model", menu))
+        menu.addMenu(helper)
+        helper.setToolTip("Optional faster/cheaper model for auto-mode reviews, history compaction, and low-effort sub-agents.")
+        cur_helper = getattr(p, "helper_model", "")
+        same_act = helper.addAction("Same as chat")
+        same_act.setCheckable(True)
+        same_act.setChecked(cur_helper == "")
+        same_act.triggered.connect(lambda _c=False: self._pick(helper_model=""))
+        for m in models:
+            act = helper.addAction(model_label(m))
+            act.setCheckable(True)
+            act.setChecked(m.id == cur_helper)
+            act.triggered.connect(lambda _c=False, mid=m.id: self._pick(helper_model=mid))
         menu.addSection("Approvals")
         auto = menu.addAction("Auto mode (hands-free, reviewed)")
         auto.setCheckable(True)
@@ -327,7 +340,7 @@ class ChatSetupMixin:
         menu.deleteLater()
 
     def _pick(self, model: str | None = None, thinking: str | None = None, auto: bool | None = None,
-              screen_thinking: str | None = None) -> None:
+              screen_thinking: str | None = None, helper_model: str | None = None) -> None:
         p = self._plugin
         if model is not None and valid_model(model):
             p.model = model
@@ -337,6 +350,8 @@ class ChatSetupMixin:
             p.auto = auto
         if screen_thinking == "" or screen_thinking in THINKING_LEVELS:
             p.screen_thinking = screen_thinking
+        if helper_model == "" or (helper_model is not None and valid_model(helper_model)):
+            p.helper_model = helper_model
         self._refresh_title()
         self.remote_changed.emit()
 

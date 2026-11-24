@@ -32,9 +32,9 @@ from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool
 from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (calculate, check_layout, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
-                                computer_action, destructive_reason, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
+                                computer_action, destructive_reason, file_outline, is_readonly_command, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
-                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
+                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, syntax_check_edits, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
 from src.tools.errands import describe as describe_errand
 from src.tools.clip_vault import clipboard_is_private
@@ -892,6 +892,18 @@ class AiToolHost(QObject):
         """ask() refuses a research tool while this chat's sub-agents still run (see Agents.blocked)."""
         return self.agents.blocked(name, self.cancel)
 
+    def can_parallel(self, name: str, args: dict[str, Any]) -> bool:
+        """Opt-in per-call parallel safety for `_run_calls`."""
+        if name in ("load_skill", "file_outline", "search_sessions", "list_windows"):
+            return True
+        if name == "read_file":
+            try:
+                path = resolve(self._project(), args.get("path"))
+            except (OSError, ValueError):
+                return False
+            return not is_secret(path)
+        return False
+
     def run(self, name: str, args: dict[str, Any]) -> str:
         """One tool call; the pet acts it out meanwhile (`activity`)."""
         self._tool = name  # what the pet goes back to acting out after an approval
@@ -920,8 +932,13 @@ class AiToolHost(QObject):
             shown = json.dumps(args, ensure_ascii=False)
             # Values only: an argument named "format" or "truncate" is not a destructive command
             risk = "destructive tool" if self.mcp.is_destructive(name) else destructive_reason("\n".join(_strings(args)))
-            review = (self._review(f'MCP tool "{name}" on server "{server}" with arguments:\n{shown}')
-                      if _host_auto_mode(self) and f"mcp:{server}" not in chat._allowed else None)
+            if _host_auto_mode(self) and f"mcp:{server}" not in chat._allowed:
+                if not risk and not self.outside and self.mcp.is_readonly(name):
+                    review = (True, "read-only MCP tool")
+                else:
+                    review = self._review(f'MCP tool "{name}" on server "{server}" with arguments:\n{shown}')
+            else:
+                review = None
             if self.cancel.is_set():
                 return "error: stopped"
             extra = {"review": review} if review else {}
@@ -973,7 +990,8 @@ class AiToolHost(QObject):
                          if scratch else ("edit_outside", "edits outside the Project Folder"))
             if not self._allowed(key, ask, what):
                 return "error: the user declined this edit"
-            return apply_edits(edits)
+            res = apply_edits(edits)
+            return res if res.startswith("error") else res + syntax_check_edits(edits)
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
@@ -999,6 +1017,13 @@ class AiToolHost(QObject):
             command = args.get("script" if ps else "command")
             ps_path = args.get("path") if ps else None
             cwd = self._project() or Path.home()
+            if isinstance(args.get("cwd"), str) and args["cwd"].strip():
+                try:
+                    cwd = resolve(self._project(), args["cwd"])
+                except (OSError, ValueError):
+                    return "error: bad cwd path"
+                if not cwd.is_dir():
+                    return "error: cwd is not a folder"
             user_script: Path | None = None
             if ps and (not isinstance(command, str) or not command.strip()):
                 if not isinstance(ps_path, str) or not ps_path.strip():
@@ -1021,13 +1046,17 @@ class AiToolHost(QObject):
                 user_script = resolved
             if not isinstance(command, str) or not command.strip():
                 return "error: give a script" if ps else "error: give a command"
-            where = "the Project Folder" if self._project() else f"your home folder ({cwd})"
+            where = str(cwd) if isinstance(args.get("cwd"), str) and args["cwd"].strip() else ("the Project Folder" if self._project() else f"your home folder ({cwd})")
             risk = destructive_reason(command)
             seconds = command_timeout(args.get("timeout_s"))
             limit = f" (allowed to run up to {seconds:g} s)" if args.get("timeout_s") is not None else ""
             what = " this PowerShell script" if ps else ""
+            fast_rev = ((True, "read-only command")
+                        if _host_auto_mode(self) and not ps and not risk and not self.outside and is_readonly_command(command)
+                        else None)
+            allow_kw = {"fast_review": fast_rev} if fast_rev is not None else {}
             if not self._allowed("run_command", f"The model wants to run{what} in {where}{limit}:\n\n{command.strip()}",
-                                 "commands", risk):
+                                 "commands", risk, **allow_kw):
                 return "error: the user declined this command"
             script, source = None, command
             if user_script is not None:
@@ -1067,7 +1096,14 @@ class AiToolHost(QObject):
             if not isinstance(command, str) or not command.strip():
                 return "error: give a command"
             cwd = self._project() or Path.home()
-            where = "the Project Folder" if self._project() else f"your home folder ({cwd})"
+            if isinstance(args.get("cwd"), str) and args["cwd"].strip():
+                try:
+                    cwd = resolve(self._project(), args["cwd"])
+                except (OSError, ValueError):
+                    return "error: bad cwd path"
+                if not cwd.is_dir():
+                    return "error: cwd is not a folder"
+            where = str(cwd) if isinstance(args.get("cwd"), str) and args["cwd"].strip() else ("the Project Folder" if self._project() else f"your home folder ({cwd})")
             # its own key: allowing background starts for this chat must not also allow every foreground command
             if not self._allowed("start_background", f"The model wants to start this in the background in {where}. It keeps "
                                  f"running until you stop it:\n\n{command.strip()}", "background commands",
@@ -1078,8 +1114,33 @@ class AiToolHost(QObject):
             return out
         if name == "read_background":
             return self.procs.read(args.get("id"))
+        if name == "send_background_input":
+            text = args.get("text")
+            if not isinstance(text, str):
+                return "error: give text to send"
+            if not self._allowed("run_command", f"Send input to {args.get('id')}:\n\n{text}",
+                                 "commands", destructive_reason(text)):
+                return "error: the user declined this input"
+            return self.procs.send(args.get("id"), text)
         if name == "stop_background":
             return self.procs.stop(args.get("id"))
+        if name == "file_outline":
+            return file_outline(self._project(), args.get("path"))
+        if name == "search_sessions":
+            from src.tools.ai_sessions import search_sessions
+
+            return search_sessions(args.get("query"), args.get("limit", 8))
+        if name == "list_windows":
+            wins = computer.list_windows()
+            if not wins:
+                return "no open application windows found"
+            return "\n".join(
+                f"hwnd={w['hwnd']} [{w['state']}]{' (front)' if w['foreground'] else ''} {w['exe']} | "
+                f"\"{w['title']}\" box {w['rect'][0]},{w['rect'][1]},{w['rect'][2]}x{w['rect'][3]}"
+                for w in wins
+            )
+        if name == "wait_for_ui":
+            return self._wait_for_ui(args)
         if name == "load_skill":
             return load_skill(skills_dir(), args.get("name"))
         if name == "find_skill":
@@ -1139,13 +1200,23 @@ class AiToolHost(QObject):
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
                 return "error: no screen grab"
-            return self._map(*got, region=args.get("region"), annotate=args.get("annotate") is True,
+            reg = args.get("region")
+            if reg is None and args.get("window") is True and got[1]:
+                if win_info := computer.window_on_monitor(got[1]):
+                    l, t, r, b = win_info[1]
+                    reg = [l, t, r - l, b - t]
+            return self._map(*got, region=reg, annotate=args.get("annotate") is True,
                              grid=args.get("grid") is True)
         if name == "peek_region":
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
                 return "error: no screen grab"
-            return self._peek_region(*got, region=args.get("region"), grid=args.get("grid") is True,
+            reg = args.get("region")
+            if reg is None and args.get("window") is True and got[1]:
+                if win_info := computer.window_on_monitor(got[1]):
+                    l, t, r, b = win_info[1]
+                    reg = [l, t, r - l, b - t]
+            return self._peek_region(*got, region=reg, grid=args.get("grid") is True,
                                      grayscale=args.get("grayscale") is True, diff=args.get("diff") is True)
         if name == "sample_colors":
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
@@ -1168,7 +1239,7 @@ class AiToolHost(QObject):
             if not _GUI_CONTROL_LOCK.acquire(blocking=False):
                 return "error: another chat is currently controlling the screen; try again once it finishes"
             try:
-                return self._computer(name, args) if name in COMPUTER_TOOLS else self._batch(args.get("steps"))
+                return self._computer(name, args) if name in COMPUTER_TOOLS else self._batch(args.get("steps"), args.get("verify", "none"))
             finally:
                 _GUI_CONTROL_LOCK.release()
         if name == "preview_document":  # reads a private copy in a hidden Office instance, so it needs no approval
@@ -1338,6 +1409,13 @@ class AiToolHost(QObject):
                 if note.startswith("error"):
                     return note
                 args = {**args, "x": x, "y": y}
+        elif name == "ui_action":
+            if args.get("name") is not None and args.get("x") is None:
+                found = self._find_click(args)
+                if isinstance(found, str):
+                    return found
+                args = {**args, "x": found[0], "y": found[1]}
+            args = {**args, "_label": target_label}
         elif name == "mouse_drag" and not getattr(self, "_batch_acted", False):
             note, x, y = self._stale_click(args["x"], args["y"], target_label)  # the grab point only: drop spot may be anywhere
             if note.startswith("error"):
@@ -1651,7 +1729,60 @@ class AiToolHost(QObject):
                 "thing. The screen now (a fresh screen_map, no need to call it): find your target again and click its "
                 "new position.\n\n" + self._map(*got), x, y)
 
-    def _batch(self, steps: Any) -> str:
+    def _wait_for_ui(self, args: dict[str, Any]) -> str:
+        """Poll locally (up to 20s) for text, gone_text, control, window_title, or settle_ms."""
+        text_q = args.get("text") if isinstance(args.get("text"), str) and args["text"].strip() else ""
+        gone_q = args.get("gone_text") if isinstance(args.get("gone_text"), str) and args["gone_text"].strip() else ""
+        ctrl_q = args.get("control") if isinstance(args.get("control"), str) and args["control"].strip() else ""
+        title_q = args.get("window_title") if isinstance(args.get("window_title"), str) and args["window_title"].strip() else ""
+        settle_ms = args.get("settle_ms")
+        has_settle = isinstance(settle_ms, int) and not isinstance(settle_ms, bool) and settle_ms > 0
+        if not (text_q or gone_q or ctrl_q or title_q or has_settle):
+            return "error: give at least one condition (text, gone_text, control, window_title, or settle_ms)"
+        raw_t = args.get("timeout_s")
+        timeout_s = min(20.0, max(1.0, float(raw_t))) if isinstance(raw_t, (int, float)) and not isinstance(raw_t, bool) else 8.0
+        started = time.monotonic()
+        deadline = started + timeout_s
+        prev_img: QImage | None = None
+        settled_since: float | None = None
+        need_settle_s = min(5.0, (settle_ms or 500) / 1000.0)
+        while not self.cancel.is_set():
+            elapsed = time.monotonic() - started
+            if title_q:
+                cur_title, _ = computer.front_state()
+                if title_q.casefold() in cur_title.casefold():
+                    return f'window_title "{title_q}" matched after {elapsed:.1f}s'
+            if ctrl_q:
+                hwnd = computer.front_app()
+                if hwnd:
+                    found = find_control(computer.ui_elements(hwnd), "", ctrl_q, "", 99999, 99999)
+                    if isinstance(found, tuple):
+                        return f'control "{ctrl_q}" appeared at ({found[0]}, {found[1]}) after {elapsed:.1f}s'
+            if text_q or gone_q or has_settle:
+                got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
+                img = got[0] if isinstance(got, tuple) else got
+                if isinstance(img, QImage) and not img.isNull():
+                    if text_q or gone_q:
+                        ocr = self._ocr(img, empty="")
+                        if text_q and text_q.casefold() in ocr.casefold():
+                            return f'text "{text_q}" appeared after {elapsed:.1f}s'
+                        if gone_q and gone_q.casefold() not in ocr.casefold():
+                            return f'text "{gone_q}" disappeared after {elapsed:.1f}s'
+                    if has_settle:
+                        if prev_img is not None and changed_region(prev_img, img) == (0, 0, 0, 0, 0):
+                            if settled_since is None:
+                                settled_since = time.monotonic()
+                            if time.monotonic() - settled_since >= need_settle_s:
+                                return f"screen settled after {elapsed:.1f}s"
+                        else:
+                            settled_since = None
+                        prev_img = img
+            if time.monotonic() >= deadline:
+                return f"timeout after {timeout_s:g}s: condition not met"
+            self.cancel.wait(0.35)
+        return "error: stopped by the user"
+
+    def _batch(self, steps: Any, verify: Any = "none") -> str:
         """computer_batch: one approval listing every step (asked as risky when any step is), then each step through
         `_computer`, stopping at the first error or Stop."""
         if not isinstance(steps, list) or not steps or len(steps) > MAX_BATCH_STEPS:
@@ -1666,8 +1797,13 @@ class AiToolHost(QObject):
                 plan.append(f"{i}. wait {ms} ms")
                 todo.append((tool, {"ms": ms}))
                 continue
+            if tool == "wait_for_ui":
+                step_args = {k: v for k, v in step.items() if k != "tool"}
+                plan.append(f"{i}. wait_for_ui")
+                todo.append((tool, step_args))
+                continue
             if tool not in COMPUTER_TOOLS:
-                return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS | {'wait'}))}"
+                return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS | {'wait', 'wait_for_ui'}))}"
             args = resolve_target(tool, _given({k: v for k, v in step.items() if k != "tool"}),
                                   getattr(self, "_items", {}))
             if isinstance(args, str):
@@ -1692,12 +1828,23 @@ class AiToolHost(QObject):
                     cancel.wait(args["ms"] / 1000)
                     lines.append(f"{i}. waited {args['ms']} ms")
                     continue
+                if tool == "wait_for_ui":
+                    out = self._wait_for_ui(args)
+                    lines.append(f"{i}. {out}")
+                    if out.startswith(("error", "timeout")):
+                        return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
+                    continue
                 self._in_batch = i < len(todo)
                 out = self._computer(tool, args, approved=True)
                 self._batch_acted = True
                 lines.append(f"{i}. {out}")
                 if out.startswith("error"):
                     return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
+            if verify in ("peek", "diff", "map") and hasattr(self, "_on_gui") and hasattr(self, "_grab_screen"):
+                got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
+                if isinstance(got, tuple) and isinstance(got[0], QImage) and not got[0].isNull():
+                    vnote = self._map(*got) if verify == "map" else self._peek_region(*got, diff=(verify == "diff"))
+                    lines.append(vnote)
             return "\n".join(lines)
         finally:
             self._in_batch = False
@@ -1712,14 +1859,22 @@ class AiToolHost(QObject):
         for w in hidden:
             w.hide()
         before = [("", False)]
+        prev_clip: list[str | None] = [None]
+        pasted_plain: list[str] = [""]
         if name == "paste_text" and (cb := QGuiApplication.clipboard()) is not None:
+            mime_now = cb.mimeData()
+            if mime_now is not None and not clipboard_is_private(mime_now) and mime_now.hasText():
+                prev_clip[0] = cb.text()
             if args.get("html") is True:  # both formats: rich-paste apps take the HTML, the rest the plain text
                 mime, doc = QMimeData(), QTextDocument()
                 doc.setHtml(args["text"])
+                plain = doc.toPlainText()
                 mime.setHtml(args["text"])
-                mime.setText(doc.toPlainText())
+                mime.setText(plain)
+                pasted_plain[0] = plain
                 cb.setMimeData(mime)
             else:
+                pasted_plain[0] = args["text"]
                 cb.setText(args["text"])  # here on the Qt thread; the worker only presses ctrl+v
 
         def act() -> str:  # on a worker thread: typing takes 8 ms a character and must not freeze the pet
@@ -1742,12 +1897,28 @@ class AiToolHost(QObject):
                     computer.press(computer.parse_keys("ctrl+v"))
                     result = f"pasted {len(args['text'])} characters"
                 elif name == "mouse_drag":
-                    computer.drag(
+                    ok_drag = computer.drag(
                         args["x"], args["y"], args["to_x"], args["to_y"],
                         button=args.get("button") or "left",
                         modifiers=computer.parse_modifiers(args.get("modifiers")),
+                        stop=self.cancel,
                     )
-                    result = "dragged"
+                    result = "dragged" if ok_drag else "error: stopped (user moved the mouse or pressed Stop)"
+                elif name == "focus_window":
+                    result = computer.focus_window(
+                        hwnd=args.get("hwnd"),
+                        title=args.get("title"),
+                        exe=args.get("exe"),
+                        action=args.get("action") or "focus",
+                    )
+                elif name == "ui_action":
+                    hwnd_now = computer.front_app()
+                    ok_ui, detail_ui = computer.uia_action(
+                        hwnd_now, args.get("x", 0), args.get("y", 0),
+                        args.get("_label") or args.get("name") or "",
+                        args["action"], str(args.get("value") or ""),
+                    )
+                    result = detail_ui if ok_ui else f"error: {detail_ui}"
                 elif name == "mouse_path":
                     pts = [(p[0], p[1]) for p in args["points"]]
                     done_pts = computer.path(
@@ -1767,13 +1938,20 @@ class AiToolHost(QObject):
                     computer.press(computer.parse_keys(args["keys"]))
                     result = f"pressed {args['keys']}"
                 else:
-                    computer.scroll(args["amount"], args.get("x"), args.get("y"))
+                    computer.scroll(
+                        args["amount"], args.get("x"), args.get("y"),
+                        horizontal=bool(args.get("horizontal")),
+                        modifiers=computer.parse_modifiers(args.get("modifiers")),
+                    )
                     result = "scrolled"
             except (ValueError, OSError, TypeError, ctypes.ArgumentError) as exc:  # a bad arg must not hang the call
                 result = f"error: {exc}"
             return result
 
         def finish(result: str) -> None:
+            if name == "paste_text" and prev_clip[0] is not None and (cb := QGuiApplication.clipboard()) is not None:
+                if cb.text() == pasted_plain[0]:
+                    cb.setText(prev_clip[0])
             for w in shown:  # back without taking the keyboard from the app the model is driving
                 if w in hidden:
                     show_quietly(w)
@@ -1841,7 +2019,9 @@ class AiToolHost(QObject):
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:
         """A sub-agent's thread: one ask() with the chat's provider and model at the agent's own thinking level."""
         plugin = _host_chat(self)._plugin
-        url, model = plugin.base_url, plugin.model
+        helper = getattr(plugin, "helper_model", "")
+        url = plugin.base_url
+        model = (helper or plugin.model) if effort in ("off", "low") else plugin.model
         where = f"the Project Folder {host.root}" if host.root else f"the home folder {Path.home()}"
         messages = [{"role": "system", "content": AGENT_PROMPT.format(calls=MAX_AGENT_CALLS, where=where, today=date.today())},
                     {"role": "user", "content": [{"type": "text", "text": task}, *(
@@ -1868,7 +2048,9 @@ class AiToolHost(QObject):
             return out
         tools = [s["function"]["name"] for s in self.mcp.specs() if self.mcp.server_of(s["function"]["name"]) == server]
         if not tools:
-            return out + ", but it did not start (wrong command, missing npx / uvx, or a missing env value)"
+            err = getattr(self.mcp, "start_errors", {}).get(server, "")
+            detail = f": {err}" if err else " (wrong command, missing npx / uvx, or a missing env value)"
+            return out + f", but it did not start{detail}"
         return out + (f"; it started with these tools: {', '.join(tools)}. If they are not in your tool list yet, "
                       "they are from the user's next message, so tell the user to send one.")
 
@@ -1949,7 +2131,8 @@ class AiToolHost(QObject):
                     "it (ctrl+a, backspace) and call type_login again")
         return f"typed the saved {field} for {target.site}"
 
-    def _allowed(self, key: str, text: str, what: str, risk: str = "") -> bool:
+    def _allowed(self, key: str, text: str, what: str, risk: str = "",
+                 fast_review: tuple[bool, str] | None = None) -> bool:
         """The user's answer in the chat; no answer within APPROVE_TIMEOUT_S counts as declined.
         A `risk` (destructive command) is asked every time, even when the chat allowed the tool before. So is a
         tool in OUTSIDE_GUARDED once the chat holds outside content, which could have told the model what to do."""
@@ -1958,7 +2141,7 @@ class AiToolHost(QObject):
             self.outside and key in OUTSIDE_GUARDED) else {}
         if _host_auto_mode(self) and (extra or key not in AUTO_INSTANT | chat._allowed):  # allowed for this chat: no review
             # every action gets its own review: a cached yes would pass later clicks (Send, Buy) unseen
-            extra["review"] = self._review(text)
+            extra["review"] = fast_review if (fast_review is not None and not extra) else self._review(text)
             if self.cancel.is_set():
                 return False
         ask = lambda done: chat.confirm(key, text, what, done, **extra)  # noqa: E731
@@ -1968,7 +2151,8 @@ class AiToolHost(QObject):
         """Auto mode's reviewer on this chat's provider and model (worker thread; Stop ends it)."""
         chat = _host_chat(self)
         p = chat._plugin
-        return review_action(p.base_url, load_key(p.base_url), p.model, chat.user_requests(), action, self.cancel)
+        model = getattr(p, "helper_model", "") or p.model
+        return review_action(p.base_url, load_key(p.base_url), model, chat.user_requests(), action, self.cancel)
 
     def _waiting(self, ask: Callable[[Callable[[Any], None]], None]) -> Any:
         """An approval on the Qt thread: the pet waits with the user (`activity` "approval") until it is answered."""

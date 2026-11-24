@@ -555,7 +555,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         host = None if self._testing else self._tool_host
         cancel = self._cancel = threading.Event()
         if host is not None:
-            host.cancel, host.ran, host.mcp_loaded, host.layout_open = cancel, [], set(), ""
+            host.cancel, host.ran, host.layout_open = cancel, [], ""
 
         self._clear_stream()
 
@@ -581,7 +581,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         def run() -> AiReply:
             if history is None:
                 return ask(url, key, model, messages or [], thinking=thinking, screen_thinking=screen, host=host, steer=lambda: self._take_steer(cancel), cancel=cancel)
-            sent, n, summary = (compact_history(url, key, model, history, cancel, keep, tasks) if long
+            compact_model = getattr(p, "helper_model", "") or model
+            sent, n, summary = (compact_history(url, key, compact_model, history, cancel, keep, tasks) if long
                                 else (history, 0, ""))
             # shortcut: Claude still gets earlier answers in note form (its turns are built in another shape)
             reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url), extra_system=REMOTE_SYSTEM_NOTE if self._remote_only else ""), thinking=thinking,
@@ -1466,6 +1467,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._sid = None
         self._history.clear()
         self._allowed.clear()
+        if hasattr(self._tool_host, "mcp_loaded"):
+            self._tool_host.mcp_loaded.clear()
         self._remote_steers.clear()
         self._draft.clear()
         self._clear_attachments()

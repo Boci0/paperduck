@@ -210,6 +210,39 @@ def load_session(sid: str, root: Path | None = None) -> Session | None:
     return _parse((root or sessions_dir()) / f"{sid}.json") if _ID.match(sid) else None
 
 
+def search_sessions(query: Any, limit: int = 8, root: Path | None = None) -> str:
+    """Search saved chats (newest first) for `query` in titles or message text."""
+    if not isinstance(query, str) or not query.strip():
+        return "error: give a non-empty search query"
+    q = query.strip().casefold()
+    cap = min(20, max(1, limit if isinstance(limit, int) and not isinstance(limit, bool) else 8))
+    hits: list[str] = []
+    now = time.time()
+    for session in list_sessions(root):
+        if q in session.title.casefold():
+            age_h = max(0, round((now - session.updated) / 3600))
+            hits.append(f"[{session.id}] \"{session.title}\" ({age_h}h ago) [title match]")
+        for turn in session.history:
+            text = str(turn.get("content") or "")
+            if text.startswith("[Earlier conversation") and q not in text.casefold():
+                continue
+            low = text.casefold()
+            at = low.find(q)
+            if at >= 0:
+                start = max(0, at - 80)
+                end = min(len(text), at + len(q) + 140)
+                excerpt = " ".join(_clean(text[start:end]).split())
+                age_h = max(0, round((now - session.updated) / 3600))
+                hits.append(f"[{session.id}] \"{session.title}\" ({age_h}h ago) {turn.get('role', 'user')}: {excerpt}")
+                break
+        if len(hits) >= cap:
+            break
+    if not hits:
+        return "no matching past chats"
+    out = "\n".join(hits)
+    return out[:8000]
+
+
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024  # shortcut: stops appending past this, no rotation; upgrade if chats run longer
 
 

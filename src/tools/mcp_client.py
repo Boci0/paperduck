@@ -53,6 +53,7 @@ LOOK_NOTE = ("\n[Paperduck: a screenshot of the page after this action follows t
              "Never guess at text you cannot read.]")
 MAX_IMAGE_B64 =28 * 1024 * 1024  # about 20 MB decoded, the same cap view_image has
 MAX_TOOLS_PER_SERVER = 64
+MAX_STDERR_BYTES = 4096
 IDLE_CLOSE_S = 300.0  # servers unused this long are closed (an npx server is two node processes, ~180 MB)
 NPX_REFRESH_S = 7 * 86400.0  # a cached npx server still starts through npx this often, so `@latest` updates
 REFRESH_PATH = CONFIG_PATH.parent / "mcp_refresh.json"  # spec -> last time it started through npx
@@ -221,14 +222,17 @@ class McpServer:
         self.readonly: set[str] = set()  # safe names of tools that declare readOnlyHint (no look after them)
         self._lock = threading.Lock()
         self._lines: queue.Queue[str | None] = queue.Queue()
+        self._stderr = bytearray()
+        self._stderr_lock = threading.Lock()
         self._next_id = 0
         command = shutil.which(cfg["command"]) or cfg["command"]  # finds npx.cmd and the like
         argv = direct_command(command, cfg["args"]) or [command, *cfg["args"]]
         self._proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=child_env(cfg["env"]), cwd=scratch_dir(),  # not the app's data folder
+            stderr=subprocess.PIPE, env=child_env(cfg["env"]), cwd=scratch_dir(),  # not the app's data folder
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
 
     def _read(self) -> None:
         assert self._proc.stdout is not None
@@ -236,10 +240,37 @@ class McpServer:
             self._lines.put(raw.decode("utf-8", "replace"))
         self._lines.put(None)  # the server exited
 
+    def _read_stderr(self) -> None:
+        stream = self._proc.stderr
+        if stream is None:
+            return
+        while True:
+            try:
+                chunk = stream.read(1024)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            with self._stderr_lock:
+                self._stderr.extend(chunk)
+                if len(self._stderr) > MAX_STDERR_BYTES:
+                    del self._stderr[:len(self._stderr) - MAX_STDERR_BYTES]
+
+    @property
+    def stderr_tail(self) -> str:
+        with self._stderr_lock:
+            return bytes(self._stderr).decode("utf-8", "replace").strip()[-600:]
+
     def _send(self, message: dict[str, Any]) -> None:
-        assert self._proc.stdin is not None
-        self._proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
-        self._proc.stdin.flush()
+        stdin = self._proc.stdin
+        if stdin is None or stdin.closed:
+            raise BrokenPipeError("stdin closed")
+        payload = (json.dumps(message) + "\n").encode("utf-8")
+        try:
+            stdin.write(payload)
+            stdin.flush()
+        except ValueError:
+            raise BrokenPipeError("stdin closed") from None
 
     def request(self, method: str, params: dict[str, Any], timeout: float,
                 cancel: threading.Event | None = None) -> Any:
@@ -269,7 +300,8 @@ class McpServer:
                     raise RuntimeError(f"no answer within {timeout:.0f}s") from None
                 if line is None:
                     self._lines.put(None)
-                    raise RuntimeError("the server exited")
+                    tail = self.stderr_tail
+                    raise RuntimeError("the server exited" + (f": {tail}" if tail else ""))
                 try:
                     msg = json.loads(line)
                 except ValueError:
@@ -333,6 +365,12 @@ class McpServer:
                 self._proc.wait(5)
             except subprocess.TimeoutExpired:  # never let a stuck exit turn a tool error into a lost answer
                 logger.warning("MCP server %s did not exit", self.name)
+        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 class McpHub:
@@ -346,6 +384,7 @@ class McpHub:
         self._used = time.monotonic()  # last specs() or call()
         self._lock = threading.Lock()
         self.image = b""  # the last call's first image (see McpServer.image)
+        self.start_errors: dict[str, str] = {}
 
     def specs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -365,7 +404,9 @@ class McpHub:
                     try:
                         self._specs += server.start()
                         self._servers[name] = server
-                    except (RuntimeError, OSError):
+                        self.start_errors.pop(name, None)
+                    except (RuntimeError, OSError) as exc:
+                        self.start_errors[name] = str(exc) or server.stderr_tail
                         server.close()
             return self._specs
 
@@ -378,6 +419,11 @@ class McpHub:
         """Whether the tool's server declared it destructive (it then asks before every call)."""
         server, _sep, tool = name.partition(SEP)
         return tool in getattr(self._servers.get(server), "destructive", ())
+
+    def is_readonly(self, name: str) -> bool:
+        """Whether the tool's server declared it read-only."""
+        server, _sep, tool = name.partition(SEP)
+        return tool in getattr(self._servers.get(server), "readonly", ())
 
     def call(self, name: str, args: dict[str, Any], cancel: threading.Event | None = None) -> str:
         server, _sep, tool = name.partition(SEP)

@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
+from typing import Any
 
 from src.tools.ports import process_name
 from src.tools.watch import is_private_title
@@ -27,13 +28,18 @@ _VK = {"enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, 
 _VK.update({f"f{n}": 0x6F + n for n in range(1, 13)})
 # OEM punctuation keys (zoom is ctrl+plus / ctrl+minus); the models also write them as the symbol itself
 _VK.update({"plus": 0xBB, "=": 0xBB, "equals": 0xBB, "minus": 0xBD, "-": 0xBD, "comma": 0xBC, ",": 0xBC,
-            "period": 0xBE, ".": 0xBE})
-_EXTENDED = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2E, 0x5B}
+            "period": 0xBE, ".": 0xBE, "[": 0xDB, "lbracket": 0xDB, "]": 0xDD, "rbracket": 0xDD,
+            "\\": 0xDC, "backslash": 0xDC, "/": 0xBF, "slash": 0xBF, ";": 0xBA, "semicolon": 0xBA,
+            "'": 0xDE, "quote": 0xDE, "`": 0xC0, "backtick": 0xC0, "insert": 0x2D, "ins": 0x2D,
+            "printscreen": 0x2C, "prtsc": 0x2C, "capslock": 0x14})
+_EXTENDED = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B}
 _MODIFIERS = {0x10, 0x11, 0x12, 0x5B}
 
 _KEYUP, _EXTENDEDKEY, _UNICODE = 0x2, 0x1, 0x4
-_MOUSE_FLAGS = {"left": (0x2, 0x4), "right": (0x8, 0x10)}  # (down, up)
+_MOUSE_FLAGS = {"left": (0x2, 0x4), "right": (0x8, 0x10), "middle": (0x20, 0x40)}  # (down, up)
 _WHEEL = 0x800
+_HWHEEL = 0x1000
+USER_ABORT_PX = 120
 
 
 def parse_keys(keys: object) -> list[int]:
@@ -142,6 +148,26 @@ def _check_point(x: int, y: int) -> tuple[int, int]:
     return max(vx, min(x, vx + width - 1)), max(vy, min(y, vy + height - 1))
 
 
+def cursor_pos() -> tuple[int, int] | None:
+    """Current cursor position in physical screen pixels, or None if unavailable."""
+    u32 = _user32()
+    get_pos = getattr(u32, "GetCursorPos", None)
+    if get_pos is None:
+        return None
+    pt = wintypes.POINT()
+    if not get_pos(ctypes.byref(pt)):
+        return None
+    return int(pt.x), int(pt.y)
+
+
+def _user_yanked(expected_x: int, expected_y: int) -> bool:
+    """True when the user physically moved the mouse far away from our last target."""
+    pos = cursor_pos()
+    if pos is None:
+        return False
+    return math.hypot(pos[0] - expected_x, pos[1] - expected_y) > USER_ABORT_PX
+
+
 def _move(x: int, y: int) -> None:
     x, y = _check_point(x, y)
     _user32().SetCursorPos(x, y)
@@ -150,7 +176,7 @@ def _move(x: int, y: int) -> None:
 
 def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
     if button not in _MOUSE_FLAGS:
-        raise ValueError("button is left or right")
+        raise ValueError("button is left, right or middle")
     _move(x, y)
     down, up = _MOUSE_FLAGS[button]
     for _ in range(2 if double else 1):
@@ -161,23 +187,39 @@ def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
 
 
 def drag(x: int, y: int, to_x: int, to_y: int, steps: int = 12, button: str = "left",
-         modifiers: list[int] | None = None) -> None:
-    """Button drag in small moves (web canvases such as Canva ignore a jump); button and modifiers always come back up."""
+         modifiers: list[int] | None = None, stop: threading.Event | None = None) -> bool:
+    """Button drag in small moves (web canvases such as Canva ignore a jump); button and modifiers always come back up.
+    Returns True if completed, False if aborted by `stop` or user mouse-yank."""
     if button not in _MOUSE_FLAGS:
-        raise ValueError("button is left or right")
+        raise ValueError("button is left, right or middle")
     _check_point(to_x, to_y)  # checks the end is on screen before anything is pressed without warping there
     _move(x, y)
     mods = list(modifiers or ())
     down, up = _MOUSE_FLAGS[button]
+    completed = True
+
+    def _run_steps() -> bool:
+        prev_x, prev_y = x, y
+        time.sleep(0.08)
+        for i in range(1, steps + 1):
+            if stop is not None:
+                if stop.is_set():
+                    return False
+                if i > 1 and _user_yanked(prev_x, prev_y):
+                    stop.set()
+                    return False
+            nx, ny = round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps)
+            _move(nx, ny)
+            prev_x, prev_y = nx, ny
+        time.sleep(0.08)
+        return True
+
     if mods:
         _send(*[_key(vk) for vk in mods])
         try:
             _send(_mouse(down))
             try:
-                time.sleep(0.08)
-                for i in range(1, steps + 1):
-                    _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
-                time.sleep(0.08)
+                completed = _run_steps()
             finally:
                 _send(_mouse(up))
         finally:
@@ -185,19 +227,17 @@ def drag(x: int, y: int, to_x: int, to_y: int, steps: int = 12, button: str = "l
     else:
         _send(_mouse(down))
         try:
-            time.sleep(0.08)
-            for i in range(1, steps + 1):
-                _move(round(x + (to_x - x) * i / steps), round(y + (to_y - y) * i / steps))
-            time.sleep(0.08)
+            completed = _run_steps()
         finally:
             _send(_mouse(up))
+    return completed
 
 
 def path(points: list[tuple[int, int]], button: str = "left", modifiers: list[int] | None = None,
          step_px: int = 8, delay: float = 0.016, stop: threading.Event | None = None) -> int:
     """Trace a smooth multi-point stroke while holding `button` and optional `modifiers`. Returns vertices reached."""
     if button not in _MOUSE_FLAGS:
-        raise ValueError("button is left or right")
+        raise ValueError("button is left, right or middle")
     if not (2 <= len(points) <= MAX_PATH_POINTS):
         raise ValueError(f"give 2 to {MAX_PATH_POINTS} points")
     if not (2 <= step_px <= 40):
@@ -232,17 +272,23 @@ def path(points: list[tuple[int, int]], button: str = "left", modifiers: list[in
     if mods:
         _send(*[_key(vk) for vk in mods])
     reached = 1
+    prev_x, prev_y = clamped[0]
     try:
         _send(_mouse(down))
         try:
             time.sleep(0.06)
             for seg in raw_segs:
                 for cx, cy in seg:
-                    if stop is not None and stop.is_set():
-                        return reached
+                    if stop is not None:
+                        if stop.is_set():
+                            return reached
+                        if _user_yanked(prev_x, prev_y):
+                            stop.set()
+                            return reached
                     ax = round((cx - vx) * 65535 / max(1, vw - 1))
                     ay = round((cy - vy) * 65535 / max(1, vh - 1))
                     _send(_Input(type=0, mi=_Mouse(ax, ay, 0, 0x8001 | 0x4000, 0, 0)))  # MOVE|ABSOLUTE|VIRTUALDESK
+                    prev_x, prev_y = cx, cy
                     time.sleep(delay)
                 reached += 1
             time.sleep(0.06)
@@ -260,11 +306,23 @@ def hover(x: int, y: int, wait_ms: int = 500) -> None:
     time.sleep(max(0, min(wait_ms, MAX_HOVER_MS)) / 1000.0)
 
 
-def scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
-    """Positive scrolls down, negative up (one notch each); the wheel acts where the cursor is."""
+def scroll(amount: int, x: int | None = None, y: int | None = None,
+           horizontal: bool = False, modifiers: list[int] | None = None) -> None:
+    """Positive scrolls down (or right when `horizontal`), negative up/left; the wheel acts where the cursor is."""
     if x is not None and y is not None:
         _move(x, y)
-    _send(_mouse(_WHEEL, -max(-MAX_SCROLL, min(MAX_SCROLL, amount)) * 120))
+    clamped = max(-MAX_SCROLL, min(MAX_SCROLL, amount))
+    flag = _HWHEEL if horizontal else _WHEEL
+    delta = (clamped * 120) if horizontal else (-clamped * 120)
+    mods = list(modifiers or ())
+    if mods:
+        _send(*[_key(vk) for vk in mods])
+        try:
+            _send(_mouse(flag, delta))
+        finally:
+            _send(*[_key(vk, flags=_KEYUP) for vk in reversed(mods)])
+    else:
+        _send(_mouse(flag, delta))
 
 
 def type_text(text: str, delay: float = 0.008, stop: threading.Event | None = None,
@@ -297,7 +355,7 @@ def press(codes: list[int]) -> None:
 # The "skeleton" of the front window: its clickable controls from Windows UI Automation, each with an exact rectangle
 # (icons and unlabeled buttons that OCR cannot see). Windows PowerShell 5.1 ships the .NET UIAutomationClient.
 _UIA_PS = r"""
-param([long]$Hwnd)
+param([long]$Hwnd, [string]$Popups = '')
 $ErrorActionPreference = 'Stop'
 if (-not ('BS.Dpi' -as [type])) {  # a warm worker runs this again in the same process
     Add-Type -Namespace BS -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);'
@@ -315,66 +373,141 @@ if (-not $script:paperduckUiaCond2) {
         $types | ForEach-Object { [System.Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $_) }))
     $visible = [System.Windows.Automation.PropertyCondition]::new($A::IsOffscreenProperty, $false)
     $script:paperduckUiaCond2 = [System.Windows.Automation.AndCondition]::new($any, $visible)
+    $req = [System.Windows.Automation.CacheRequest]::new()
+    $req.TreeScope = [System.Windows.Automation.TreeScope]::Element
+    $req.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::Full
+    foreach ($prop in @($A::BoundingRectangleProperty, $A::NameProperty, $A::AutomationIdProperty, $A::HelpTextProperty,
+        $A::ControlTypeProperty, $A::IsEnabledProperty, $A::HasKeyboardFocusProperty, $A::AcceleratorKeyProperty,
+        [System.Windows.Automation.TogglePattern]::ToggleStateProperty,
+        [System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty,
+        [System.Windows.Automation.ExpandCollapsePattern]::ExpandCollapseStateProperty,
+        [System.Windows.Automation.RangeValuePattern]::ValueProperty,
+        [System.Windows.Automation.RangeValuePattern]::MaximumProperty,
+        [System.Windows.Automation.ValuePattern]::ValueProperty)) {
+        $req.Add($prop)
+    }
+    foreach ($pat in @([System.Windows.Automation.TogglePattern]::Pattern,
+        [System.Windows.Automation.SelectionItemPattern]::Pattern,
+        [System.Windows.Automation.ExpandCollapsePattern]::Pattern,
+        [System.Windows.Automation.RangeValuePattern]::Pattern,
+        [System.Windows.Automation.ValuePattern]::Pattern,
+        [System.Windows.Automation.InvokePattern]::Pattern)) {
+        $req.Add($pat)
+    }
+    $script:paperduckUiaReq = $req
 }
-$root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
+$A = [System.Windows.Automation.AutomationElement]
+$roots = New-Object System.Collections.Generic.List[long]
+foreach ($tok in ($Popups -split ',')) {
+    [long]$pv = 0
+    if ([long]::TryParse($tok.Trim(), [ref]$pv) -and $pv -and $pv -ne $Hwnd -and -not $roots.Contains($pv)) { $roots.Add($pv) }
+}
+if ($Hwnd -and -not $roots.Contains($Hwnd)) { $roots.Add($Hwnd) }
 $count = 0
-foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond2)) {
+foreach ($rh in $roots) {
+    if ($count -ge 400) { break }
+    $root = $null
+    try { $root = $A::FromHandle([IntPtr]$rh) } catch { continue }
+    if (-not $root) { continue }
+    $useCache = $false
+    $found = $null
+    $scope = $null
     try {
-        $r = $e.Current.BoundingRectangle
-        if ($r.IsEmpty -or $r.Width -lt 4 -or $r.Height -lt 4) { continue }
-        $name = $e.Current.Name
-        if (-not $name) { $name = $e.Current.AutomationId }
-        if (-not $name) { $name = $e.Current.HelpText }
-        if ($name) { $name = ($name -replace '[\r\n\t]+', ' ').Trim() } else { $name = '' }
-        $kind = $e.Current.ControlType.ProgrammaticName -replace '^ControlType\.', ''
-        $tags = @()
-        if (-not $e.Current.IsEnabled) { $tags += 'disabled' }
-        if ($e.Current.HasKeyboardFocus) { $tags += 'focus' }
-        $acc = $e.Current.AcceleratorKey
-        if ($acc) {
-            $accClean = ($acc -replace '[\r\n\t]+', ' ').Trim()
-            if ($accClean.Length -gt 20) { $accClean = $accClean.Substring(0, 20) }
-            if ($accClean) { $tags += "key=$accClean" }
-        }
-        $tp = $null
-        if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
-            $ts = $tp.Current.ToggleState.ToString()
-            if ($ts -eq 'On') { $tags += 'on' }
-            elseif ($ts -eq 'Off') { $tags += 'off' }
-            elseif ($ts -eq 'Indeterminate') { $tags += 'mixed' }
-        }
-        $sp = $null
-        if ($e.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sp)) {
-            if ($sp.Current.IsSelected) { $tags += 'selected' }
-        }
-        $ep = $null
-        if ($e.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep)) {
-            if ($ep.Current.ExpandCollapseState.ToString() -eq 'Expanded') { $tags += 'expanded' }
-        }
-        $rv = $null
-        $vp = $null
-        if ($e.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rv)) {
-            $tags += "val=$([math]::Round($rv.Current.Value, 2))/$([math]::Round($rv.Current.Maximum, 2))"
-        } elseif ($kind -ne 'Document' -and $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
-            $v = $vp.Current.Value
-            if ($v) {
-                $vClean = ($v -replace '[\r\n\t]+', ' ').Trim()
-                if ($vClean.Length -gt 30) { $vClean = $vClean.Substring(0, 30) }
-                if ($vClean) { $tags += "val=$vClean" }
+        $scope = $script:paperduckUiaReq.Activate()
+        $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond2)
+        $useCache = $true
+    } catch {
+        $useCache = $false
+    } finally {
+        if ($scope) { $scope.Dispose() }
+    }
+    if (-not $useCache) {
+        try { $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $script:paperduckUiaCond2) } catch { continue }
+    }
+    foreach ($e in $found) {
+        try {
+            $cur = if ($useCache) { $e.Cached } else { $e.Current }
+            $r = $cur.BoundingRectangle
+            if ($r.IsEmpty -or $r.Width -lt 4 -or $r.Height -lt 4) { continue }
+            $name = $cur.Name
+            if (-not $name) { $name = $cur.AutomationId }
+            if (-not $name) { $name = $cur.HelpText }
+            if ($name) { $name = ($name -replace '[\r\n\t]+', ' ').Trim() } else { $name = '' }
+            $kind = $cur.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+            $tags = @()
+            if (-not $cur.IsEnabled) { $tags += 'disabled' }
+            if ($cur.HasKeyboardFocus) { $tags += 'focus' }
+            $acc = $cur.AcceleratorKey
+            if ($acc) {
+                $accClean = ($acc -replace '[\r\n\t]+', ' ').Trim()
+                if ($accClean.Length -gt 20) { $accClean = $accClean.Substring(0, 20) }
+                if ($accClean) { $tags += "key=$accClean" }
             }
-        }
-        if ($kind -in @('Custom', 'Image') -and -not $name -and $tags.Count -eq 0) {
-            $ip = $null
-            if (-not $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) { continue }
-        }
-        if ($tags.Count -gt 0) {
-            "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name`t$($tags -join ', ')"
-        } else {
-            "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name"
-        }
-        $count++
-        if ($count -ge 400) { break }
-    } catch { }
+            $tp = $null
+            if ($useCache) {
+                if ($e.TryGetCachedPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
+                    $ts = $tp.Cached.ToggleState.ToString()
+                    if ($ts -eq 'On') { $tags += 'on' }
+                    elseif ($ts -eq 'Off') { $tags += 'off' }
+                    elseif ($ts -eq 'Indeterminate') { $tags += 'mixed' }
+                }
+            } elseif ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
+                $ts = $tp.Current.ToggleState.ToString()
+                if ($ts -eq 'On') { $tags += 'on' }
+                elseif ($ts -eq 'Off') { $tags += 'off' }
+                elseif ($ts -eq 'Indeterminate') { $tags += 'mixed' }
+            }
+            $sp = $null
+            if ($useCache) {
+                if ($e.TryGetCachedPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sp) -and $sp.Cached.IsSelected) { $tags += 'selected' }
+            } elseif ($e.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sp) -and $sp.Current.IsSelected) {
+                $tags += 'selected'
+            }
+            $ep = $null
+            if ($useCache) {
+                if ($e.TryGetCachedPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep) -and $ep.Cached.ExpandCollapseState.ToString() -eq 'Expanded') { $tags += 'expanded' }
+            } elseif ($e.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep) -and $ep.Current.ExpandCollapseState.ToString() -eq 'Expanded') {
+                $tags += 'expanded'
+            }
+            $rv = $null
+            $vp = $null
+            if ($useCache) {
+                if ($e.TryGetCachedPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rv)) {
+                    $tags += "val=$([math]::Round($rv.Cached.Value, 2))/$([math]::Round($rv.Cached.Maximum, 2))"
+                } elseif ($kind -ne 'Document' -and $e.TryGetCachedPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+                    $v = $vp.Cached.Value
+                    if ($v) {
+                        $vClean = ($v -replace '[\r\n\t]+', ' ').Trim()
+                        if ($vClean.Length -gt 30) { $vClean = $vClean.Substring(0, 30) }
+                        if ($vClean) { $tags += "val=$vClean" }
+                    }
+                }
+            } else {
+                if ($e.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$rv)) {
+                    $tags += "val=$([math]::Round($rv.Current.Value, 2))/$([math]::Round($rv.Current.Maximum, 2))"
+                } elseif ($kind -ne 'Document' -and $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+                    $v = $vp.Current.Value
+                    if ($v) {
+                        $vClean = ($v -replace '[\r\n\t]+', ' ').Trim()
+                        if ($vClean.Length -gt 30) { $vClean = $vClean.Substring(0, 30) }
+                        if ($vClean) { $tags += "val=$vClean" }
+                    }
+                }
+            }
+            if ($kind -in @('Custom', 'Image') -and -not $name -and $tags.Count -eq 0) {
+                $ip = $null
+                $hasInv = if ($useCache) { $e.TryGetCachedPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip) } else { $e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip) }
+                if (-not $hasInv) { continue }
+            }
+            if ($tags.Count -gt 0) {
+                "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name`t$($tags -join ', ')"
+            } else {
+                "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)`t$kind`t$name"
+            }
+            $count++
+            if ($count -ge 400) { break }
+        } catch { }
+    }
 }
 """
 
@@ -633,8 +766,248 @@ def uia_invoke(hwnd: int, x: int, y: int, name: str) -> bool:
     return (warm_ps.run("uia", _UIA_INVOKE_PS, {"Hwnd": hwnd, "X": x, "Y": y, "Name": name}, 10.0) or "").strip() == "invoked"
 
 
+WINDOW_ACTIONS = ("focus", "maximize", "minimize", "restore", "snap_left", "snap_right")
+UIA_ACTIONS = ("invoke", "set_value", "toggle", "select", "expand", "collapse", "range", "focus")
+
+
+def list_windows(max_windows: int = 40) -> list[dict[str, Any]]:
+    """Visible (and minimized) top-level app windows in z-order, excluding our own."""
+    user32 = _user32()
+    user32.GetTopWindow.restype = user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    fg = foreground_window()
+    out: list[dict[str, Any]] = []
+    names: dict[int, str] = {}
+    hwnd = user32.GetTopWindow(None)
+    for _ in range(1000):
+        if not hwnd or len(out) >= max_windows:
+            break
+        cloaked = wintypes.DWORD()
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), 14, ctypes.byref(cloaked), 4)
+        if (user32.IsWindowVisible(hwnd) and not cloaked.value
+                and not (user32.GetWindowLongW(hwnd, -20) & 0x80)
+                and user32.GetWindowTextLengthW(hwnd) > 0 and not _ours(user32, hwnd)):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            raw_title = buf.value.strip()
+            title = "a private window" if is_private_title(raw_title) else raw_title[:120]
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in names:
+                names[pid.value] = process_name(pid.value)
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            state = "minimized" if user32.IsIconic(hwnd) else ("maximized" if user32.IsZoomed(hwnd) else "normal")
+            out.append({
+                "hwnd": int(hwnd),
+                "title": title,
+                "exe": names[pid.value],
+                "state": state,
+                "rect": [rect.left, rect.top, max(0, rect.right - rect.left), max(0, rect.bottom - rect.top)],
+                "foreground": int(hwnd) == fg,
+            })
+        hwnd = user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT
+    return out
+
+
+def focus_window(hwnd: int | None = None, title: str | None = None, exe: str | None = None, action: str = "focus") -> str:
+    """Focus, restore, minimize, maximize, or snap a window on screen."""
+    if action not in WINDOW_ACTIONS:
+        raise ValueError(f"action must be one of {', '.join(WINDOW_ACTIONS)}")
+    windows = list_windows()
+    if not windows:
+        return "error: no open application windows found"
+    target: dict[str, Any] | None = None
+    if hwnd is not None:
+        target = next((w for w in windows if w["hwnd"] == hwnd), None)
+        if target is None:
+            return f"error: no open window with hwnd {hwnd}"
+    else:
+        t_q = (title or "").strip().casefold()
+        e_q = (exe or "").strip().casefold()
+        if not t_q and not e_q:
+            raise ValueError("give hwnd, title, or exe")
+        hits = [
+            w for w in windows
+            if (not t_q or t_q in w["title"].casefold()) and (not e_q or e_q in w["exe"].casefold())
+        ]
+        if not hits:
+            sample = "; ".join(f'{w["exe"]}: "{w["title"][:40]}"' for w in windows[:6])
+            return f"error: no matching window found (open: {sample})"
+        target = hits[0]
+    thwnd = int(target["hwnd"])
+    user32 = _user32()
+    if _ours(user32, thwnd):
+        return "error: cannot target Paperduck's own window"
+    if action == "minimize":
+        user32.ShowWindow(wintypes.HWND(thwnd), 6)  # SW_MINIMIZE
+    elif action == "maximize":
+        user32.ShowWindow(wintypes.HWND(thwnd), 3)  # SW_MAXIMIZE
+        _bring_to_front(user32, thwnd)
+    elif action == "restore":
+        user32.ShowWindow(wintypes.HWND(thwnd), 9)  # SW_RESTORE
+        _bring_to_front(user32, thwnd)
+    elif action in ("snap_left", "snap_right"):
+        user32.ShowWindow(wintypes.HWND(thwnd), 9)
+        work = wintypes.RECT()
+        if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):  # SPI_GETWORKAREA
+            ww = max(200, work.right - work.left)
+            wh = max(200, work.bottom - work.top)
+            half = ww // 2
+            sx = work.left if action == "snap_left" else work.left + half
+            sw = half if action == "snap_left" else ww - half
+            user32.SetWindowPos(wintypes.HWND(thwnd), 0, sx, work.top, sw, wh, 0x0040)  # SWP_SHOWWINDOW
+        _bring_to_front(user32, thwnd)
+    else:  # focus
+        if user32.IsIconic(wintypes.HWND(thwnd)):
+            user32.ShowWindow(wintypes.HWND(thwnd), 9)
+        _bring_to_front(user32, thwnd)
+    return f'{action} "{target["title"]}" ({target["exe"]})'
+
+
+def _bring_to_front(user32: Any, hwnd: int) -> None:
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        return
+    if user32.SetForegroundWindow(wintypes.HWND(hwnd)):
+        time.sleep(0.05)
+        return
+    fg_tid = user32.GetWindowThreadProcessId(wintypes.HWND(fg), None) if fg else 0
+    cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+    attached = bool(fg_tid and fg_tid != cur_tid and user32.AttachThreadInput(cur_tid, fg_tid, True))
+    try:
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+    finally:
+        if attached:
+            user32.AttachThreadInput(cur_tid, fg_tid, False)
+    time.sleep(0.05)
+
+
+def popup_windows(hwnd: int) -> list[int]:
+    """Up to 4 visible popup/owned windows belonging to `hwnd`'s process (context menus, dropdowns)."""
+    if not hwnd:
+        return []
+    user32 = _user32()
+    if not hasattr(user32, "GetTopWindow"):
+        return []
+    if hasattr(user32, "GetDesktopWindow") and hwnd == user32.GetDesktopWindow():
+        return []
+    user32.GetTopWindow.restype = user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    target_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(target_pid))
+    out: list[int] = []
+    cur = user32.GetTopWindow(None)
+    for _ in range(500):
+        if not cur or len(out) >= 4:
+            break
+        if int(cur) != hwnd and user32.IsWindowVisible(cur) and not user32.IsIconic(cur):
+            cloaked = wintypes.DWORD()
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(wintypes.HWND(cur), 14, ctypes.byref(cloaked), 4)
+            if not cloaked.value:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(cur, ctypes.byref(pid))
+                cls = window_class(int(cur))
+                if pid.value == target_pid.value or cls == "#32768":
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(cur, ctypes.byref(rect)) and (rect.right - rect.left) >= 16 and (rect.bottom - rect.top) >= 16:
+                        out.append(int(cur))
+        cur = user32.GetWindow(cur, 2)
+    return out
+
+
+_UIA_ACTION_PS = "param([string]$Roots, [int]$X, [int]$Y, [string]$Name, [string]$Action, [string]$Value)\n" + _UIA_HEAD + r"""
+$rootIds = New-Object System.Collections.Generic.List[long]
+foreach ($tok in ($Roots -split ',')) {
+    [long]$rv = 0
+    if ([long]::TryParse($tok.Trim(), [ref]$rv) -and $rv -and -not $rootIds.Contains($rv)) { $rootIds.Add($rv) }
+}
+$target = $null
+if ($Name) {
+    $cond = [System.Windows.Automation.PropertyCondition]::new($A::NameProperty, $Name)
+    foreach ($rh in $rootIds) {
+        if (-not $rh) { continue }
+        try {
+            $root = $A::FromHandle([IntPtr]$rh)
+            foreach ($e in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)) {
+                $r = $e.Current.BoundingRectangle
+                if ([math]::Abs($r.X + $r.Width / 2 - $X) -le 8 -and [math]::Abs($r.Y + $r.Height / 2 - $Y) -le 8) {
+                    $target = $e
+                    break
+                }
+            }
+        } catch { }
+        if ($target) { break }
+    }
+}
+if (-not $target) {
+    try { $target = $A::FromPoint([System.Windows.Point]::new($X, $Y)) } catch { }
+}
+if (-not $target) { 'ERR:control not found'; return }
+$p = $null
+switch ($Action) {
+    'invoke' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); 'OK:invoked' }
+        else { 'ERR:invoke not supported' }
+    }
+    'set_value' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) { $p.SetValue($Value); 'OK:value set' }
+        else { 'ERR:set_value not supported' }
+    }
+    'toggle' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) {
+            $p.Toggle()
+            "OK:toggled to $($p.Current.ToggleState)"
+        } else { 'ERR:toggle not supported' }
+    }
+    'select' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); 'OK:selected' }
+        else { 'ERR:select not supported' }
+    }
+    'expand' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$p)) { $p.Expand(); 'OK:expanded' }
+        else { 'ERR:expand not supported' }
+    }
+    'collapse' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$p)) { $p.Collapse(); 'OK:collapsed' }
+        else { 'ERR:collapse not supported' }
+    }
+    'range' {
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$p)) {
+            $num = 0.0
+            if ([double]::TryParse($Value, [ref]$num)) { $p.SetValue($num); "OK:range set to $num" }
+            else { 'ERR:range value must be a number' }
+        } else { 'ERR:range not supported' }
+    }
+    'focus' {
+        $target.SetFocus()
+        'OK:focused'
+    }
+    default { "ERR:unknown action $Action" }
+}
+"""
+
+
+def uia_action(hwnd: int, x: int, y: int, name: str, action: str, value: str = "") -> tuple[bool, str]:
+    """Execute a UIA pattern action on the control at (x, y) / `name`."""
+    if action not in UIA_ACTIONS:
+        return False, f"unknown action {action}"
+    from src.tools import warm_ps
+
+    roots = [*popup_windows(hwnd), hwnd] if hwnd else []
+    out = (warm_ps.run("uia", _UIA_ACTION_PS,
+                       {"Roots": ",".join(str(r) for r in roots), "X": x, "Y": y, "Name": name, "Action": action, "Value": value}, 10.0) or "").strip()
+    if out.startswith("OK:"):
+        return True, out[3:]
+    if out.startswith("ERR:"):
+        return False, out[4:]
+    return False, "UIA action failed"
+
+
 def ui_elements(hwnd: int, timeout_s: float = 25.0) -> str:
-    """Raw `x,y,w,h<TAB>Type<TAB>Name` lines for the controls of window `hwnd`; '' on any failure."""
+    """Raw `x,y,w,h<TAB>Type<TAB>Name` lines for the controls of window `hwnd` (plus popups); '' on any failure."""
     import subprocess
     import tempfile
     from pathlib import Path
@@ -643,7 +1016,8 @@ def ui_elements(hwnd: int, timeout_s: float = 25.0) -> str:
         return ""
     from src.tools import warm_ps
 
-    warm = warm_ps.run("uia", _UIA_PS, {"Hwnd": hwnd}, timeout_s)
+    popups = popup_windows(hwnd)
+    warm = warm_ps.run("uia", _UIA_PS, {"Hwnd": hwnd, "Popups": ",".join(str(p) for p in popups)}, timeout_s)
     if warm is not None:
         return warm
     with tempfile.TemporaryDirectory(prefix="paperduck_uia_") as tmp:
