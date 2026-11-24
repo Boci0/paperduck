@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QRect, QUrl
 from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication
-from PyQt6.QtWidgets import QApplication, QFileDialog
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog
 
 from src.engine.models import PetState
 from src.tools.ai_assist import AiAssistPlugin
@@ -359,6 +359,41 @@ class AiMixin:
             if folder and project is not None:
                 project.set_repo(folder)
                 self._show_toast(Path(folder).name[:10].upper(), QColor("#73EFF7"))
+            return
+        if callback_id == "launcher:add":
+            launcher = self._state_machine.registry.get_plugin("launcher")
+            if launcher is None:
+                return
+            label, ok = QInputDialog.getText(self, "Paperduck - Add Launcher Command", "Command name:")
+            if not ok or not label.strip():
+                return
+            command, ok2 = QInputDialog.getText(self, "Paperduck - Add Launcher Command", "Command line:")
+            if not ok2 or not command.strip():
+                return
+            cwd, ok3 = QInputDialog.getText(
+                self, "Paperduck - Add Launcher Command",
+                "Working folder (optional; blank uses Project Folder or Home):",
+            )
+            if not ok3:
+                return
+            status = launcher.add_command(label, command, cwd)
+            color = "#38B764" if status == "ADDED" else "#EF7D57"
+            self._show_toast(status, QColor(color))
+            return
+        if callback_id == "launcher:remove":
+            launcher = self._state_machine.registry.get_plugin("launcher")
+            cmds = getattr(launcher, "commands", [])
+            if launcher is None or not cmds:
+                self._show_toast("EMPTY", QColor("#8A9AF2"))
+                return
+            labels = [f"{i + 1}. {c.label}  ({c.command[:40]})" for i, c in enumerate(cmds)]
+            picked, ok = QInputDialog.getItem(
+                self, "Paperduck - Remove Launcher Command", "Choose a command to remove:", labels, 0, False
+            )
+            if ok and picked in labels:
+                idx = labels.index(picked)
+                if launcher.remove_command(idx):
+                    self._show_toast("REMOVED", QColor("#8A9AF2"))
             return
         if callback_id == "forge:clipboard_files":
             clip_paths = self._clipboard_local_paths()

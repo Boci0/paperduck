@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
-from src.tools.ai_tools import scratch_dir
+from src.tools.ai_tools import find_injection, scratch_dir
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,23 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, dict[str, Any]]:
             out[re.sub(r"_{2,}", "_", safe_name(str(name)))] = {"command": cfg["command"], "args": args,
                                          "env": {str(k): str(v) for k, v in env.items()}}
     return out
+
+
+def poisoned_tool_reason(tool: dict[str, Any]) -> str:
+    """Matched injection snippet if a tools/list entry's name, description, or schema carries prompt injection."""
+    todo: list[Any] = [tool.get("name"), tool.get("description"), tool.get("inputSchema"), tool.get("annotations")]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, str):
+            if hit := find_injection(item):
+                return hit
+        elif isinstance(item, dict):
+            for k, v in item.items():
+                todo.append(k)
+                todo.append(v)
+        elif isinstance(item, list):
+            todo.extend(item)
+    return ""
 
 
 def tool_spec(server: str, tool: dict[str, Any]) -> dict[str, Any]:
@@ -220,6 +237,7 @@ class McpServer:
         self.destructive: set[str] = set()  # safe names of tools that declare destructiveHint (and not readOnlyHint)
         self.image = b""  # the last call's first image, for a model that sees
         self.readonly: set[str] = set()  # safe names of tools that declare readOnlyHint (no look after them)
+        self.poisoned: dict[str, str] = {}  # blocked tool name -> matched injection snippet
         self._lock = threading.Lock()
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._stderr = bytearray()
@@ -326,6 +344,10 @@ class McpServer:
         tools = [t for t in (listed or {}).get("tools") or [] if isinstance(t, dict) and isinstance(t.get("name"), str)]
         specs = []
         for tool in tools[:MAX_TOOLS_PER_SERVER]:
+            if hit := poisoned_tool_reason(tool):
+                self.poisoned[tool["name"]] = hit
+                logger.warning("blocked poisoned MCP tool %s.%s (%s)", self.name, tool["name"], hit)
+                continue
             spec = tool_spec(self.name, tool)
             short = base = spec["function"]["name"].removeprefix(self.name + SEP)
             n = 2
@@ -385,6 +407,7 @@ class McpHub:
         self._lock = threading.Lock()
         self.image = b""  # the last call's first image (see McpServer.image)
         self.start_errors: dict[str, str] = {}
+        self.poisoned_tools: dict[str, list[str]] = {}
 
     def specs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -396,6 +419,7 @@ class McpHub:
             if mtime != self._loaded:
                 self._stop()
                 self._loaded = mtime
+                self.poisoned_tools.clear()
                 for name, cfg in load_config(self.path).items():
                     try:
                         server = McpServer(name, cfg)
@@ -405,6 +429,8 @@ class McpHub:
                         self._specs += server.start()
                         self._servers[name] = server
                         self.start_errors.pop(name, None)
+                        if server.poisoned:
+                            self.poisoned_tools[name] = sorted(server.poisoned)
                     except (RuntimeError, OSError) as exc:
                         self.start_errors[name] = str(exc) or server.stderr_tail
                         server.close()

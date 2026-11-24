@@ -13,6 +13,7 @@ from src.tools.clip_vault import ClipVaultPlugin
 from src.tools.file_forge import FileForgePlugin, ForgeMode
 from src.tools.errands import ErrandsPlugin
 from src.tools.hints import HintsPlugin
+from src.tools.launcher import LauncherPlugin
 from src.tools.pomodoro import PomodoroPhase, PomodoroPlugin
 from src.tools.project import ProjectPlugin
 from src.tools.system_monitor import SystemMonitorPlugin
@@ -46,8 +47,10 @@ class PetStateMachine:
             pomodoro.completed_sessions = self._stats.completed_sessions
             forge = FileForgePlugin()
             clipvault = ClipVaultPlugin()
-            self._registry = ToolRegistry([sysmon, pomodoro, forge, clipvault, ProjectPlugin(),
-                                           HintsPlugin(), AiAssistPlugin(), ErrandsPlugin()])
+            project = ProjectPlugin()
+            launcher = LauncherPlugin(project_dir=lambda: project.repo)
+            self._registry = ToolRegistry([sysmon, pomodoro, forge, clipvault, project,
+                                           launcher, HintsPlugin(), AiAssistPlugin(), ErrandsPlugin()])
 
         self._sync_stats_from_tools()
 
@@ -99,6 +102,11 @@ class PetStateMachine:
     def clip_vault_plugin(self) -> ClipVaultPlugin | None:
         plugin = self._registry.get_plugin("clipvault")
         return plugin if isinstance(plugin, ClipVaultPlugin) else None
+
+    @property
+    def launcher_plugin(self) -> LauncherPlugin | None:
+        plugin = self._registry.get_plugin("launcher")
+        return plugin if isinstance(plugin, LauncherPlugin) else None
 
     def on_state_change(self, callback: StateChangeCallback) -> Callable[[], None]:
         """Register a listener for state transitions; returns an unsubscribe callable."""

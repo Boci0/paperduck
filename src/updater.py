@@ -37,7 +37,17 @@ from src.tools.qt_relay import emit_later, ensure_relay
 
 logger = logging.getLogger(__name__)
 
-REPO = "Boci0/paperduck"
+_DEFAULT_REPO = "Boci0/paperduck"
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def configured_repo(override: str | None = None) -> str:
+    """GitHub `owner/repo` from `override` or `PAPERDUCK_REPO`, defaulting to `Boci0/paperduck`."""
+    cand = (os.environ.get("PAPERDUCK_REPO", "") if override is None else override).strip()
+    return cand if _REPO_RE.fullmatch(cand) else _DEFAULT_REPO
+
+
+REPO = configured_repo()
 LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{REPO}/releases"
 FROZEN = bool(getattr(sys, "frozen", False))

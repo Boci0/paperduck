@@ -17,11 +17,12 @@
 param(
     [switch]$DesktopShortcut,
     [switch]$StartWithWindows,
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [string]$Repo = $(if ($env:PAPERDUCK_REPO -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { $env:PAPERDUCK_REPO } else { "Boci0/paperduck" })
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "Boci0/paperduck"
+if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw "Invalid Repo: $Repo" }
 $Root = Join-Path $env:LOCALAPPDATA "Paperduck"
 $App = Join-Path $Root "app"
 $Venv = Join-Path $Root "venv"

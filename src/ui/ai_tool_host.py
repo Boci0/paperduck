@@ -32,8 +32,8 @@ from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool
 from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
 from src.tools.ai_tools import (CORE_TOOL_NAMES, calculate, check_layout, discover_workspace, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
-                                batch_read, computer_action, destructive_reason, file_outline, infer_tool_groups, is_readonly_command, query_files, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
-                                plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve, search_memory, search_tools_catalog,
+                                apply_undo, batch_read, computer_action, destructive_reason, file_outline, infer_tool_groups, is_readonly_command, list_undo_edits, query_files, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
+                                plan_edits, plan_memory, plan_skill_update, plan_undo, print_to_pdf_paths, python_destructive_reason, python_error_note, python_exe, python_file, resolve, search_memory, search_tools_catalog,
                                 PDF_WAIT_S, changed_media, file_stamp, media_stamps, syntax_check_edits, tool_group_of, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
 from src.tools.errands import describe as describe_errand
@@ -959,10 +959,15 @@ class AiToolHost(QObject):
         if name == "load_mcp_tools":
             want = args.get("server")
             tools = [s["function"]["name"] for s in self.mcp.specs() if self.mcp.server_of(s["function"]["name"]) == want]
-            if not tools:
+            blocked = getattr(self.mcp, "poisoned_tools", {}).get(want, [])
+            if not tools and not blocked:
                 return f"error: no MCP server named {want!r}"
-            self.mcp_loaded.add(want)
-            return f"loaded {len(tools)} tools: {', '.join(tools)}. Call them from the next step."
+            if tools:
+                self.mcp_loaded.add(want)
+            msg = f"loaded {len(tools)} tools: {', '.join(tools)}. Call them from the next step." if tools else f"no safe tools loaded from {want}"
+            if blocked:
+                msg += f"\n[Paperduck: blocked poisoned MCP tool(s) from {want}: {', '.join(blocked)}.]"
+            return msg
         if name == "search_tools":
             activated, out = search_tools_catalog(args.get("query", ""), args.get("group", ""))
             self.tool_groups_loaded.update(activated)
@@ -1023,16 +1028,7 @@ class AiToolHost(QObject):
                 ask = f"The model wants to change {len(edits)} files, all or none:\n\n{diffs}"
             # Only edits wholly inside the Project Folder share the "edit_file" approval:
             # elsewhere (Startup, secrets, Paperduck's own skills and MCP config) asks under its own key.
-            root, app_data = self._project(), skills_dir().parent.resolve()
-            inside = root is not None and all(
-                e.path.resolve().is_relative_to(root.resolve()) and not e.path.resolve().is_relative_to(app_data)
-                and not is_secret(e.path) for e in edits)
-            # Helper scripts in the scratch folder get a key of their own, so allowing them never allows Startup or
-            # other folders; still reviewed, since a later `run_command` card shows only the script's name
-            scratch = not inside and all(e.path.resolve().is_relative_to(scratch_dir().resolve())
-                                         and not is_secret(e.path) for e in edits)
-            key, what = (("edit_file", "file edits") if inside else ("edit_scratch", "helper scripts in the scratch folder")
-                         if scratch else ("edit_outside", "edits outside the Project Folder"))
+            inside, key, what = AiToolHost._edit_scope(self, [e.path for e in edits])
             if not self._allowed(key, ask, what):
                 return "error: the user declined this edit"
             res = apply_edits(edits)
@@ -1043,6 +1039,25 @@ class AiToolHost(QObject):
                         self.edit_gen += 1
                         self.edited_code_files.extend(touched)
                 return res + syntax_check_edits(edits)
+            return res
+        if name == "undo_edits":
+            if args.get("list") is True:
+                return list_undo_edits()
+            force = args.get("force") is True
+            try:
+                manifests, items = plan_undo(args.get("id"), args.get("steps", 1), force=force)
+            except ValueError as exc:
+                return f"error: {exc}"
+            diffs = "\n\n".join(f"{'remove' if not it.existed else 'revert'} {it.rel}\n{it.diff}" for it in items)
+            inside, key, what = AiToolHost._edit_scope(self, [it.path for it in items])
+            if not self._allowed(key, f"The model wants to undo {len(items)} file edit(s):\n\n{diffs}", what):
+                return "error: the user declined undoing these edits"
+            res = apply_undo(manifests, items, force=force)
+            if not res.startswith("error") and inside and hasattr(self, "edit_gen"):
+                touched = [it.rel for it in items if it.path.suffix.lower() in _CODE_EXTS]
+                if touched:
+                    self.edit_gen += 1
+                    self.edited_code_files.extend(touched)
             return res
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
@@ -1086,87 +1101,8 @@ class AiToolHost(QObject):
             if hasattr(self, "open_tasks"):
                 self.open_tasks = sum(1 for _t, s in tasks if s != "done")
             return f"task list shown ({sum(1 for _t, s in tasks if s == 'done')} of {len(tasks)} done)"
-        if name in ("run_command", "run_powershell"):
-            ps = name == "run_powershell"
-            command = args.get("script" if ps else "command")
-            ps_path = args.get("path") if ps else None
-            cwd = self._project() or Path.home()
-            if isinstance(args.get("cwd"), str) and args["cwd"].strip():
-                try:
-                    cwd = resolve(self._project(), args["cwd"])
-                except (OSError, ValueError):
-                    return "error: bad cwd path"
-                if not cwd.is_dir():
-                    return "error: cwd is not a folder"
-            user_script: Path | None = None
-            if ps and (not isinstance(command, str) or not command.strip()):
-                if not isinstance(ps_path, str) or not ps_path.strip():
-                    return "error: give a script or path"
-                try:
-                    resolved = resolve(self._project(), ps_path)
-                except (OSError, ValueError):
-                    return "error: bad script path"
-                allowed_roots = [scratch_dir().resolve()] + ([self._project().resolve()] if self._project() else [])
-                if resolved.suffix.lower() != ".ps1" or not any(resolved.is_relative_to(r) for r in allowed_roots):
-                    return "error: path must be a .ps1 file inside the scratch or Project Folder"
-                if is_secret(resolved) or not resolved.is_file():
-                    return "error: script file not found"
-                if resolved.stat().st_size > MAX_SAVE_CHARS:
-                    return f"error: script is longer than {MAX_SAVE_CHARS} characters"
-                try:
-                    command = resolved.read_text(encoding="utf-8-sig")
-                except (OSError, UnicodeDecodeError):
-                    return "error: could not read script as UTF-8"
-                user_script = resolved
-            if not isinstance(command, str) or not command.strip():
-                return "error: give a script" if ps else "error: give a command"
-            where = str(cwd) if isinstance(args.get("cwd"), str) and args["cwd"].strip() else ("the Project Folder" if self._project() else f"your home folder ({cwd})")
-            risk = destructive_reason(command)
-            seconds = command_timeout(args.get("timeout_s"))
-            limit = f" (allowed to run up to {seconds:g} s)" if args.get("timeout_s") is not None else ""
-            what = " this PowerShell script" if ps else ""
-            fast_rev = ((True, "read-only command")
-                        if _host_auto_mode(self) and not ps and not risk and not self.outside and is_readonly_command(command)
-                        else None)
-            allow_kw = {"fast_review": fast_rev} if fast_rev is not None else {}
-            if not self._allowed("run_command", f"The model wants to run{what} in {where}{limit}:\n\n{command.strip()}",
-                                 "commands", risk, **allow_kw):
-                return "error: the user declined this command"
-            script, source = None, command
-            if user_script is not None:
-                command = f'powershell -NoProfile -ExecutionPolicy Bypass -File "{user_script}"'
-            elif ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
-                try:
-                    script, command = powershell_file(command)
-                except (ValueError, OSError) as exc:
-                    return f"error: {exc}"
-            pdfs = {pdf: file_stamp(pdf) for pdf in print_to_pdf_paths(command, cwd)}
-            media = media_stamps(command, cwd)
-            out = run_command(cwd, command, self.cancel, seconds)
-            failed = out.startswith(("error", "stopped after")) or (
-                out.startswith("exit code") and not out.startswith("exit code 0"))
-            if not failed and out.startswith("exit code 0") and hasattr(self, "verified_gen"):
-                self.verified_gen = getattr(self, "edit_gen", 0)
-            if script is not None and not failed:
-                script.unlink(missing_ok=True)
-            active = user_script or script
-            if active is not None and failed:
-                out += powershell_error_note(out, source, active.name, saved_path=active)
-            for pdf, before in pdfs.items():  # headless Edge stamps HeadlessChrome, Skia and dates
-                # msedge.exe hands off to a child and returns before the PDF is written: wait for the new file
-                if wait_for_new_file(pdf, before, PDF_WAIT_S, self.cancel):
-                    out += f"\n[Paperduck: {pdf.name}: metadata {scrub_metadata(pdf)}]"
-                else:
-                    out += f"\n[Paperduck: {pdf.name} was not written within {PDF_WAIT_S:g} s; call clean_metadata on it]"
-            # Other PDFs and images the command made may carry metadata too; they are the user's to keep as they
-            # are (a build's own fixtures, say), so the model is told rather than the files changed
-            unclean = [p for p in changed_media(media, cwd, command)
-                       if p not in pdfs and scrub_metadata(p, dry_run=True) == "would clean"]
-            if unclean:
-                names = ", ".join(_rel_name(p, cwd) for p in unclean[:8])
-                out += (f"\n[Paperduck: this made or changed {names}, which still carry metadata (author, creating app, "
-                        "dates). Call clean_metadata on each one you hand to the user.]")
-            return out
+        if name in ("run_command", "run_powershell", "run_python"):
+            return AiToolHost._run_exec(self, name, args)
         if name == "start_background":
             command = args.get("command")
             if not isinstance(command, str) or not command.strip():
@@ -1284,7 +1220,8 @@ class AiToolHost(QObject):
                     l, t, r, b = win_info[1]
                     reg = [l, t, r - l, b - t]
             return self._map(*got, region=reg, annotate=args.get("annotate") is True,
-                             grid=args.get("grid") is True)
+                             grid=args.get("grid") is True, query=args.get("query"),
+                             control_types=args.get("control_types"))
         if name == "peek_region":
             got = self._on_gui(lambda done: self._grab_screen(done, primary=True))
             if not isinstance(got, tuple) or not isinstance(got[0], QImage) or got[0].isNull():
@@ -1425,6 +1362,113 @@ class AiToolHost(QObject):
 
         return "error: action must be 'read', 'send', or 'stop'"
 
+    def _edit_scope(self, paths: list[Path]) -> tuple[bool, str, str]:
+        """Classify edit/undo targets into (inside_project, approval_key, approval_label)."""
+        root, app_data = self._project(), skills_dir().parent.resolve()
+        inside = root is not None and all(
+            p.resolve().is_relative_to(root.resolve()) and not p.resolve().is_relative_to(app_data)
+            and not is_secret(p) for p in paths)
+        scratch = not inside and all(p.resolve().is_relative_to(scratch_dir().resolve())
+                                     and not is_secret(p) for p in paths)
+        if inside:
+            return True, "edit_file", "file edits"
+        if scratch:
+            return False, "edit_scratch", "helper scripts in the scratch folder"
+        return False, "edit_outside", "edits outside the Project Folder"
+
+    def _run_exec(self, name: str, args: dict[str, Any]) -> str:
+        """Shared execution path for `run_command`, `run_powershell`, and `run_python`."""
+        ps = name == "run_powershell"
+        py = name == "run_python"
+        is_script = ps or py
+        command = args.get("script" if is_script else "command")
+        script_path_arg = args.get("path") if is_script else None
+        cwd = self._project() or Path.home()
+        if isinstance(args.get("cwd"), str) and args["cwd"].strip():
+            try:
+                cwd = resolve(self._project(), args["cwd"])
+            except (OSError, ValueError):
+                return "error: bad cwd path"
+            if not cwd.is_dir():
+                return "error: cwd is not a folder"
+        user_script: Path | None = None
+        if is_script and (not isinstance(command, str) or not command.strip()):
+            if not isinstance(script_path_arg, str) or not script_path_arg.strip():
+                return "error: give a script or path"
+            try:
+                resolved = resolve(self._project(), script_path_arg)
+            except (OSError, ValueError):
+                return "error: bad script path"
+            ext = ".ps1" if ps else ".py"
+            allowed_roots = [scratch_dir().resolve()] + ([self._project().resolve()] if self._project() else [])
+            if resolved.suffix.lower() != ext or not any(resolved.is_relative_to(r) for r in allowed_roots):
+                return f"error: path must be a {ext} file inside the scratch or Project Folder"
+            if is_secret(resolved) or not resolved.is_file():
+                return "error: script file not found"
+            if resolved.stat().st_size > MAX_SAVE_CHARS:
+                return f"error: script is longer than {MAX_SAVE_CHARS} characters"
+            try:
+                command = resolved.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError):
+                return "error: could not read script as UTF-8"
+            user_script = resolved
+        if not isinstance(command, str) or not command.strip():
+            return "error: give a script" if is_script else "error: give a command"
+        where = (str(cwd) if isinstance(args.get("cwd"), str) and args["cwd"].strip()
+                 else ("the Project Folder" if self._project() else f"your home folder ({cwd})"))
+        risk = python_destructive_reason(command) if py else destructive_reason(command)
+        seconds = command_timeout(args.get("timeout_s"))
+        limit = f" (allowed to run up to {seconds:g} s)" if args.get("timeout_s") is not None else ""
+        what = " this PowerShell script" if ps else (" this Python script" if py else "")
+        fast_rev = ((True, "read-only command")
+                    if _host_auto_mode(self) and not is_script and not risk and not self.outside and is_readonly_command(command)
+                    else None)
+        allow_kw = {"fast_review": fast_rev} if fast_rev is not None else {}
+        if not self._allowed("run_command", f"The model wants to run{what} in {where}{limit}:\n\n{command.strip()}",
+                             "commands", risk, **allow_kw):
+            return "error: the user declined this command"
+        script, source = None, command
+        if user_script is not None:
+            if ps:
+                command = f'powershell -NoProfile -ExecutionPolicy Bypass -File "{user_script}"'
+            else:
+                command = f'"{python_exe(cwd, self._project())}" "{user_script}"'
+        elif ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
+            try:
+                script, command = powershell_file(command)
+            except (ValueError, OSError) as exc:
+                return f"error: {exc}"
+        elif py:
+            try:
+                script, command = python_file(command, exe=python_exe(cwd, self._project()))
+            except (ValueError, OSError) as exc:
+                return f"error: {exc}"
+        pdfs = {pdf: file_stamp(pdf) for pdf in print_to_pdf_paths(command, cwd)}
+        media = media_stamps(command, cwd)
+        out = run_command(cwd, command, self.cancel, seconds)
+        failed = out.startswith(("error", "stopped after")) or (
+            out.startswith("exit code") and not out.startswith("exit code 0"))
+        if not failed and out.startswith("exit code 0") and hasattr(self, "verified_gen"):
+            self.verified_gen = getattr(self, "edit_gen", 0)
+        if script is not None and not failed:
+            script.unlink(missing_ok=True)
+        active = user_script or script
+        if active is not None and failed:
+            note_fn = powershell_error_note if ps else python_error_note
+            out += note_fn(out, source, active.name, saved_path=active)
+        for pdf, before in pdfs.items():  # headless Edge stamps HeadlessChrome, Skia and dates
+            if wait_for_new_file(pdf, before, PDF_WAIT_S, self.cancel):
+                out += f"\n[Paperduck: {pdf.name}: metadata {scrub_metadata(pdf)}]"
+            else:
+                out += f"\n[Paperduck: {pdf.name} was not written within {PDF_WAIT_S:g} s; call clean_metadata on it]"
+        unclean = [p for p in changed_media(media, cwd, command)
+                   if p not in pdfs and scrub_metadata(p, dry_run=True) == "would clean"]
+        if unclean:
+            names = ", ".join(_rel_name(p, cwd) for p in unclean[:8])
+            out += (f"\n[Paperduck: this made or changed {names}, which still carry metadata (author, creating app, "
+                    "dates). Call clean_metadata on each one you hand to the user.]")
+        return out
+
     def _errand(self, name: str, args: dict[str, Any]) -> str:
         """set_errand asks every time (it is an instruction that runs later, maybe while the user is away);
         cancel_errand only removes one. The plugin is touched on the Qt thread, where the pet polls it."""
@@ -1527,10 +1571,18 @@ class AiToolHost(QObject):
             out.append(f"{x + dx},{y + dy},{w},{h}{tab}{rest}")
         return "\n".join(out)
 
-    def _map(self, image: QImage, hwnd: int, region: Any = None, annotate: bool = False, grid: bool = False) -> str:
+    def _map(self, image: QImage, hwnd: int, region: Any = None, annotate: bool = False, grid: bool = False,
+             query: Any = None, control_types: Any = None) -> str:
         """screen_map's text for a grab; the grab becomes what the next click is checked against. `region`
         ([left, top, width, height]) lists only what is inside it and sends just that part as the screenshot: the
         provider charges about the same per image whatever its size, so a crop shows more for the same tokens."""
+        q_str = query.strip() if isinstance(query, str) and query.strip() else ""
+        if isinstance(control_types, str):
+            types_list = [t.strip() for t in control_types.split(",") if t.strip()]
+        elif isinstance(control_types, list):
+            types_list = [t.strip() for t in control_types if isinstance(t, str) and t.strip()]
+        else:
+            types_list = []
         clip = None
         if region is not None:
             if (not isinstance(region, list) or len(region) != 4
@@ -1541,13 +1593,14 @@ class AiToolHost(QObject):
                 return "error: the region is (almost) off the screen"
             clip = (rect.x(), rect.y(), rect.width(), rect.height())
         shown = image.copy(QRect(*clip)) if clip else image
+        ui_kw = {"query": q_str, "control_types": types_list} if (q_str or types_list) else {}
         with ThreadPoolExecutor(max_workers=2) as pool:  # OCR (cropped when zoomed) and the control tree overlap
-            controls = pool.submit(computer.ui_elements, hwnd)
-            raw_ocr = pool.submit(self._ocr, shown, True).result()
+            controls = pool.submit(computer.ui_elements, hwnd, **ui_kw)
+            raw_ocr = "" if types_list else pool.submit(self._ocr, shown, True).result()
             elements = controls.result()
         lines = self._offset_ocr_boxes(raw_ocr, clip[0], clip[1]) if clip else raw_ocr
         ox, oy = (clip[0], clip[1]) if clip else (0, 0)
-        if annotate or elements.count("\n") < 12:
+        if not (q_str or types_list) and (annotate or elements.count("\n") < 12):
             existing: list[tuple[int, int, int, int]] = []
             for raw_line in (elements.splitlines() + lines.splitlines()):
                 box_part = raw_line.partition("\t")[0]
@@ -1571,11 +1624,15 @@ class AiToolHost(QObject):
             note += " #id boxes are drawn on the screenshot (teal = controls, violet = unlabeled icon, amber = OCR text)."
         if grid:
             note += " Faint grid lines match the ruler ticks."
+        if q_str or types_list:
+            fparts = ([f"types={','.join(types_list)}"] if types_list else []) + ([f'query="{q_str}"'] if q_str else [])
+            note += f" Filtered ({', '.join(fparts)})."
         if clip:
             note = (f"Zoomed: only region {clip[0]},{clip[1]},{clip[2]}x{clip[3]} is listed and shown; (x, y) are "
                     "still screen pixels. " + note)
         self._items, self._ocr_ids = {}, set()  # the ids this map hands out; clicks and drags resolve `id` with them
-        out = parse_boxes(lines, image.width(), image.height(), elements, note, self._items, clip, self._ocr_ids)
+        out = parse_boxes(lines, image.width(), image.height(), elements, note, self._items, clip, self._ocr_ids,
+                          query=q_str, control_types=types_list)
         composed = render_screen_overlay(
             shown,
             origin=(clip[0], clip[1]) if clip else (0, 0),
@@ -2172,11 +2229,13 @@ class AiToolHost(QObject):
         if out.startswith("error"):
             return out
         tools = [s["function"]["name"] for s in self.mcp.specs() if self.mcp.server_of(s["function"]["name"]) == server]
+        blocked = getattr(self.mcp, "poisoned_tools", {}).get(server, [])
+        blocked_note = (f" (blocked {len(blocked)} poisoned tool(s): {', '.join(blocked)})" if blocked else "")
         if not tools:
             err = getattr(self.mcp, "start_errors", {}).get(server, "")
-            detail = f": {err}" if err else " (wrong command, missing npx / uvx, or a missing env value)"
+            detail = f": {err}" if err else (blocked_note or " (wrong command, missing npx / uvx, or a missing env value)")
             return out + f", but it did not start{detail}"
-        return out + (f"; it started with these tools: {', '.join(tools)}. If they are not in your tool list yet, "
+        return out + (f"; it started with these tools: {', '.join(tools)}{blocked_note}. If they are not in your tool list yet, "
                       "they are from the user's next message, so tell the user to send one.")
 
     def _project(self) -> Path | None:

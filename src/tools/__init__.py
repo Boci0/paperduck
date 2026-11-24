@@ -9,6 +9,7 @@ from src.tools.file_forge import (
     ForgeWheelOption,
     get_wheel_options_for_paths,
 )
+from src.tools.launcher import LauncherCommand, LauncherPlugin
 from src.tools.pomodoro import PomodoroPlugin
 from src.tools.system_monitor import SystemMetrics, SystemMonitorPlugin, get_system_metrics
 
@@ -19,6 +20,8 @@ __all__ = [
     "ForgeMode",
     "ForgeResult",
     "ForgeWheelOption",
+    "LauncherCommand",
+    "LauncherPlugin",
     "PomodoroPlugin",
     "SystemMetrics",
     "SystemMonitorPlugin",

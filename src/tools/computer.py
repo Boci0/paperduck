@@ -355,7 +355,7 @@ def press(codes: list[int]) -> None:
 # The "skeleton" of the front window: its clickable controls from Windows UI Automation, each with an exact rectangle
 # (icons and unlabeled buttons that OCR cannot see). Windows PowerShell 5.1 ships the .NET UIAutomationClient.
 _UIA_PS = r"""
-param([long]$Hwnd, [string]$Popups = '')
+param([long]$Hwnd, [string]$Popups = '', [string]$Query = '', [string]$ControlTypes = '')
 $ErrorActionPreference = 'Stop'
 if (-not ('BS.Dpi' -as [type])) {  # a warm worker runs this again in the same process
     Add-Type -Namespace BS -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);'
@@ -404,6 +404,15 @@ foreach ($tok in ($Popups -split ',')) {
 }
 if ($Hwnd -and -not $roots.Contains($Hwnd)) { $roots.Add($Hwnd) }
 $count = 0
+$typeFilter = New-Object System.Collections.Generic.HashSet[string]
+if ($ControlTypes) {
+    foreach ($t in ($ControlTypes -split ',')) {
+        $tt = $t.Trim().ToLowerInvariant()
+        if ($tt) { [void]$typeFilter.Add($tt) }
+    }
+}
+$hasQuery = [bool]($Query -and $Query.Trim())
+$needle = if ($hasQuery) { $Query.Trim() } else { '' }
 foreach ($rh in $roots) {
     if ($count -ge 400) { break }
     $root = $null
@@ -434,6 +443,8 @@ foreach ($rh in $roots) {
             if (-not $name) { $name = $cur.HelpText }
             if ($name) { $name = ($name -replace '[\r\n\t]+', ' ').Trim() } else { $name = '' }
             $kind = $cur.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+            if ($typeFilter.Count -gt 0 -and -not $typeFilter.Contains($kind.ToLowerInvariant())) { continue }
+            if ($hasQuery -and $name.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             $tags = @()
             if (-not $cur.IsEnabled) { $tags += 'disabled' }
             if ($cur.HasKeyboardFocus) { $tags += 'focus' }
@@ -1079,7 +1090,8 @@ def uia_action(hwnd: int, x: int, y: int, name: str, action: str, value: str = "
     return False, "UIA action failed"
 
 
-def ui_elements(hwnd: int, timeout_s: float = 25.0) -> str:
+def ui_elements(hwnd: int, timeout_s: float = 25.0, query: str = "",
+                control_types: list[str] | tuple[str, ...] | None = None) -> str:
     """Raw `x,y,w,h<TAB>Type<TAB>Name` lines for the controls of window `hwnd` (plus popups); '' on any failure."""
     import subprocess
     import tempfile
@@ -1090,15 +1102,23 @@ def ui_elements(hwnd: int, timeout_s: float = 25.0) -> str:
     from src.tools import warm_ps
 
     popups = popup_windows(hwnd)
-    warm = warm_ps.run("uia", _UIA_PS, {"Hwnd": hwnd, "Popups": ",".join(str(p) for p in popups)}, timeout_s)
+    types_str = ",".join(t.strip() for t in (control_types or ()) if isinstance(t, str) and t.strip())
+    q_str = query.strip() if isinstance(query, str) else ""
+    warm = warm_ps.run("uia", _UIA_PS, {"Hwnd": hwnd, "Popups": ",".join(str(p) for p in popups),
+                                       "Query": q_str, "ControlTypes": types_str}, timeout_s)
     if warm is not None:
         return warm
     with tempfile.TemporaryDirectory(prefix="paperduck_uia_") as tmp:
         script = Path(tmp) / "uia.ps1"
         script.write_text(_UIA_PS, encoding="utf-8")
         try:
-            proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                   "-File", str(script), str(hwnd)], capture_output=True, timeout=timeout_s,
+            cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(script), "-Hwnd", str(hwnd), "-Popups", ",".join(str(p) for p in popups)]
+            if q_str:
+                cmd += ["-Query", q_str]
+            if types_str:
+                cmd += ["-ControlTypes", types_str]
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout_s,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.TimeoutExpired):
             return ""

@@ -39,6 +39,7 @@ from src.storage.recent_files import format_age
 from src.tools.ai_assist import (
     COMPACT_AT,
     COMPACT_PREFIX,
+    COMPACT_TOKENS,
     DEEPSEEK_TOP_UP,
     MAX_INPUT_CHARS,
     THINKING_LEVELS,
@@ -184,6 +185,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._balance: tuple[str, float] | None = None  # DeepSeek (currency, total), refreshed after each reply
         self._balance_start: tuple[str, float] | None = None  # the first balance this run, for spend so far
         self._last_info: QLabel | None = None  # the newest reply's details line, where its balance drop is added
+        self._last_prompt_tokens = 0  # provider-reported context tokens from the newest reply
         self._testing = False
         self._asked = ("", "off")  # model and thinking level of the request in flight
         self._anchor: QRect | None = None  # the pet's sprite, in global coordinates
@@ -577,7 +579,10 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
 
         note.on_text = on_text  # type: ignore[attr-defined]
 
-        long = history is not None and history_chars(history) > COMPACT_AT
+        long = history is not None and (
+            history_chars(history) > COMPACT_AT
+            or getattr(self, "_last_prompt_tokens", 0) > COMPACT_TOKENS
+        )
         sid, tasks, saved = self.ensure_sid() if long else "", list(self._tasks), [""]
 
         def keep(turns: list[dict]) -> str:  # worker thread; only file writes. shortcut: a failed answer rewrites them next time
@@ -725,6 +730,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     def _accept_reply(self, reply: AiReply) -> None:
         # "wire" stays in memory only (sessions save the note form): a resumed chat pays one cache miss
         self._remote_error = ""
+        self._last_prompt_tokens = getattr(reply, "last_prompt_tokens", 0)
         self._history.append({"role": "assistant", "content": reply.text, "tools": reply.tools,
                               **({"wire": reply.wire} if keep_wire(self._history, reply.wire) else {})})
         self._plugin.record(reply.total_tokens)
@@ -1476,6 +1482,7 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             self._branch_q.clear()
         self._sheets.close_all()
         self._sid = None
+        self._last_prompt_tokens = 0
         self._history.clear()
         self._allowed.clear()
         if hasattr(self._tool_host, "mcp_loaded"):

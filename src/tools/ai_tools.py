@@ -22,9 +22,11 @@ Security:
 from __future__ import annotations
 
 import ast
+import base64
 import bisect
-import codecs
 from collections import deque
+import hashlib
+import json
 import math
 import operator
 import ctypes
@@ -32,7 +34,9 @@ import difflib
 import fnmatch
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import itertools
 import threading
@@ -60,6 +64,7 @@ MAX_CONTEXT = 3  # lines search_text may show around a match
 MAX_DIFF_CHARS = 4000  # diff shown in the chat for the user to approve
 MAX_NOTE_CHARS = 300  # one memory note
 MAX_EDITS = 12  # files one edit_files call changes
+MAX_UNDO_BATCHES = 30  # reversible pre-edit snapshots kept under scratch_dir()/undo/
 MAX_BATCH_STEPS = 25  # steps one computer_batch call runs
 MAX_WAIT_MS = 5000  # one computer_batch wait step
 # where a mouse_drag `handle` grabs a screen_map box, as fractions of its width and height
@@ -75,8 +80,34 @@ MAX_COMMAND_TIMEOUT_S = 900  # what the model may ask for with timeout_s
 MAX_COMMAND_CHARS = 30000  # command output returned to the model (head and tail kept)
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
              ".next", "target", ".cache", "coverage"}
-_SECRET = re.compile(r"^\.env|\.(pem|key|pfx|p12|kdbx|ppk)$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret",
-                     re.I)
+_SECRET = re.compile(
+    r"^\.env|^\.(npmrc|pypirc|netrc|git-credentials|dockercfg)$|^_netrc$|"
+    r"\.(pem|key|pfx|p12|kdbx|ppk)$|^id_(rsa|dsa|ecdsa|ed25519)|kubeconfig|"
+    r"^(login data|login data for account|logins\.json|key[34]\.db|cert9\.db|cookies\.sqlite|signons\.sqlite)$|"
+    r"credential|secret",
+    re.I,
+)
+_SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg"})
+_BROWSER_DATA_MARKERS = frozenset({
+    "user data", "chrome", "edge", "brave-browser", "bravesoftware", "opera", "vivaldi", "mozilla", "firefox",
+})
+_BROWSER_SENSITIVE_NAMES = frozenset({"cookies", "web data", "local state"})
+
+_INJECTION = re.compile(
+    r"ignore (?:all |any |the )?(?:previous|prior|above|earlier|your) (?:instructions|rules|prompt)"
+    r"|disregard (?:all |any |the )?(?:previous|prior|above|earlier|your) (?:instructions|rules)"
+    r"|(?:do not|don't|never) (?:tell|inform|mention (?:this )?to) the user"
+    r"|without (?:telling|informing) the user"
+    r"|(?:reveal|print|show|send|leak) (?:me )?(?:your|the) (?:system prompt|instructions|api key|secrets?)"
+    r"|new instructions?:|\[/system\]|(?<!\w)\[system\]\s*:|<\|?(?:im_start|system)\|?>|you are now (?:in )?(?:developer|dan|jailbreak)",
+    re.I,
+)
+
+
+def find_injection(text: str) -> str:
+    """Return the matched prompt-injection snippet (up to 40 chars) or '' when clean."""
+    found = _INJECTION.search(text)
+    return found[0][:40] if found else ""
 
 # Allowlisted pet actions -> what they do (the model sees this list)
 PET_ACTIONS: dict[str, str] = {
@@ -93,7 +124,7 @@ PET_ACTIONS: dict[str, str] = {
 }
 # Tools whose output is the user's own data; after one runs, fetch_page may only open links already in the chat
 LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "batch_read", "query_files", "read_clipboard", "read_screen", "screen_map", "peek_region", "sample_colors", "layout_check", "preview_document", "view_image", "mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "computer_batch", "pet_status",
-                    "run_command", "run_powershell", "read_background", "list_windows", "wait_for_ui", "file_outline", "search_sessions"}
+                    "run_command", "run_powershell", "run_python", "read_background", "list_windows", "wait_for_ui", "file_outline", "search_sessions"}
 
 
 def _fn(name: str, description: str, props: dict[str, Any] | None = None, required: tuple[str, ...] = ()) -> dict:
@@ -148,7 +179,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
          "annotate": {"type": "boolean",
                       "description": "Draw #id boxes and badges onto the screenshot (default false)"},
          "grid": {"type": "boolean",
-                  "description": "Draw faint screen-coordinate grid lines matching the ruler ticks (default false)"}}),
+                  "description": "Draw faint screen-coordinate grid lines matching the ruler ticks (default false)"},
+         "query": {"type": "string",
+                   "description": "Optional case-insensitive substring filter for control names or OCR lines"},
+         "control_types": {"type": "array", "items": {"type": "string"},
+                           "description": "Optional UIA control types to keep, e.g. ['Button', 'Edit', 'MenuItem', 'TabItem']"}}),
     _fn("peek_region", "Fast image-only look at the main monitor or a cropped region, skipping UI Automation and OCR. "
         "Use during painting, drawing, layout or visual iteration where controls do not need re-listing. Supports "
         "optional coordinate grid, grayscale value check ('squint test' for tonal contrast), and diff (side-by-side "
@@ -326,6 +361,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "path": _PATH, "old_text": {"type": "string"}, "new_text": {"type": "string"},
             "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "replace_all": {"type": "boolean"}},
             "required": ["path", "old_text", "new_text"]}}}, ("edits",)),
+    _fn("undo_edits", "List or revert recent AI file edits using saved pre-edit snapshots in scratch_dir/undo. "
+        "Pass list=true to inspect saved edit batches, or revert the newest `steps` (default 1) or a specific `id` "
+        "(restores original bytes or removes newly created files after user approval).",
+        {"list": {"type": "boolean", "description": "List available undo batches without changing files"},
+         "steps": {"type": "integer", "description": "How many recent edit batches to undo (1 to 10, default 1)"},
+         "id": {"type": "string", "description": "Optional specific batch id from list=true"},
+         "force": {"type": "boolean", "description": "Overwrite even if the file changed after the AI edit"}}),
     _fn("file_outline", "Show classes, functions, methods, or markdown headings with line numbers for a source file.",
         {"path": _PATH}, ("path",)),
     _fn("search_sessions", "Search saved past chats by keyword in titles or messages.",
@@ -355,6 +397,16 @@ TOOL_SPECS: list[dict[str, Any]] = [
         f"limit and timeout_s as run_command.",
         {"script": {"type": "string"},
          "path": {"type": "string", "description": "Optional .ps1 path (scratch or Project Folder) to run instead of passing 'script'"},
+         "cwd": _PATH,
+         "timeout_s": {"type": "integer", "description": f"Seconds to allow, default {COMMAND_TIMEOUT_S}, most "
+                       f"{MAX_COMMAND_TIMEOUT_S}."}}, ()),
+    _fn("run_python", f"Run a Python script using the Project Folder or Paperduck .venv Python interpreter and get its "
+        f"exit code and output. Prefer this over run_command for data processing, file/JSON/CSV/PDF/image scripting, "
+        f"or multi-line Python code (saved to scratch_dir/py_*.py and kept on failure so edit_file can fix it). Give "
+        f"'script', or 'path' to a .py file in the scratch or Project Folder. Same {COMMAND_TIMEOUT_S} s limit and "
+        f"timeout_s as run_command.",
+        {"script": {"type": "string"},
+         "path": {"type": "string", "description": "Optional .py path (scratch or Project Folder) to run instead of passing 'script'"},
          "cwd": _PATH,
          "timeout_s": {"type": "integer", "description": f"Seconds to allow, default {COMMAND_TIMEOUT_S}, most "
                        f"{MAX_COMMAND_TIMEOUT_S}."}}, ()),
@@ -428,7 +480,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
 ]
 CORE_TOOL_NAMES = frozenset({
     "list_files", "read_file", "file_outline", "batch_read", "query_files", "find_files", "search_text",
-    "edit_file", "edit_files", "run_command", "run_powershell", "plan_tasks", "calculate",
+    "edit_file", "edit_files", "undo_edits", "run_command", "run_powershell", "run_python", "plan_tasks", "calculate",
     "find_skill", "load_skill", "search_tools",
 })
 TOOL_GROUPS: dict[str, frozenset[str]] = {
@@ -452,7 +504,7 @@ _TOOL_GROUP_MAP = {name: grp for grp, names in TOOL_GROUPS.items() for name in n
 # the user allows each call in the chat (or all of them for a chat)
 COMPUTER_TOOLS = {"mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "type_text", "paste_text", "press_key", "scroll", "focus_window", "ui_action"}  # computer_batch runs these as its steps
 SCREEN_TOOLS = COMPUTER_TOOLS | {"screen_map", "peek_region", "sample_colors", "computer_batch", "layout_check", "wait_for_ui"}  # an answer using these gets screen_thinking
-APPROVED_TOOLS = COMPUTER_TOOLS | {"computer_batch", "edit_file", "edit_files", "run_command", "run_powershell", "start_background", "send_background_input", "add_mcp_server", "add_skill", "update_skill", "remember", "forget", "set_errand"}
+APPROVED_TOOLS = COMPUTER_TOOLS | {"computer_batch", "edit_file", "edit_files", "undo_edits", "run_command", "run_powershell", "run_python", "start_background", "send_background_input", "add_mcp_server", "add_skill", "update_skill", "remember", "forget", "set_errand"}
 FILE_TOOLS = {"list_files", "read_file", "find_files", "search_text"}
 
 
@@ -536,7 +588,17 @@ def _rel(base: Path, path: Path) -> str:
 
 
 def is_secret(path: Path) -> bool:
-    return bool(_SECRET.search(path.name))
+    if _SECRET.search(path.name):
+        return True
+    parts_low = [p.lower() for p in path.parts]
+    if any(p in _SECRET_DIRS for p in parts_low):
+        return True
+    name_low = path.name.lower()
+    if ".kube" in parts_low[:-1] and name_low in ("config", "kubeconfig"):
+        return True
+    if name_low in _BROWSER_SENSITIVE_NAMES and any(m in parts_low[:-1] for m in _BROWSER_DATA_MARKERS):
+        return True
+    return False
 
 
 SCAN_CUT = f"\n... stopped after scanning {MAX_SCANNED} files; give a narrower path to see the rest"
@@ -930,7 +992,7 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
             for path in [single] if single is not None else _walk(base, cut):
                 if single is None and not fnmatch.fnmatch(path.name.lower(), pattern.strip().lower()):
                     continue
-                if _SECRET.search(path.name):
+                if is_secret(path):
                     secret += 1
                     continue
                 if not _search_file(path, found_in, context, _rel(base, path), hits):
@@ -1186,9 +1248,9 @@ def plan_edits(root: Path | None, args: dict[str, Any]) -> list[Edit]:
     return edits
 
 
-def apply_edits(edits: list[Edit]) -> str:
+def apply_edits(edits: list[Edit], record_undo: bool = True) -> str:
     """Write allowed edits all or nothing: refuses if any file changed since the plan, and puts back the files
-    already written if a later write fails."""
+    already written if a later write fails. Saves reversible pre-edit snapshots in scratch_dir()/undo/."""
     try:
         for edit in edits:
             now = edit.path.read_bytes().decode("utf-8") if edit.path.exists() else None
@@ -1225,6 +1287,8 @@ def apply_edits(edits: list[Edit]) -> str:
                     pass
             return (f"error: could not write {edit.rel} ({exc.strerror or 'write failed'}); "
                     "the other files were put back")
+    if record_undo and edits:
+        _save_undo_batch(edits)
     rows = []
     for edit in edits:
         rows.append(f"{'created' if edit.before is None else 'edited'} {edit.rel} (+{edit.added} -{edit.removed} lines)")
@@ -1234,6 +1298,203 @@ def apply_edits(edits: list[Edit]) -> str:
 def apply_edit(edit: Edit) -> str:
     """Write one allowed edit, unless the file changed since it was planned."""
     return apply_edits([edit])
+
+
+_UNDO_LOCK = threading.Lock()
+_UNDO_SEQ = 0
+_UNDO_ID = re.compile(r"^[0-9A-Za-z_-]{4,64}$")
+
+
+@dataclass
+class UndoItem:
+    path: Path
+    rel: str
+    existed: bool
+    before_bytes: bytes | None
+    after_sha256: str
+    diff: str
+
+
+def undo_dir() -> Path:
+    return scratch_dir() / "undo"
+
+
+def _save_undo_batch(edits: list[Edit]) -> str:
+    """Persist reversible pre-edit snapshots for non-secret edits under scratch_dir()/undo/."""
+    global _UNDO_SEQ
+    entries: list[dict[str, Any]] = []
+    for edit in edits:
+        if is_secret(edit.path):
+            continue
+        try:
+            after_sha = hashlib.sha256(edit.path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        entries.append({
+            "path": str(edit.path),
+            "rel": edit.rel,
+            "existed": edit.before is not None,
+            "before_b64": base64.b64encode(edit.before.encode("utf-8")).decode("ascii") if edit.before is not None else "",
+            "after_sha256": after_sha,
+        })
+    if not entries:
+        return ""
+    folder = undo_dir()
+    with _UNDO_LOCK:
+        _UNDO_SEQ = (_UNDO_SEQ + 1) % 10000
+        batch_id = f"{int(time.time() * 1000):014d}_{_UNDO_SEQ:04d}_{uuid.uuid4().hex[:6]}"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            payload = {"id": batch_id, "created": time.time(), "entries": entries}
+            (folder / f"{batch_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+            old = sorted(folder.glob("*.json"))
+            for stale in old[:-MAX_UNDO_BATCHES]:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            return ""
+    return batch_id
+
+
+def _load_undo_manifests() -> list[tuple[Path, dict[str, Any]]]:
+    folder = undo_dir()
+    if not folder.is_dir():
+        return []
+    out: list[tuple[Path, dict[str, Any]]] = []
+    for p in sorted(folder.glob("*.json"), reverse=True):
+        try:
+            data = json.loads(p.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("entries"), list):
+            out.append((p, data))
+    return out
+
+
+def list_undo_edits() -> str:
+    """Human-readable summary of saved undo snapshots, newest first."""
+    batches = _load_undo_manifests()
+    if not batches:
+        return "no saved edit snapshots to undo"
+    lines: list[str] = []
+    for _p, data in batches[:15]:
+        bid = str(data.get("id") or _p.stem)
+        files = ", ".join(
+            f"{'create' if not e.get('existed') else 'edit'} {e.get('rel') or e.get('path')}"
+            for e in data.get("entries", []) if isinstance(e, dict)
+        )
+        lines.append(f"- {bid}: {files}")
+    return "\n".join(lines)
+
+
+def plan_undo(batch_id: Any = None, steps: Any = 1, force: bool = False) -> tuple[list[Path], list[UndoItem]]:
+    """Plan reverting the newest `steps` undo batches (or one `batch_id`) without modifying disk."""
+    batches = _load_undo_manifests()
+    if not batches:
+        raise ValueError("no saved edit snapshots to undo")
+    if isinstance(batch_id, str) and batch_id.strip():
+        want = batch_id.strip()
+        if not _UNDO_ID.fullmatch(want):
+            raise ValueError("invalid undo id")
+        chosen = [(p, d) for p, d in batches if d.get("id") == want or p.stem == want]
+        if not chosen:
+            raise ValueError(f'no undo snapshot "{want}"')
+    else:
+        if isinstance(steps, bool) or not isinstance(steps, int) or not (1 <= steps <= 10):
+            raise ValueError("steps must be an integer from 1 to 10")
+        chosen = batches[:steps]
+    merged: dict[Path, dict[str, Any]] = {}
+    for _p, data in chosen:  # newest -> oldest
+        for entry in data.get("entries", []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                continue
+            target = Path(entry["path"])
+            if target not in merged:
+                merged[target] = {
+                    "rel": str(entry.get("rel") or target),
+                    "after_sha256": str(entry.get("after_sha256") or ""),
+                    "existed": bool(entry.get("existed")),
+                    "before_b64": str(entry.get("before_b64") or ""),
+                }
+            else:  # older batch supplies the earlier pre-edit bytes
+                merged[target]["existed"] = bool(entry.get("existed"))
+                merged[target]["before_b64"] = str(entry.get("before_b64") or "")
+    if not merged:
+        raise ValueError("undo snapshot has no entries")
+    items: list[UndoItem] = []
+    for target, info in merged.items():
+        rel = info["rel"]
+        expected_sha = info["after_sha256"]
+        if target.exists():
+            try:
+                cur_bytes = target.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"could not read {rel} ({exc.strerror or 'read failed'})") from None
+            cur_sha = hashlib.sha256(cur_bytes).hexdigest()
+            if not force and cur_sha != expected_sha:
+                raise ValueError(f"{rel} changed after the AI edit; pass force=true to overwrite")
+        else:
+            cur_bytes = b""
+            if not force and expected_sha:
+                raise ValueError(f"{rel} was removed after the AI edit; pass force=true to restore")
+        existed = info["existed"]
+        try:
+            before_bytes = base64.b64decode(info["before_b64"], validate=True) if existed else None
+        except ValueError:
+            raise ValueError(f"corrupt undo snapshot for {rel}") from None
+        cur_text = cur_bytes.decode("utf-8", "replace").removeprefix("\ufeff").replace("\r\n", "\n")
+        prev_text = (before_bytes.decode("utf-8", "replace").removeprefix("\ufeff").replace("\r\n", "\n")
+                     if before_bytes is not None else "")
+        diff_lines = list(difflib.unified_diff(
+            cur_text.splitlines(keepends=True),
+            prev_text.splitlines(keepends=True),
+            f"a/{rel}",
+            "/dev/null" if not existed else f"b/{rel}",
+            n=2,
+        ))
+        diff = "".join(x if x.endswith("\n") else x + "\n\\ No newline at end of file\n" for x in diff_lines)
+        if len(diff) > MAX_DIFF_CHARS:
+            diff = diff[:MAX_DIFF_CHARS] + f"\n... diff cut, {len(diff) - MAX_DIFF_CHARS} more characters"
+        items.append(UndoItem(target, rel, existed, before_bytes, expected_sha, diff or "(no change)"))
+    return [p for p, _d in chosen], items
+
+
+def apply_undo(manifests: list[Path], items: list[UndoItem], force: bool = False) -> str:
+    """Restore saved pre-edit bytes (or unlink created files) and consume `manifests`."""
+    if not force:
+        for item in items:
+            if item.path.exists():
+                try:
+                    cur_sha = hashlib.sha256(item.path.read_bytes()).hexdigest()
+                except OSError:
+                    return f"error: could not check {item.rel}; nothing was reverted"
+                if cur_sha != item.after_sha256:
+                    return f"error: {item.rel} changed while the user was deciding; nothing was reverted"
+            elif item.after_sha256:
+                return f"error: {item.rel} was removed while the user was deciding; nothing was reverted"
+    rows: list[str] = []
+    checked: list[Edit] = []
+    for item in items:
+        try:
+            if not item.existed:
+                item.path.unlink(missing_ok=True)
+                rows.append(f"removed {item.rel} (created by edit)")
+            else:
+                assert item.before_bytes is not None
+                item.path.parent.mkdir(parents=True, exist_ok=True)
+                item.path.write_bytes(item.before_bytes)
+                rows.append(f"reverted {item.rel}")
+                try:
+                    checked.append(Edit(item.path, item.rel, "", item.before_bytes.decode("utf-8"), False, ""))
+                except UnicodeDecodeError:
+                    pass
+        except OSError as exc:
+            return f"error: could not revert {item.rel} ({exc.strerror or 'write failed'})"
+    for m in manifests:
+        try:
+            m.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return "\n".join(rows) + (syntax_check_edits(checked) if checked else "")
 
 
 def syntax_check_edits(edits: list[Edit]) -> str:
@@ -1349,9 +1610,10 @@ _DESTRUCTIVE = re.compile(
     r"|reg(\.exe)?\s+delete|(?<![\w-])(move|mv)\b.*(-force|/y)\b"
     # Hidden or downloaded code: the approval cannot show what it does. PowerShell takes any prefix of
     # -EncodedCommand (-e, -ec, -enc...), while -ex is -ExecutionPolicy.
-    r"|(powershell|pwsh)(\.exe)?\b.*\s[-/](e|ec|en|enc\w*)\b|(?<![\w-])(iex|invoke-expression)(?![\w-])"
-    r"|(iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|]*\|\s*(sh|bash|cmd|powershell|pwsh|python)\b"
-    r"|certutil\b.*-urlcache|(?<![\w-])mshta(?![\w-])",
+    r"|(powershell|pwsh)(\.exe)?\b.*\s[-/](e|ec|en|enc\w*)\b|(?<![\w-])[-/]encodedcommand\b"
+    r"|(?<![\w-])(iex|invoke-expression|frombase64string|bitsadmin(?:\.exe)?|mshta(?:\.exe)?|rundll32(?:\.exe)?)(?![\w-])"
+    r"|(iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|]*\|\s*(sh|bash|cmd|powershell|pwsh|python|py|iex|invoke-expression)\b"
+    r"|certutil(?:\.exe)?\b.*[-/]urlcache\b",
     re.IGNORECASE)
 
 
@@ -1404,13 +1666,17 @@ def find_control(elements: str, ocr: str, name: str, near: str, width: int, heig
 
 def parse_boxes(raw: str, width: int, height: int, elements: str = "", shot: str = "",
                 items: dict[int, tuple[int, int, int, int, str]] | None = None,
-                clip: tuple[int, int, int, int] | None = None, ocr_ids: set[int] | None = None) -> str:
+                clip: tuple[int, int, int, int] | None = None, ocr_ids: set[int] | None = None,
+                query: str = "", control_types: list[str] | tuple[str, ...] | None = None) -> str:
     """screen_map's text: the front window's controls (UI Automation `x,y,w,h<TAB>Type<TAB>Name`, exact) and the
     OCR lines (`x,y,w,h<TAB>text`), each numbered `#n` with the screen position (x, y) of its centre and its box
     (left, top, width x height). An OCR line that only repeats the control it sits in is left out. `shot` says how
     a screenshot that goes along was scaled; `items`, when given, is filled with n: (x, y, w, h, label); `clip`
-    (left, top, width, height) keeps only what is centred inside it (screen_map's zoom)."""
+    (left, top, width, height) keeps only what is centred inside it (screen_map's zoom). Optional `query` and
+    `control_types` filter controls (and OCR lines by `query`, skipped when only `control_types` is requested)."""
     fold = lambda t: " ".join(t.split()).casefold()  # noqa: E731
+    want_query = fold(query) if isinstance(query, str) and query.strip() else ""
+    want_types = {t.strip().casefold() for t in (control_types or ()) if isinstance(t, str) and t.strip()}
     left, top = clip[:2] if clip else (0, 0)
     right, bottom = (clip[0] + clip[2], clip[1] + clip[3]) if clip else (width, height)
     inside = lambda x, y, w, h: left <= x + w // 2 < right and top <= y + h // 2 < bottom  # noqa: E731
@@ -1423,24 +1689,33 @@ def parse_boxes(raw: str, width: int, height: int, elements: str = "", shot: str
             x, y, w, h = (int(n) for n in box.split(","))
         except ValueError:
             continue
-        if inside(x, y, w, h):  # a control off the primary monitor cannot be clicked
-            boxes.append((x, y, w, h, kind, " ".join(name.split())[:60], " ".join(state.split())[:60]))
+        if not inside(x, y, w, h):  # a control off the primary monitor cannot be clicked
+            continue
+        clean_name = " ".join(name.split())[:60]
+        if want_types and kind.strip().casefold() not in want_types:
+            continue
+        if want_query and want_query not in fold(clean_name):
+            continue
+        boxes.append((x, y, w, h, kind, clean_name, " ".join(state.split())[:60]))
     if len(boxes) > 150:
         primary = [b for b in boxes if b[4] not in ("DataItem", "TreeItem")]
         secondary = [b for b in boxes if b[4] in ("DataItem", "TreeItem")]
         boxes = (primary + secondary)[:150]
     named = [(x, y, w, h, fold(name)) for x, y, w, h, _k, name, _s in boxes if name]
-    for line in raw.splitlines():
-        box, _tab, text = line.partition("\t")
-        try:
-            x, y, w, h = (int(n) for n in box.split(","))
-        except ValueError:
-            continue
-        cx, cy, said = x + w // 2, y + h // 2, fold(text)
-        repeats = any(bx <= cx <= bx + bw and by <= cy <= by + bh and (said in name or name in said)
-                      for bx, by, bw, bh, name in named)
-        if said and inside(x, y, w, h) and not repeats:
-            boxes.append((x, y, w, h, "", text.strip(), ""))
+    if not want_types:
+        for line in raw.splitlines():
+            box, _tab, text = line.partition("\t")
+            try:
+                x, y, w, h = (int(n) for n in box.split(","))
+            except ValueError:
+                continue
+            cx, cy, said = x + w // 2, y + h // 2, fold(text)
+            if want_query and want_query not in said:
+                continue
+            repeats = any(bx <= cx <= bx + bw and by <= cy <= by + bh and (said in name or name in said)
+                          for bx, by, bw, bh, name in named)
+            if said and inside(x, y, w, h) and not repeats:
+                boxes.append((x, y, w, h, "", text.strip(), ""))
     controls, lines = [], []
     for n, (x, y, w, h, kind, name, state) in enumerate(boxes, 1):
         where = f"({x + w // 2}, {y + h // 2}) box {x},{y},{w}x{h}"
@@ -1689,6 +1964,74 @@ def destructive_reason(command: str) -> str:
     return found.group(0).strip() if found else ""
 
 
+_PY_DESTRUCTIVE = re.compile(
+    r"(?:\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir)|winreg\.Delete(?:Key|Value)|frombase64string)\b"
+    r"|\.(?:unlink|rmdir)\s*\()",
+    re.IGNORECASE,
+)
+
+
+def python_destructive_reason(script: str) -> str:
+    """Why a Python script could destroy data or run an obfuscated stager (avoids false hits on `del x` or `.format()`)."""
+    if found := _PY_DESTRUCTIVE.search(script):
+        return found.group(0).strip()
+    for m in re.finditer(r"(?:os\.system|os\.popen|subprocess\.(?:run|Popen|call|check_output|check_call))\s*\(([^)\n]{1,400})", script):
+        if hit := destructive_reason(m.group(1)):
+            return hit
+    return ""
+
+
+def python_exe(cwd: Path | None = None, project: Path | None = None) -> str:
+    """Best Python CLI interpreter: cwd/project `.venv\\Scripts\\python.exe`, else Paperduck's `.venv`, else sys.executable."""
+    candidates: list[Path] = []
+    for base in (cwd, project, Path(__file__).resolve().parents[2]):
+        if base is not None:
+            candidates.append(base / ".venv" / "Scripts" / "python.exe")
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand)
+        except OSError:
+            pass
+    if not getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        if exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").is_file():
+            return str(exe.with_name("python.exe"))
+        return sys.executable
+    return shutil.which("python") or shutil.which("py") or "python"
+
+
+def python_file(script: Any, exe: str | None = None) -> tuple[Path, str]:
+    """(the saved .py script in scratch_dir, the cmd line that runs it), or ValueError."""
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError("give a script")
+    if len(script) > MAX_SAVE_CHARS:
+        raise ValueError(f"script is longer than {MAX_SAVE_CHARS} characters")
+    path = scratch_dir() / f"py_{uuid.uuid4().hex[:10]}.py"
+    path.write_text("\n".join(script.splitlines()) + "\n", encoding="utf-8", newline="\n")
+    interp = exe or python_exe()
+    return path, f'"{interp}" "{path}"'
+
+
+def python_error_note(out: str, script: str, file_name: str, saved_path: Path | None = None) -> str:
+    """A `[Paperduck: ...]` note quoting failing Python traceback lines and `saved_path` when kept."""
+    lines = script.splitlines()
+    found: list[int] = []
+    for m in re.finditer(r'File "[^"]*' + re.escape(file_name) + r'", line (\d+)', out):
+        n = int(m.group(1))
+        if 1 <= n <= len(lines) and n not in found:
+            found.append(n)
+    notes: list[str] = []
+    if found:
+        quoted = "; ".join(f"line {n}: {lines[n - 1].strip()[:200]}" for n in found[:3])
+        notes.append(f"the script failed at {quoted}")
+    if saved_path is not None:
+        notes.append(f'kept at {saved_path}; fix with edit_file and re-run via run_python(path="{saved_path}")')
+    elif found:
+        notes.append("pass a fixed script to run_python (the deleted temp file cannot be re-run)")
+    return f"\n[Paperduck: {'. '.join(notes)}.]" if notes else ""
+
+
 def powershell_file(script: Any) -> tuple[Path, str]:
     """(the saved script, the cmd line that runs it), or ValueError. The file has a BOM, which Windows PowerShell 5.1
     needs to read non-ASCII text; the caller deletes it after the run."""
@@ -1926,7 +2269,7 @@ class _Background:
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self) -> None:
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        raw_buf = bytearray()
         stream = self.proc.stdout
         while stream is not None:
             try:
@@ -1934,12 +2277,36 @@ class _Background:
             except (OSError, ValueError):
                 break
             if not chunk:
+                if raw_buf:
+                    self._append_text(console_text(bytes(raw_buf)))
+                    raw_buf.clear()
                 break
-            with self.lock:
-                self.text += decoder.decode(chunk).replace("\r\n", "\n")
-                if len(self.text) > MAX_BACKGROUND_CHARS:
-                    cut = len(self.text) - MAX_BACKGROUND_CHARS
-                    self.text, self.dropped = self.text[cut:], self.dropped + cut
+            raw_buf.extend(chunk)
+            while (nl := raw_buf.find(b"\n")) >= 0:
+                line = bytes(raw_buf[:nl + 1])
+                del raw_buf[:nl + 1]
+                self._append_text(console_text(line))
+            if raw_buf:
+                tail = bytes(raw_buf)
+                try:
+                    text = tail.decode("utf-8")
+                    raw_buf.clear()
+                    self._append_text(text)
+                except UnicodeDecodeError as exc:
+                    if exc.reason == "unexpected end of data" and len(tail) - exc.start <= 3:
+                        if exc.start > 0:
+                            self._append_text(console_text(tail[:exc.start]))
+                            del raw_buf[:exc.start]
+                    else:
+                        raw_buf.clear()
+                        self._append_text(console_text(tail))
+
+    def _append_text(self, text: str) -> None:
+        with self.lock:
+            self.text += text.replace("\r\n", "\n")
+            if len(self.text) > MAX_BACKGROUND_CHARS:
+                cut = len(self.text) - MAX_BACKGROUND_CHARS
+                self.text, self.dropped = self.text[cut:], self.dropped + cut
 
     @property
     def running(self) -> bool:
