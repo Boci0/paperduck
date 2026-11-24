@@ -14,6 +14,7 @@ The report quotes your chats, so it stays on this PC (dist/ is gitignored).
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections import Counter
@@ -25,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.tools.ai_assist import _failed  # noqa: E402
-from src.tools.ai_sessions import Session, list_sessions, sessions_dir  # noqa: E402
+from src.tools.ai_sessions import Session, _clean, list_sessions, sessions_dir  # noqa: E402
 
 STOPPED = "(stopped by the user"
 PUSHBACK = re.compile(r"\b(still|again|wrong|not what|that'?s not|isn'?t|doesn'?t|didn'?t|don'?t|won'?t|undo|revert|"
@@ -146,10 +147,26 @@ def report_html(top: list[Case], total: int, sessions: int, by_tool: Counter, by
             f"<h2>Stray files</h2>{stray}<h2>Worst answers</h2>{''.join(items)}</main></html>")
 
 
+def export_eval_cases(all_cases: list[Case], limit: int = 20) -> list[dict[str, Any]]:
+    exported: list[dict[str, Any]] = []
+    for idx, c in enumerate(all_cases[:limit], 1):
+        exported.append({
+            "name": f"mined_{idx}",
+            "score": c.score,
+            "prompt": _clean(c.request[:1200]),
+            "next_user": _clean(c.next_user[:400]),
+            "failed_tools": [{"call": _clean(n[:120]), "error": _clean(o[:240])} for n, o in c.failed[:6]],
+            "retries": [{"shape": sh, "count": k} for sh, k in c.retries],
+            "stopped": c.stopped,
+        })
+    return exported
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--report", default=str(ROOT / "dist" / "failure_report.html"))
+    parser.add_argument("--export-eval", default="", help="Optional JSON path for sanitized failure trajectories")
     args = parser.parse_args()
     data_dir = sessions_dir().parent
     sessions = list_sessions()
@@ -160,6 +177,11 @@ def main() -> int:
     out = Path(args.report)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report_html(found[:args.top], len(found), len(sessions), by_tool, by_kind, logged, strays), "utf-8")
+    if args.export_eval:
+        eval_path = Path(args.export_eval)
+        eval_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_path.write_text(json.dumps(export_eval_cases(found, args.top), indent=2) + "\n", encoding="utf-8")
+        print(f"exported eval cases: {eval_path}")
     print(f"{len(sessions)} chats, {len(found)} answers with a problem "
           f"({sum(c.pushback for c in found)} pushed back, {sum(c.stopped for c in found)} stopped, "
           f"{sum(bool(c.retries) for c in found)} retry chains, {sum(len(c.failed) for c in found)} failed calls)")

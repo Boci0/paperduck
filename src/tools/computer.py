@@ -766,6 +766,79 @@ def uia_invoke(hwnd: int, x: int, y: int, name: str) -> bool:
     return (warm_ps.run("uia", _UIA_INVOKE_PS, {"Hwnd": hwnd, "X": x, "Y": y, "Name": name}, 10.0) or "").strip() == "invoked"
 
 
+_UIA_FOCUS_PS = _UIA_HEAD + r"""
+$e = $null
+try { $e = $A::FocusedElement } catch { }
+if (-not $e) { return }
+$c = $e.Current
+$kind = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+$name = ($c.Name -replace '[\r\n\t]+', ' ').Trim()
+if ($name.Length -gt 50) { $name = $name.Substring(0, 50) }
+$state = @()
+if (-not $c.IsEnabled) { $state += 'disabled' }
+$vp = $null
+if (-not $c.IsPassword -and $kind -ne 'Document' -and $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+    $v = ($vp.Current.Value -replace '[\r\n\t]+', ' ').Trim()
+    if ($v.Length -gt 40) { $v = $v.Substring(0, 40) }
+    if ($v) { $state += "val=$v" }
+}
+$suffix = if ($state.Count -gt 0) { " ($($state -join ', '))" } else { '' }
+"$kind`t$name$suffix"
+"""
+
+
+_UIA_STATE_PS = "param([int]$X, [int]$Y)\n" + _UIA_HEAD + r"""
+$e = $null
+try { $e = $A::FromPoint([System.Windows.Point]::new($X, $Y)) } catch { }
+if (-not $e) { return }
+$c = $e.Current
+$kind = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+$name = ($c.Name -replace '[\r\n\t]+', ' ').Trim()
+if ($name.Length -gt 50) { $name = $name.Substring(0, 50) }
+$flags = @()
+if (-not $c.IsEnabled) { $flags += 'disabled' }
+if ($c.IsOffscreen) { $flags += 'offscreen' }
+"$kind`t$name`t$($flags -join ',')"
+"""
+
+
+def uia_focus_note() -> str:
+    from src.tools import warm_ps
+
+    out = (warm_ps.run("uia", _UIA_FOCUS_PS, {}, 4.0) or "").strip()
+    if not out or "\t" not in out:
+        return ""
+    kind, _t, rest = out.partition("\t")
+    return f" Focus: [{kind}] {rest}." if rest else f" Focus: [{kind}]."
+
+
+def uia_zero_change_hint(x: int, y: int) -> str:
+    from src.tools import warm_ps
+
+    out = (warm_ps.run("uia", _UIA_STATE_PS, {"X": x, "Y": y}, 4.0) or "").strip()
+    if not out:
+        return ""
+    parts = out.split("\t")
+    kind = parts[0] if len(parts) > 0 else ""
+    label = parts[1] if len(parts) > 1 else ""
+    flags = parts[2] if len(parts) > 2 else ""
+    if "disabled" in flags:
+        return f' UIA: [{kind}] "{label}" is disabled.'
+    if "offscreen" in flags:
+        return f' UIA: [{kind}] "{label}" is offscreen.'
+    return ""
+
+
+def restore_cursor_and_window(hwnd: int, pos: tuple[int, int] | None) -> None:
+    if pos is not None:
+        try:
+            _move(pos[0], pos[1])
+        except (ValueError, OSError):
+            pass
+    if hwnd and not _ours(_user32(), hwnd):
+        _bring_to_front(_user32(), hwnd)
+
+
 WINDOW_ACTIONS = ("focus", "maximize", "minimize", "restore", "snap_left", "snap_right")
 UIA_ACTIONS = ("invoke", "set_value", "toggle", "select", "expand", "collapse", "range", "focus")
 

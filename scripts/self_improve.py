@@ -37,8 +37,9 @@ sys.path.insert(0, str(ROOT))
 
 from src.tools.ai_assist import AiReply, ask, chat_messages, load_key  # noqa: E402
 from src.tools.ai_tools import (FILE_TOOLS, MAX_NOTE_CHARS, MEMORY_HEADER, TOOL_SPECS, apply_edits,  # noqa: E402
-                                calculate, contrast,
-                                memory_path, plan_edit, plan_edits, read_memory, resolve, run_file_tool)
+                                calculate, contrast, load_skill,
+                                memory_path, plan_edit, plan_edits, plan_skill_update, read_memory, resolve,
+                                run_file_tool, skills_dir)
 
 TAG = "[harness] "
 MAX_LESSONS = 6
@@ -586,6 +587,30 @@ def check(model: str, lessons: list[str], args: argparse.Namespace, key: str, sa
     return 1 if bad else 0
 
 
+def load_mined_cases(path: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [c for c in data if isinstance(c, dict) and isinstance(c.get("prompt"), str)] if isinstance(data, list) else []
+
+
+def propose_skill_patch(skill_name: str, body: str, failures: list[dict[str, Any]], ask_fn: AskFn,
+                        base_url: str, key: str, model: str) -> tuple[str, float]:
+    diag = "\n\n".join(
+        f"REQUEST: {c.get('prompt', '')[:400]}\nNEXT_USER: {c.get('next_user', '')[:250]}\n"
+        f"FAILED: {json.dumps(c.get('failed_tools', [])[:4])}\nRETRIES: {json.dumps(c.get('retries', []))}"
+        for c in failures[:8]
+    )
+    prompt = (
+        f"You are refining the Paperduck skill '{skill_name}' based on real failed chat traces.\n"
+        f"CURRENT SKILL BODY:\n{body[:8000]}\n\nFAILURE TRACES:\n{diag}\n\n"
+        "Return only the full updated Markdown instructions body (concise, concrete steps fixing the observed failure modes)."
+    )
+    reply = ask_fn(base_url, key, model, [{"role": "user", "content": prompt}], web=False)
+    return reply.text.strip(), reply.cost or reply.cost_estimate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url", default="https://api.deepseek.com")
@@ -599,11 +624,35 @@ def main() -> int:
     parser.add_argument("--report", default=str(ROOT / "dist" / "harness_report.html"), help="HTML report path")
     parser.add_argument("--check", action="store_true", help="one pass, no rewriting; exit 1 on a regression vs the baseline")
     parser.add_argument("--save-baseline", action="store_true", help="one pass, then save which tasks pass as the baseline")
+    parser.add_argument("--skill", default="", help="propose an update to a user skill from mined failure traces")
+    parser.add_argument("--eval-json", default="", help="JSON file exported by mine_failures.py --export-eval")
     args = parser.parse_args()
     key = load_key(args.base_url)
     if not key:
         print(f"no API key saved for {args.base_url}; set it in the AI chat settings first")
         return 1
+    if args.skill:
+        sdir = skills_dir()
+        body = load_skill(sdir, args.skill)
+        if body.startswith("error:"):
+            print(body)
+            return 1
+        eval_file = Path(args.eval_json) if args.eval_json else (ROOT / "dist" / "mined_tasks.json")
+        mined = load_mined_cases(eval_file)
+        if not mined:
+            print(f"no failure cases in {eval_file}; run scripts/mine_failures.py --export-eval {eval_file} first")
+            return 1
+        updated, spent = propose_skill_patch(args.skill, body, mined, ask, args.base_url, key, args.improver_model or args.model)
+        try:
+            path, text, diff = plan_skill_update(sdir, args.skill, None, updated)
+        except ValueError as exc:
+            print(f"skill update skipped ({exc}, spent ${spent:.4f})")
+            return 0
+        print(diff)
+        if args.apply and input(f"\nApply update to {path}? [y/N] ").strip().lower() == "y":
+            path.write_text(text, encoding="utf-8")
+            print(f"updated {path}")
+        return 0
     real_memory = memory_path()  # before LOCALAPPDATA points at the sandbox
     current = [n[len(TAG):] for n in read_memory(real_memory) if n.startswith(TAG)]
     sandbox = Path(tempfile.mkdtemp(prefix="paperduck_rsi_"))

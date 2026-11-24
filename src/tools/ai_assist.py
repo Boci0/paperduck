@@ -32,6 +32,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -72,8 +73,8 @@ OLD_TOOL_CHARS = 1000  # ... and per tool for older answers
 # An answer whose own messages fit this is replayed word for word (a prefix cache hit next time); a bigger one
 # goes back to the note form, since carrying its full tool output through every later round costs more. Tuned
 # with a DeepSeek cache sim (miss 50x a hit): above these, the larger context costs more than the misses saved.
-MAX_WIRE_CHARS = 64000
-MAX_HISTORY_WIRE_CHARS = 256000  # replayed text a chat may carry in all (see keep_wire)
+MAX_WIRE_CHARS = 96000
+MAX_HISTORY_WIRE_CHARS = 384000  # replayed text a chat may carry in all (see keep_wire)
 
 
 def keep_wire(history: list[dict[str, Any]], wire: list[dict[str, Any]]) -> bool:
@@ -88,9 +89,13 @@ COMPACT_AT = MAX_HISTORY_CHARS * 3 // 4  # history size that makes the next send
 KEEP_TURNS = 6  # newest turns kept word for word when compacting
 COMPACT_PREFIX = "[Earlier conversation, compacted by "
 COMPACT_MARK = f"{COMPACT_PREFIX}Paperduck into this summary:]"
-COMPACT_PROMPT = ("Summarize the conversation so far so it can continue without it. Keep every fact, decision, "
-                  "file path, command, number and open task the user may come back to; drop small talk. "
-                  "Plain notes, no preamble.")
+COMPACT_PROMPT = (
+    "Summarize the conversation so far into a structured continuation checkpoint so work can resume without loss. "
+    "Use these exact headings (plain text, concise bullets, keep every exact file path, command, symbol, error, "
+    "number, and decision; omit small talk):\n"
+    "Goal:\nDecisions & Constraints:\nCompleted & Verified:\nModified Files:\n"
+    "Failed Attempts (Do Not Repeat):\nOpen Errors:\nNext Steps:"
+)
 TOOLS_MARK = "[Tools run (added by the app; output may be cut short):"
 MAX_TOOL_LINES = 12  # tool calls an earlier answer's note lists
 MAX_REPLY_TOKENS = 8192  # the answer alone; most current models allow it
@@ -108,6 +113,8 @@ BUDGET_NOTE = (f"\n\n[Paperduck: that was the last of this message's {MAX_TOOL_R
 LAYOUT_NOTE = ("[Paperduck: your last layout_check still listed problems: {}. If you can still use tools, fix them "
                "and run layout_check again. Otherwise, or for one that is intended (such as a full-bleed background), "
                "tell the user plainly in your answer which problems remain.]")
+VERIFY_NOTE = ("[Paperduck: before finishing, verification is still open: {}. Run the relevant test/check command "
+               "or update plan_tasks now; if blocked, tell the user plainly what remains unverified.]")
 # Sent once when a reply came back empty because thinking used the whole token budget; that round has no thinking
 WRAP_NOTE = ("\n\n[Paperduck: your last reply hit the token limit while thinking and said nothing. Answer now "
              "without tools or more thinking: what is done, how you checked it, and what is left.]")
@@ -147,6 +154,8 @@ STEER_AFTER = 3  # failed tool results in a row before the model is told to chan
 REPEAT_WINDOW = 2 * STEER_STOP  # recent calls checked for repeats, so A,B,A,B loops count too
 STEER_NOTE = ("\n\n[Paperduck: {n} tool calls in a row failed. Do not repeat them: try a different approach, or stop "
               "and tell the user what is blocking you and what you need.]")
+SEMANTIC_STEER_NOTE = ("\n\n[Paperduck: {n} recent calls repeated the same failing/ineffective pattern with slightly "
+                       "changed inputs. Stop tweaking numbers/paths/coordinates and change approach (inspect the file/screen first).]")
 REPEAT_NOTE = ("\n\n[Paperduck: the same call gave the same result {n} times recently. It is not getting anywhere: try "
                "something different, or tell the user what is blocking you.]")
 LOOP_CALLS = 8  # the same call this often among the last LOOP_WINDOW calls is a loop, whatever the results said
@@ -473,7 +482,8 @@ def wire_chars(wire: list[dict[str, Any]]) -> int:
                for m in wire)
 
 
-def chat_messages(history: list[dict[str, Any]], wire: bool = False, extra_system: str = "") -> list[dict[str, Any]]:
+def chat_messages(history: list[dict[str, Any]], wire: bool = False, extra_system: str = "",
+                  memory_scope: str = "") -> list[dict[str, Any]]:
     """System prompt plus the newest turns that fit MAX_HISTORY_CHARS (the last turn is always kept).
 
     A turn's optional "images" (data URLs) become image parts; they are not counted against the budget.
@@ -507,7 +517,8 @@ def chat_messages(history: list[dict[str, Any]], wire: bool = False, extra_syste
     system = (f"{SYSTEM_PROMPT} Today is {date.today()}. Put helper scripts, screenshots and drafts in your scratch "
               f"folder {scratch_dir()}, never in {skills_dir().parent} (the app's own data); save what the user "
               "asked for where they asked, else in the Project Folder.")
-    extra = [block for block in (rules_prompt(rules_path()), memory_prompt(memory_path()), skills_prompt(skills_dir()), extra_system.strip())
+    extra = [block for block in (rules_prompt(rules_path()), memory_prompt(memory_path(), memory_scope),
+                                 skills_prompt(skills_dir()), extra_system.strip())
              if block]
     return [{"role": "system", "content": "\n\n".join([system, *extra])}, *reversed(kept)]
 
@@ -1157,6 +1168,8 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     # joins with the next message
     tools = (CLAUDE_TOOLS if web else []) + [{"name": s["function"]["name"], "description": s["function"]["description"],
                              "input_schema": s["function"]["parameters"]} for s in (_all_specs(host) if host else [])]
+    if tools:
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     system, turns = claude_messages(messages)
     last = turns[-1]  # prompt cache breakpoint: tools, system and the chat so far are reused by the next message
     blocks = [{"type": "text", "text": last["content"]}] if isinstance(last["content"], str) else list(last["content"])
@@ -1169,13 +1182,14 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     reasoning: list[str] = []
     used: list[tuple[str, str]] = []
     tool_rounds = hits = 0
-    fails: list[Any] = [0, 0, None, [], None, set()]
+    fails: list[Any] = [0, 0, None, [], None, set(), []]
     # set once a tool has returned the user's own data; a sub-agent (`local_data`) starts set: its task may hold some
     read_local = getattr(host, "local_data", False) or any(read_local_data(m) for m in messages)
     _note_outside(host, messages=messages)
     seen_buf: list[Any] = ["", 0]  # see _grow_seen
     start = len(turns)  # this answer's own turns follow
-    for _ in range(MAX_NATIVE_ROUNDS + MAX_TOOL_ROUNDS + 1):
+    verify_pushed = False
+    for _ in range(MAX_NATIVE_ROUNDS + MAX_TOOL_ROUNDS + 2):
         body: dict[str, Any] = {"model": model, "system": system, "messages": turns, **({"tools": tools} if tools else {}),
                                 "max_tokens": MAX_THINKING_TOKENS if effort else MAX_REPLY_TOKENS,
                                 **({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": effort}}
@@ -1227,11 +1241,12 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
                     read_local = read_local or b["name"] in LOCAL_DATA_TOOLS or MCP_SEP in b["name"]
                     _note_outside(host, b["name"])
                     shot = _take_shot(host)
-                    sent = out + _steer(b["name"], _call_key(b["name"], b.get("input")), out, fails, paid)
+                    shown_out = _offload_output(b["name"], out)
+                    sent = shown_out + _steer(b["name"], _call_key(b["name"], b.get("input")), out, fails, paid)
                     content: Any = sent if not shot else [{"type": "text", "text": sent}, {"type": "image", "source": {
                         "type": "base64", "media_type": "image/png", "data": shot.split(",", 1)[1]}}]
                     results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content})
-                    used.append((tool_note(b["name"], b.get("input")), out))
+                    used.append((tool_note(b["name"], b.get("input")), shown_out))
                     shots = shots or bool(shot)
                 tool_rounds += 1
                 note = [{"type": "text", "text": (BUDGET_NOTE if tool_rounds == MAX_TOOL_ROUNDS else PACE_NOTE).strip()}]                     if tool_rounds in (MAX_TOOL_ROUNDS, PACE_AT) else []
@@ -1259,6 +1274,12 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
         if stop == "refusal":
             raise ValueError("the model declined to answer")
         text = text.strip()
+        if ((v_open := getattr(host, "verify_open", "")) and isinstance(v_open, str) and not verify_pushed
+                and tool_rounds < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS):
+            verify_pushed = True
+            turns = [*turns, {"role": "assistant", "content": blocks or [{"type": "text", "text": text or "(no text)"}]},
+                     {"role": "user", "content": VERIFY_NOTE.format(v_open[:600])}]
+            continue
         if sources:
             text += "\n\nSources:\n" + "\n".join(f"- {t[:80]}: {u}" for u, t in list(sources.items())[:5])
         reply = AiReply(text=text, model=served if isinstance(served, str) and valid_model(served) else "",
@@ -1288,10 +1309,10 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
     used: list[tuple[str, str]] = []
     shot_at: list[tuple[int, str]] = []  # (index in `messages`, shot role) of screenshot messages still sent
     cached, cost, estimate = 0, 0.0, 0.0
-    fails: list[Any] = [0, 0, None, [], None, set()]
-    blind_told = wrapped = pushed = False
+    fails: list[Any] = [0, 0, None, [], None, set(), []]
+    blind_told = wrapped = pushed = verify_pushed = False
     used_screen = ""
-    for round_ in range(MAX_TOOL_ROUNDS + 2):  # the extra round is only the wrap-up after a cut-off (WRAP_NOTE)
+    for round_ in range(MAX_TOOL_ROUNDS + 3):  # the extra round is only the wrap-up after a cut-off (WRAP_NOTE)
         _check(cancel)
         shots: list[str] = []
         screen_active = bool(
@@ -1305,6 +1326,8 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
         level = screen_thinking if screen_active else thinking
         if screen_active and level != thinking:
             used_screen = level
+        if fails[0] >= 2 and level in ("off", "low") and not (is_deepseek(base_url) and thinking == "off"):
+            level = fit_thinking(base_url, "medium", model)
         thinks = level in THINKING_LEVELS and level != "off"
         body: dict[str, Any] = {"model": model, "messages": messages,
                                 "max_tokens": MAX_THINKING_TOKENS if thinks else MAX_REPLY_TOKENS,
@@ -1390,12 +1413,13 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
                             progress(f"Running {fn['name']}")
                         result = _run_tool(fn["name"], fn.get("arguments"), host, seen)
                     last = round_ == MAX_TOOL_ROUNDS - 1 and call is calls[-1]  # the next round sends no tools
+                    shown_result = _offload_output(fn["name"], result)
                     messages.append({"role": "tool", "tool_call_id": call["id"],
-                                     "content": result + _steer(fn["name"], _call_key(fn["name"], fn.get("arguments")), result, fails, paid)
+                                     "content": shown_result + _steer(fn["name"], _call_key(fn["name"], fn.get("arguments")), result, fails, paid)
                                      + (BUDGET_NOTE if last else PACE_NOTE if round_ == PACE_AT - 1 and call is calls[-1] else "")})
                     read_local = read_local or fn["name"] in LOCAL_DATA_TOOLS or MCP_SEP in fn["name"]
                     _note_outside(host, fn["name"])
-                    used.append((tool_note(fn["name"], fn.get("arguments")), result))
+                    used.append((tool_note(fn["name"], fn.get("arguments")), shown_result))
                     shot = _take_shot(host)
                     if shot:
                         shots.append(shot)
@@ -1451,9 +1475,15 @@ def _post(base_url: str, key: str, model: str, messages: list[dict[str, Any]], t
             messages += [{"role": "assistant", "content": reply.text or "(no text)"},
                          {"role": "user", "content": LAYOUT_NOTE.format(open_[:800])}]
             continue
+        if ((v_open := getattr(host, "verify_open", "")) and isinstance(v_open, str) and not verify_pushed
+                and round_ < MAX_TOOL_ROUNDS and not _stuck(fails) and paid < MAX_ANSWER_TOKENS):
+            verify_pushed = True
+            messages += [{"role": "assistant", "content": reply.text or "(no text)"},
+                         {"role": "user", "content": VERIFY_NOTE.format(v_open[:600])}]
+            continue
         if not reply.text:
             raise ValueError("cut off" if reply.cut_off else "empty reply")
-        if wrapped or pushed:
+        if wrapped or pushed or verify_pushed:
             reply.wire = []  # the note changed an earlier turn; the replay would carry it
         drop_skills(reply)
         return reply
@@ -1535,6 +1565,12 @@ def _steer(name: str, call: str, result: str, state: list[Any], tokens: int = 0)
     return _steer_note(name, call, result, state, tokens) + _office_note(name, call, state)
 
 
+def _call_shape(name: str, call: str) -> str:
+    norm = re.sub(r"ps_[0-9a-f]+\.ps1", "ps_#.ps1", call.lower())
+    norm = re.sub(r"\d+", "#", re.sub(r"(['\"]).*?\1", "''", norm))
+    return f"{name}:{norm[:160]}"
+
+
 def _steer_note(name: str, call: str, result: str, state: list[Any], tokens: int = 0) -> str:
     """The note to add to a tool result once STEER_AFTER results in a row failed, the same call gave the same
     result that often within the last REPEAT_WINDOW calls, or the answer used MAX_ANSWER_TOKENS; `state` is
@@ -1555,10 +1591,25 @@ def _steer_note(name: str, call: str, result: str, state: list[Any], tokens: int
         key = re.sub(r"\d+", "#", call) if name == "computer_batch" else call
         state[3] = [*state[3], key][-LOOP_WINDOW:]
         looped = state[3].count(key)
+    semantic_streak = 0
+    if len(state) > 6 and isinstance(state[6], list):
+        ineffective = bad or ("0 pixels changed" in result and name in SCREEN_TOOLS)
+        if ineffective:
+            sh = _call_shape(name, call)
+            state[6] = [*state[6], sh][-STEER_STOP:]
+            for prev in reversed(state[6]):
+                if prev == sh:
+                    semantic_streak += 1
+                else:
+                    break
+        else:
+            state[6] = []
     if tokens >= MAX_ANSWER_TOKENS:
         return OVER_NOTE
     if _stuck(state):
         return STUCK_NOTE.format(n=max(state[0], state[1]))
+    if semantic_streak >= STEER_AFTER and state[0] < STEER_AFTER:
+        return SEMANTIC_STEER_NOTE.format(n=semantic_streak)
     if state[0] >= STEER_AFTER:
         return STEER_NOTE.format(n=state[0])
     if state[1] >= STEER_AFTER:
@@ -1576,13 +1627,37 @@ def _take_shot(host: ToolHost | None) -> str:
 
 
 KEEP_SHOTS = 3  # old screenshots go in one batch past this, so the prompt cache holds in between
+OFFLOAD_CHARS = 18000
+OFFLOAD_HEAD = 4000
+OFFLOAD_TAIL = 2000
+_OFFLOAD_TOOLS = frozenset({"run_command", "run_powershell", "read_background", "search_text", "query_files"})
 WORKING_CHARS = 200_000  # tool output of one answer kept word for word; past it older results are trimmed
+
+
+def _offload_output(name: str, text: str) -> str:
+    if len(text) <= OFFLOAD_CHARS or (name not in _OFFLOAD_TOOLS and MCP_SEP not in name):
+        return text
+    obs_dir = scratch_dir() / "obs"
+    try:
+        obs_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(obs_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime_ns)
+        for stale in existing[:-39] if len(existing) >= 40 else ():
+            stale.unlink(missing_ok=True)
+        path = obs_dir / f"{name.replace(MCP_SEP, '_')}_{uuid.uuid4().hex[:10]}.txt"
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return text
+    return (
+        f"{text[:OFFLOAD_HEAD]}\n... ({len(text) - OFFLOAD_HEAD - OFFLOAD_TAIL} chars offloaded) ...\n"
+        f"{text[-OFFLOAD_TAIL:]}\n[Paperduck: full {len(text)} chars saved to {path}; use search_text or read_file if needed]"
+    )
 KEEP_RESULTS = 4  # newest tool results a trim keeps whole (one trim frees room for several rounds: fewer cache misses)
 TRIM_HEAD = 300  # characters a trimmed result keeps
 TRIM_TAIL = 160
 TRIMMED = "\n[Paperduck: older output trimmed to save room; run the tool again if you need it]"
 # Read-only tools that may run at the same time when one reply asks for several
-PARALLEL_SAFE = frozenset({"list_files", "find_files", "search_text", "web_search", "fetch_page", "calculate", "find_skill"})
+PARALLEL_SAFE = frozenset({"list_files", "find_files", "search_text", "batch_read", "query_files", "search_tools",
+                            "web_search", "fetch_page", "calculate", "find_skill"})
 MAX_PARALLEL = 4
 
 

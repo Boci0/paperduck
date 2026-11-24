@@ -31,10 +31,10 @@ from src.tools import computer, login_vault
 from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool_note
 from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
-from src.tools.ai_tools import (calculate, check_layout, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
-                                computer_action, destructive_reason, file_outline, is_readonly_command, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
-                                plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve,
-                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, syntax_check_edits, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
+from src.tools.ai_tools import (CORE_TOOL_NAMES, calculate, check_layout, discover_workspace, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
+                                batch_read, computer_action, destructive_reason, file_outline, infer_tool_groups, is_readonly_command, query_files, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
+                                plan_edits, plan_memory, plan_skill_update, print_to_pdf_paths, resolve, search_memory, search_tools_catalog,
+                                PDF_WAIT_S, changed_media, file_stamp, media_stamps, syntax_check_edits, tool_group_of, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
                                 skill_text, skills_dir, task_list, write_memory, write_skill)
 from src.tools.errands import describe as describe_errand
 from src.tools.clip_vault import clipboard_is_private
@@ -80,6 +80,10 @@ def auto_mode(win: Any) -> bool:
     return bool(getattr(getattr(getattr(win, "_ai_chat", None), "_plugin", None), "auto", False))
 
 
+_CODE_EXTS = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".ps1", ".rs", ".go",
+    ".html", ".css", ".json", ".toml", ".c", ".cpp", ".h", ".java", ".cs",
+})
 _GUI_CONTROL_LOCK = threading.Lock()
 
 
@@ -831,7 +835,12 @@ class AiToolHost(QObject):
         self._items: dict[int, tuple[int, int, int, int, str]] = {}  # the last screen_map's #id: (x, y, w, h, label)
         self._ocr_ids: set[int] = set()  # which of those ids are OCR text lines
         self.mcp_loaded: set[str] = set()  # MCP servers whose tools this answer offers (the chat clears it per answer)
+        self.tool_groups_loaded: set[str] = set()
         self.layout_open = ""  # the last layout_check's problems, "" once one passes (the chat clears it per answer)
+        self.edit_gen = 0
+        self.verified_gen = 0
+        self.edited_code_files: list[str] = []
+        self.open_tasks = 0
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
@@ -859,19 +868,47 @@ class AiToolHost(QObject):
         if getattr(_host_chat(self), "_job", None) is None:  # never mid-answer
             threading.Thread(target=self.mcp.close_idle, daemon=True).start()  # taskkill blocks briefly
 
+    def prewarm_groups(self, text: str) -> None:
+        self.tool_groups_loaded = infer_tool_groups(text)
+
+    def reset_answer(self, cancel: threading.Event) -> None:
+        self.cancel = cancel
+        self.ran = []
+        self.layout_open = ""
+        self.edit_gen = 0
+        self.verified_gen = 0
+        self.edited_code_files = []
+        self.open_tasks = 0
+
+    def workspace_note(self) -> str:
+        return discover_workspace(self._project())
+
+    @property
+    def verify_open(self) -> str:
+        parts: list[str] = []
+        if self.edit_gen > self.verified_gen and self.edited_code_files:
+            names = ", ".join(dict.fromkeys(self.edited_code_files[-6:]))
+            parts.append(f"unverified edits to {names}")
+        if self.open_tasks > 0:
+            parts.append(f"{self.open_tasks} open item(s) in plan_tasks")
+        return "; ".join(parts)
+
     @property
     def specs(self) -> list[dict[str, Any]]:
         """Built-in tools plus the MCP tools of servers loaded in this answer, and `load_mcp_tools` naming the rest:
         every round resends the tool list, and one browser server's schemas alone are ~20k characters."""
         mcp = self.mcp.specs()  # started on first use, on the worker thread
         loaded = getattr(self, "mcp_loaded", set())
+        groups = getattr(self, "tool_groups_loaded", set())
         waiting: dict[str, list[str]] = {}
         for s in mcp:
             server, _sep, tool = s["function"]["name"].partition(SEP)
             if server not in loaded:
                 waiting.setdefault(server, []).append(tool)
         shown = [s for s in mcp if s["function"]["name"].partition(SEP)[0] in loaded]
-        base = TOOL_SPECS + AGENT_SPECS + ([LAPTOP_CHAT_SPEC] if getattr(_host_chat(self), "_remote_only", False) else [])
+        core = [s for s in TOOL_SPECS
+                if s["function"]["name"] in CORE_TOOL_NAMES or tool_group_of(s["function"]["name"]) in groups]
+        base = core + AGENT_SPECS + ([LAPTOP_CHAT_SPEC] if getattr(_host_chat(self), "_remote_only", False) else [])
         if not waiting:
             return base + shown
         listed = "; ".join(f"{server} ({', '.join(tools)})" for server, tools in waiting.items())
@@ -894,7 +931,7 @@ class AiToolHost(QObject):
 
     def can_parallel(self, name: str, args: dict[str, Any]) -> bool:
         """Opt-in per-call parallel safety for `_run_calls`."""
-        if name in ("load_skill", "file_outline", "search_sessions", "list_windows"):
+        if name in ("load_skill", "file_outline", "search_sessions", "search_memory", "list_windows"):
             return True
         if name == "read_file":
             try:
@@ -926,6 +963,14 @@ class AiToolHost(QObject):
                 return f"error: no MCP server named {want!r}"
             self.mcp_loaded.add(want)
             return f"loaded {len(tools)} tools: {', '.join(tools)}. Call them from the next step."
+        if name == "search_tools":
+            activated, out = search_tools_catalog(args.get("query", ""), args.get("group", ""))
+            self.tool_groups_loaded.update(activated)
+            return out
+        if name == "batch_read":
+            return batch_read(self._project(), args)
+        if name == "query_files":
+            return query_files(self._project(), args)
         server = self.mcp.server_of(name)
         if server is not None:
             chat = _host_chat(self)
@@ -991,18 +1036,45 @@ class AiToolHost(QObject):
             if not self._allowed(key, ask, what):
                 return "error: the user declined this edit"
             res = apply_edits(edits)
-            return res if res.startswith("error") else res + syntax_check_edits(edits)
+            if not res.startswith("error"):
+                if inside and hasattr(self, "edit_gen"):
+                    touched = [e.rel for e in edits if e.path.suffix.lower() in _CODE_EXTS]
+                    if touched:
+                        self.edit_gen += 1
+                        self.edited_code_files.extend(touched)
+                return res + syntax_check_edits(edits)
+            return res
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
             share, task = args.get("share_images") is True, args.get("task")
             if isinstance(task, str) and (notes := self._shared_notes(share)):
                 task += notes
-            return self.agents.spawn(task, args.get("effort"), self._project(), self.cancel,
-                                     args.get("_local") is True, self._shared_images(share), self.see_image,
-                                     self._review if _host_auto_mode(self) else None)
+            return self.agents.spawn(
+                task, args.get("effort"), self._project(), self.cancel,
+                args.get("_local") is True, self._shared_images(share), self.see_image,
+                self._review if _host_auto_mode(self) else None,
+                role=args.get("role"), allowed_paths=args.get("allowed_paths"),
+                agent_id=args.get("agent_id"), cmd_runner=self._agent_run_command,
+            )
         if name == "wait_agents":
-            return self.agents.wait(args.get("timeout_s"), self.cancel)
+            summary = self.agents.wait(args.get("timeout_s"), self.cancel)
+            staged = self.agents.pop_staged()
+            if not staged:
+                return summary
+            diffs = "\n\n".join(f"{'new file' if e.before is None else 'edit'} {e.rel}\n{e.diff}" for e in staged)
+            if not self._allowed("edit_file", f"Sub-agent(s) staged {len(staged)} file edits, all or none:\n\n{diffs}", "file edits"):
+                return summary + "\n\n[Staged worker edits declined by user]"
+            res = apply_edits(staged)
+            if not res.startswith("error") and hasattr(self, "edit_gen"):
+                touched = [e.rel for e in staged if e.path.suffix.lower() in _CODE_EXTS]
+                if touched:
+                    self.edit_gen += 1
+                    self.edited_code_files.extend(touched)
+                res += syntax_check_edits(staged)
+            elif not res.startswith("error"):
+                res += syntax_check_edits(staged)
+            return summary + "\n\nStaged edits result:\n" + res
         if name == "calculate":  # pure arithmetic, nothing to allow
             return calculate(args.get("expression"))
         if name == "plan_tasks":
@@ -1011,6 +1083,8 @@ class AiToolHost(QObject):
             except ValueError as exc:
                 return f"error: {exc}"
             self._on_gui(lambda done: done(_host_chat(self).set_tasks(tasks) or "ok"))
+            if hasattr(self, "open_tasks"):
+                self.open_tasks = sum(1 for _t, s in tasks if s != "done")
             return f"task list shown ({sum(1 for _t, s in tasks if s == 'done')} of {len(tasks)} done)"
         if name in ("run_command", "run_powershell"):
             ps = name == "run_powershell"
@@ -1071,6 +1145,8 @@ class AiToolHost(QObject):
             out = run_command(cwd, command, self.cancel, seconds)
             failed = out.startswith(("error", "stopped after")) or (
                 out.startswith("exit code") and not out.startswith("exit code 0"))
+            if not failed and out.startswith("exit code 0") and hasattr(self, "verified_gen"):
+                self.verified_gen = getattr(self, "edit_gen", 0)
             if script is not None and not failed:
                 script.unlink(missing_ok=True)
             active = user_script or script
@@ -1176,6 +1252,8 @@ class AiToolHost(QObject):
             except OSError as exc:
                 return f"error: could not save the skill ({exc.strerror or 'write failed'})"
             return f'updated skill "{path.parent.name}"'
+        if name == "search_memory":
+            return search_memory(memory_path(), args.get("query"))
         if name in ("remember", "forget"):
             try:
                 _text, note = plan_memory(memory_path(), name, args.get("note"))
@@ -1239,7 +1317,9 @@ class AiToolHost(QObject):
             if not _GUI_CONTROL_LOCK.acquire(blocking=False):
                 return "error: another chat is currently controlling the screen; try again once it finishes"
             try:
-                return self._computer(name, args) if name in COMPUTER_TOOLS else self._batch(args.get("steps"), args.get("verify", "none"))
+                return (self._computer(name, args) if name in COMPUTER_TOOLS
+                        else self._batch(args.get("steps"), args.get("verify", "none"),
+                                         bool(args.get("restore_focus"))))
             finally:
                 _GUI_CONTROL_LOCK.release()
         if name == "preview_document":  # reads a private copy in a hidden Office instance, so it needs no approval
@@ -1782,7 +1862,7 @@ class AiToolHost(QObject):
             self.cancel.wait(0.35)
         return "error: stopped by the user"
 
-    def _batch(self, steps: Any, verify: Any = "none") -> str:
+    def _batch(self, steps: Any, verify: Any = "none", restore_focus: bool = False) -> str:
         """computer_batch: one approval listing every step (asked as risky when any step is), then each step through
         `_computer`, stopping at the first error or Stop."""
         if not isinstance(steps, list) or not steps or len(steps) > MAX_BATCH_STEPS:
@@ -1818,6 +1898,8 @@ class AiToolHost(QObject):
         if not self._allowed("computer", "The model wants to control your computer in these steps:\n\n" + "\n".join(plan),
                              "computer control", ", ".join(risks)):
             return "error: the user declined these actions"
+        saved_fg = computer.foreground_window() if restore_focus else 0
+        saved_pos = computer.cursor_pos() if restore_focus else None
         cancel, lines = self.cancel, []
         self._batch_acted = False
         try:
@@ -1849,6 +1931,8 @@ class AiToolHost(QObject):
         finally:
             self._in_batch = False
             self._batch_acted = False
+            if restore_focus:
+                computer.restore_cursor_and_window(saved_fg, saved_pos)
 
     def _act(self, done: Callable[[Any], None], name: str, args: dict[str, Any]) -> None:
         """Make the pet and the chat click-through (hidden only where Windows cannot), give the keyboard to the
@@ -1986,6 +2070,19 @@ class AiToolHost(QObject):
                     if self._ref is not None:
                         self._prev_ref = self._ref
                     self._ref = got[0]
+                    if (getattr(self, "_win", None) is not None and not result.startswith("error")
+                            and not login_vault.typed_password_shown()
+                            and name in ("mouse_click", "mouse_drag", "ui_action", "press_key", "focus_window")):
+                        def read_uia() -> None:
+                            extra_uia = ""
+                            if "0 pixels changed" in dnote and name in ("mouse_click", "mouse_drag") and "x" in args and "y" in args:
+                                extra_uia += computer.uia_zero_change_hint(args["x"], args["y"])
+                            if name in ("mouse_click", "ui_action", "press_key", "focus_window"):
+                                extra_uia += computer.uia_focus_note()
+                            done(base + dnote + extra_uia + tail)
+
+                        threading.Thread(target=read_uia, daemon=True).start()
+                        return
                 done(base + dnote + tail if not result.startswith("error") else base)
 
             self._grab_screen(keep, primary=True)
@@ -2016,6 +2113,32 @@ class AiToolHost(QObject):
         return ("\n\n[Paperduck: the user's pictures are attached to this message itself; they are not files, so do "
                 "not look for them on disk. Their text, read by OCR:]\n" + "\n".join(notes))[:MAX_SHARED_NOTE_CHARS]
 
+    def _agent_run_command(self, root: Path | None, args: dict[str, Any]) -> str:
+        command = args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "error: give a command"
+        cwd = root or Path.home()
+        if isinstance(args.get("cwd"), str) and args["cwd"].strip():
+            try:
+                cwd = resolve(root, args["cwd"])
+            except (OSError, ValueError):
+                return "error: bad cwd path"
+            if not cwd.is_dir():
+                return "error: cwd is not a folder"
+        risk = destructive_reason(command)
+        seconds = command_timeout(args.get("timeout_s"))
+        fast_rev = ((True, "read-only command")
+                    if _host_auto_mode(self) and not risk and not self.outside and is_readonly_command(command)
+                    else None)
+        allow_kw = {"fast_review": fast_rev} if fast_rev is not None else {}
+        if not self._allowed("run_command", f"Verifier sub-agent wants to run in {cwd}:\n\n{command.strip()}",
+                             "commands", risk, **allow_kw):
+            return "error: the user declined this command"
+        out = run_command(cwd, command, self.cancel, seconds)
+        if out.startswith("exit code 0"):
+            self.verified_gen = self.edit_gen
+        return out
+
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:
         """A sub-agent's thread: one ask() with the chat's provider and model at the agent's own thinking level."""
         plugin = _host_chat(self)._plugin
@@ -2023,7 +2146,9 @@ class AiToolHost(QObject):
         url = plugin.base_url
         model = (helper or plugin.model) if effort in ("off", "low") else plugin.model
         where = f"the Project Folder {host.root}" if host.root else f"the home folder {Path.home()}"
+        prior = getattr(host, "prior_messages", None) or []
         messages = [{"role": "system", "content": AGENT_PROMPT.format(calls=MAX_AGENT_CALLS, where=where, today=date.today())},
+                    *prior,
                     {"role": "user", "content": [{"type": "text", "text": task}, *(
                         {"type": "image_url", "image_url": {"url": u}} for u in host.images)] if host.images else task}]
         return ask(url, load_key(url), model, messages, thinking=fit_thinking(url, effort, model), host=host,

@@ -92,7 +92,7 @@ PET_ACTIONS: dict[str, str] = {
     "sysmon:refresh": "refresh CPU and RAM readings",
 }
 # Tools whose output is the user's own data; after one runs, fetch_page may only open links already in the chat
-LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "read_clipboard", "read_screen", "screen_map", "peek_region", "sample_colors", "layout_check", "preview_document", "view_image", "mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "computer_batch", "pet_status",
+LOCAL_DATA_TOOLS = {"list_files", "read_file", "find_files", "search_text", "batch_read", "query_files", "read_clipboard", "read_screen", "screen_map", "peek_region", "sample_colors", "layout_check", "preview_document", "view_image", "mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "computer_batch", "pet_status",
                     "run_command", "run_powershell", "read_background", "list_windows", "wait_for_ui", "file_outline", "search_sessions"}
 
 
@@ -242,7 +242,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         f"{MAX_BATCH_STEPS} steps. Optional verify ('peek', 'diff', 'map') captures the screen after the batch.",
         {"steps": {"type": "array", "items": {"type": "object"}},
          "verify": {"type": "string", "enum": ["none", "peek", "diff", "map"],
-                    "description": "Optional post-batch screen capture: peek, diff (BEFORE|AFTER), or map"}}, ("steps",)),
+                    "description": "Optional post-batch screen capture: peek, diff (BEFORE|AFTER), or map"},
+         "restore_focus": {"type": "boolean", "description": "Restore prior foreground window and cursor after the batch"}}, ("steps",)),
     _fn("scroll", "Scroll the wheel at the cursor, or at x and y when given: positive amounts scroll down (or right "
         "with horizontal=true), negative up/left, one notch each (max 20).",
         {"amount": {"type": "integer"}, "x": {"type": "integer"}, "y": {"type": "integer"},
@@ -391,9 +392,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
         ("name", "instructions")),
     _fn("remember", "Save one short lasting note to your memory, which every later chat sees: a correction, a "
         "preference, or a fact about the user's setup (e.g. 'Tests run with .venv\\Scripts\\python -m pytest'). "
+        "Optional scope tags like [project:name], [app:exe], or [topic:tag] keep prompts lean. "
         "Not for one-off details. The user allows or declines it.",
         {"note": {"type": "string", "description": f"One sentence, under {MAX_NOTE_CHARS} characters"}},
         ("note",)),
+    _fn("search_memory", "Search all saved memory notes (including scoped project/app notes) by keyword.",
+        {"query": {"type": "string"}}, ("query",)),
     _fn("forget", "Remove a note from your memory that is wrong or stale. The user allows or declines it.",
         {"note": {"type": "string", "description": "Text from the note to remove"}}, ("note",)),
     _fn("calculate", "Exact arithmetic. Use it for every number you report or rely on (sums, counts, percentages, "
@@ -402,7 +406,49 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "contrast ratio of two colors. Lists for sum, e.g. sum([0, 1, 2, 3]) * 3.",
         {"expression": {"type": "string", "description": "e.g. contrast('#4a90e2', '#11243d') or 12.5 * 3 / 4"}},
         ("expression",)),
+    _fn("batch_read", "Read line ranges or symbol outlines across up to 12 non-secret files in one call.",
+        {"items": {"type": "array", "items": {"type": "object", "properties": {
+            "path": _PATH, "start_line": {"type": "integer"}, "end_line": {"type": "integer"},
+            "outline": {"type": "boolean"}}, "required": ["path"]}}}, ("items",)),
+    _fn("query_files", "Filter, project, group, aggregate, or sort rows/records from CSV, TSV, JSON, JSONL, or text "
+        "files locally in one call without loading full files into context.",
+        {"paths": {"type": "array", "items": _PATH}, "pattern": {"type": "string"}, "path": _PATH,
+         "format": {"type": "string", "enum": ["auto", "csv", "tsv", "json", "jsonl", "lines"]},
+         "where": {"type": "string", "description": "Filter expression over row fields, e.g. status == 'error' and count > 2"},
+         "select": {"type": "array", "items": {"type": "string"}},
+         "group_by": {"type": "string"},
+         "agg": {"type": "string", "enum": ["count", "sum", "min", "max"]},
+         "agg_field": {"type": "string"},
+         "sort_by": {"type": "string"}, "desc": {"type": "boolean"},
+         "limit": {"type": "integer"}}),
+    _fn("search_tools", "Discover and activate deferred built-in tool groups (computer, design_docs, "
+        "background_errands, desktop_pet, meta_skills) by keyword or group name.",
+        {"query": {"type": "string"},
+         "group": {"type": "string", "enum": ["computer", "design_docs", "background_errands", "desktop_pet", "meta_skills"]}}),
 ]
+CORE_TOOL_NAMES = frozenset({
+    "list_files", "read_file", "file_outline", "batch_read", "query_files", "find_files", "search_text",
+    "edit_file", "edit_files", "run_command", "run_powershell", "plan_tasks", "calculate",
+    "find_skill", "load_skill", "search_tools",
+})
+TOOL_GROUPS: dict[str, frozenset[str]] = {
+    "computer": frozenset({
+        "read_screen", "screen_map", "peek_region", "sample_colors", "layout_check", "mouse_click",
+        "mouse_hover", "mouse_drag", "mouse_path", "type_text", "type_login", "paste_text", "press_key",
+        "computer_batch", "scroll", "list_windows", "focus_window", "ui_action", "wait_for_ui",
+    }),
+    "design_docs": frozenset({"preview_document", "view_image", "make_sheet", "clean_metadata", "save_file"}),
+    "background_errands": frozenset({
+        "start_background", "read_background", "send_background_input", "stop_background", "set_errand", "cancel_errand",
+    }),
+    "desktop_pet": frozenset({
+        "read_clipboard", "copy_text", "pet_status", "pet_action", "run_macro", "open_link", "search_sessions",
+    }),
+    "meta_skills": frozenset({
+        "find_mcp_servers", "add_mcp_server", "add_skill", "update_skill", "remember", "search_memory", "forget",
+    }),
+}
+_TOOL_GROUP_MAP = {name: grp for grp, names in TOOL_GROUPS.items() for name in names}
 # the user allows each call in the chat (or all of them for a chat)
 COMPUTER_TOOLS = {"mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "type_text", "paste_text", "press_key", "scroll", "focus_window", "ui_action"}  # computer_batch runs these as its steps
 SCREEN_TOOLS = COMPUTER_TOOLS | {"screen_map", "peek_region", "sample_colors", "computer_batch", "layout_check", "wait_for_ui"}  # an answer using these gets screen_thinking
@@ -1048,7 +1094,10 @@ def _closest_hint(text: str, old: str) -> str:
         if ratio > best_ratio:
             best_ratio, best_span = ratio, (i + 1, end)
     if best_ratio >= 0.55:
-        return f" (closest match near lines {best_span[0]}-{best_span[1]})"
+        lo = max(1, best_span[0] - 2)
+        hi = min(len(lines), best_span[1] + 2)
+        snippet = "\n".join(f"{n}: {lines[n - 1][:160]}" for n in range(lo, min(hi + 1, lo + 12)))
+        return f" (closest match near lines {best_span[0]}-{best_span[1]}):\n{snippet}"
     return ""
 
 
@@ -1190,6 +1239,7 @@ def apply_edit(edit: Edit) -> str:
 def syntax_check_edits(edits: list[Edit]) -> str:
     """Run free local syntax checks on edited .py and .json files; '' when clean."""
     import json
+    import tomllib
 
     issues: list[str] = []
     for edit in edits:
@@ -1204,7 +1254,56 @@ def syntax_check_edits(edits: list[Edit]) -> str:
                 json.loads(edit.after)
             except ValueError as exc:
                 issues.append(f"- {edit.rel}: {exc}")
+        elif ext == ".toml":
+            try:
+                tomllib.loads(edit.after)
+            except tomllib.TOMLDecodeError as exc:
+                issues.append(f"- {edit.rel}: {exc}")
+        elif ext in (".svg", ".xml"):
+            if "<!ENTITY" in edit.after or "<!DOCTYPE" in edit.after:
+                continue
+            try:
+                ET.fromstring(edit.after)
+            except ET.ParseError as exc:
+                issues.append(f"- {edit.rel}: {exc}")
     return ("\n[Paperduck: syntax check found issues:\n" + "\n".join(issues) + "]") if issues else ""
+
+
+_WORKSPACE_CACHE: dict[Path, tuple[int, str]] = {}
+
+
+def discover_workspace(root: Path | None) -> str:
+    if root is None:
+        return ""
+    try:
+        resolved = root.resolve()
+        mtime = resolved.stat().st_mtime_ns
+    except OSError:
+        return ""
+    cached = _WORKSPACE_CACHE.get(resolved)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    facts: list[str] = []
+    if (resolved / ".venv" / "Scripts" / "python.exe").is_file():
+        facts.append("python=.venv\\Scripts\\python.exe")
+    if (resolved / ".venv" / "Scripts" / "pytest.exe").is_file():
+        facts.append("test=.venv\\Scripts\\pytest.exe -q")
+    elif (resolved / "pyproject.toml").is_file() or (resolved / "pytest.ini").is_file():
+        facts.append("project=python")
+    if (resolved / "package.json").is_file():
+        facts.append("node=package.json")
+    if (resolved / "Cargo.toml").is_file():
+        facts.append("rust=Cargo.toml")
+    if (resolved / "go.mod").is_file():
+        facts.append("go=go.mod")
+    docs = [d for d in ("AGENTS.md", "CLAUDE.md", "CONTEXT.md") if (resolved / d).is_file()]
+    if docs:
+        facts.append("docs=" + ",".join(docs) + " (untrusted repo files)")
+    note = f"[Workspace {resolved.name}: {'; '.join(facts)}]" if facts else ""
+    if len(_WORKSPACE_CACHE) > 32:
+        _WORKSPACE_CACHE.clear()
+    _WORKSPACE_CACHE[resolved] = (mtime, note)
+    return note
 
 
 _SHELL_META = re.compile(r"[&|;><`\r\n]|\$\(")
@@ -2265,14 +2364,48 @@ def read_memory(path: Path) -> list[str]:
     return [line[2:].strip() for line in lines if line.startswith("- ") and line[2:].strip()]
 
 
-def memory_prompt(path: Path) -> str:
+_SCOPED_TAG = re.compile(r"^\[(project|app|topic):([^\]]+)\]\s*", re.I)
+CORE_MEMORY_CHARS = 2400
+
+
+def memory_prompt(path: Path, scope_hint: str = "") -> str:
     """The system prompt's memory block, or "" when there are no notes."""
     notes = read_memory(path)
     if not notes:
         return ""
-    rows = "\n".join(f"- {n}" for n in notes)[:MAX_MEMORY_CHARS]
+    hint = (scope_hint or "").lower()
+    core: list[str] = []
+    scoped: list[str] = []
+    omitted = 0
+    for n in notes:
+        m = _SCOPED_TAG.match(n)
+        if not m:
+            core.append(n)
+        elif not hint or m.group(2).strip().lower() in hint:
+            scoped.append(n)
+        else:
+            omitted += 1
+    selected = [*core, *scoped]
+    if not selected and omitted:
+        return f"Your memory has {omitted} scoped note(s); call search_memory to query them."
+    cap = CORE_MEMORY_CHARS if omitted else MAX_MEMORY_CHARS
+    rows = "\n".join(f"- {n}" for n in selected)[:cap]
+    extra = f"\n({omitted} off-topic scoped notes omitted; use search_memory if needed)" if omitted else ""
     return ("Your memory: notes you saved in earlier chats with remember, each allowed by the user. Follow them "
-            f"unless the user says otherwise now, and forget a note that turns out wrong or stale:\n{rows}")
+            f"unless the user says otherwise now, and forget a note that turns out wrong or stale:\n{rows}{extra}")
+
+
+def search_memory(path: Path, query: Any) -> str:
+    if not isinstance(query, str) or not query.strip():
+        return "error: give a search query"
+    notes = read_memory(path)
+    if not notes:
+        return "no memory notes saved"
+    terms = [t for t in re.findall(r"[a-z0-9_.-]+", query.lower()) if len(t) > 1]
+    if not terms:
+        return "\n".join(f"- {n}" for n in notes[:30])
+    hits = [n for n in notes if any(t in n.lower() for t in terms)]
+    return "\n".join(f"- {n}" for n in hits[:30]) if hits else "no matching memory notes"
 
 
 def plan_memory(path: Path, name: str, text: Any) -> tuple[str, str]:
@@ -2395,3 +2528,284 @@ def calculate(expression: Any) -> str:
     if isinstance(value, float):
         return f"{value:.6g}" if abs(value) < 1e15 else repr(value)
     return str(value)
+
+
+def tool_group_of(name: str) -> str:
+    return _TOOL_GROUP_MAP.get(name, "")
+
+
+_GROUP_HINTS: dict[str, tuple[str, ...]] = {
+    "computer": ("screen", "click", "window", "mouse", "type", "login", "browser", "canva", "button", "app", "ui"),
+    "design_docs": ("pdf", "word", "docx", "slide", "pptx", "excel", "xlsx", "sheet", "image", "png", "poster", "design"),
+    "background_errands": ("background", "errand", "server", "watch", "daemon", "remind", "later", "port"),
+    "desktop_pet": ("clipboard", "copy", "macro", "session", "past chat", "pomodoro", "timer", "pet"),
+    "meta_skills": ("skill", "remember", "forget", "memory", "mcp"),
+}
+
+
+def infer_tool_groups(text: str) -> set[str]:
+    low = (text or "").lower()
+    out: set[str] = set()
+    for grp, words in _GROUP_HINTS.items():
+        if any(re.search(rf"\b{re.escape(w)}", low) for w in words):
+            out.add(grp)
+    return out
+
+
+def search_tools_catalog(query: Any = "", group: Any = "") -> tuple[set[str], str]:
+    want_group = group.strip() if isinstance(group, str) else ""
+    if want_group and want_group not in TOOL_GROUPS:
+        return set(), "error: unknown group. Groups: " + ", ".join(sorted(TOOL_GROUPS))
+    q = query.strip().lower() if isinstance(query, str) else ""
+    terms = [t for t in re.findall(r"[a-z0-9_]+", q) if len(t) > 1]
+    if not want_group and not terms:
+        summary = "\n".join(f"- {g}: {', '.join(sorted(names))}" for g, names in TOOL_GROUPS.items())
+        return set(), "Deferred tool groups:\n" + summary
+    activated: set[str] = {want_group} if want_group else set()
+    lines: list[str] = []
+    for spec in TOOL_SPECS:
+        fn = spec["function"]
+        name = fn["name"]
+        grp = _TOOL_GROUP_MAP.get(name, "")
+        if not grp:
+            continue
+        if want_group and grp != want_group:
+            continue
+        hay = f"{name} {grp} {fn['description']}".lower()
+        if terms and not any(t in hay for t in terms):
+            continue
+        activated.add(grp)
+        lines.append(f"- [{grp}] {name}: {fn['description'][:140]}")
+    if not lines:
+        return set(), "no deferred tools matched; groups: " + ", ".join(sorted(TOOL_GROUPS))
+    return activated, f"Activated group(s): {', '.join(sorted(activated))}\n" + "\n".join(lines[:30])
+
+
+def batch_read(root: Path | None, args: dict[str, Any]) -> str:
+    items = args.get("items")
+    if not isinstance(items, list) or not (1 <= len(items) <= MAX_EDITS):
+        return f"error: give 1 to {MAX_EDITS} items"
+    out: list[str] = []
+    total = 0
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            out.append("error: each item needs a path")
+            continue
+        p_str = item["path"]
+        try:
+            path = resolve(root, p_str)
+        except (OSError, ValueError) as exc:
+            out.append(f"=== {p_str} ===\nerror: {exc}")
+            continue
+        if is_secret(path):
+            out.append(f"=== {p_str} ===\nerror: secret file refused; use read_file for approval")
+            continue
+        chunk = file_outline(root, p_str) if item.get("outline") is True else run_file_tool(
+            root, "read_file", {"path": p_str, "start_line": item.get("start_line"), "end_line": item.get("end_line")},
+        )
+        if len(chunk) > 8000:
+            chunk = chunk[:8000] + "\n... (cut)"
+        if total + len(chunk) > MAX_FILE_CHARS:
+            out.append(f"=== {p_str} ===\n... (batch character budget reached)")
+            break
+        out.append(f"=== {p_str} ===\n{chunk}")
+        total += len(chunk)
+    return "\n\n".join(out)
+
+
+_ROW_CMP = {
+    ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
+    ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,
+    ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+}
+_ROW_FUNCS = {
+    "len": len, "int": int, "float": float, "str": str,
+    "lower": lambda s: str(s).lower(),
+    "contains": lambda a, b: str(b).lower() in str(a).lower(),
+    "regex": lambda a, pat: bool(re.search(str(pat), str(a), re.I)),
+    "abs": abs, "round": round,
+}
+
+
+def _eval_row(node: ast.AST, row: dict[str, Any]) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id == "True":
+            return True
+        if node.id == "False":
+            return False
+        if node.id == "None":
+            return None
+        return row.get(node.id)
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "row":
+        key = _eval_row(node.slice, row)
+        return row.get(key)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_eval_row(e, row) for e in node.elts]
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_row(node.operand, row)
+        if isinstance(node.op, ast.Not):
+            return not v
+        if isinstance(node.op, ast.USub):
+            return -v
+        if isinstance(node.op, ast.UAdd):
+            return +v
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return all(_eval_row(v, row) for v in node.values)
+        return any(_eval_row(v, row) for v in node.values)
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        return _BINOPS[type(node.op)](_eval_row(node.left, row), _eval_row(node.right, row))
+    if isinstance(node, ast.Compare):
+        left = _eval_row(node.left, row)
+        for op, comp in zip(node.ops, node.comparators):
+            right = _eval_row(comp, row)
+            fn = _ROW_CMP.get(type(op))
+            if fn is None or not fn(left, right):
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ROW_FUNCS and not node.keywords:
+        return _ROW_FUNCS[node.func.id](*(_eval_row(a, row) for a in node.args))
+    raise ValueError(f"unsupported expression: {ast.unparse(node)[:60]}")
+
+
+def _load_records(path: Path, fmt: str) -> list[dict[str, Any]]:
+    import csv
+    import json
+
+    if path.stat().st_size > MAX_READ_BYTES:
+        raise ValueError(f"{path.name} is larger than 32 MB")
+    raw = path.read_bytes()
+    if b"\0" in raw[:8192]:
+        raise ValueError(f"{path.name} is binary")
+    text = raw.decode("utf-8", "replace")
+    ext = path.suffix.lower()
+    kind = fmt if fmt != "auto" else (
+        "csv" if ext == ".csv" else "tsv" if ext == ".tsv" else "jsonl" if ext in (".jsonl", ".ndjson")
+        else "json" if ext == ".json" else "lines"
+    )
+    if kind in ("csv", "tsv"):
+        rows = list(csv.DictReader(text.splitlines(), delimiter="\t" if kind == "tsv" else ","))
+        for i, r in enumerate(rows, 1):
+            r.setdefault("_line", i)
+            r.setdefault("_file", path.name)
+        return rows
+    if kind == "json":
+        data = json.loads(text)
+        if isinstance(data, list):
+            return [{**(r if isinstance(r, dict) else {"value": r}), "_file": path.name} for r in data]
+        if isinstance(data, dict):
+            return [{**data, "_file": path.name}]
+        return [{"value": data, "_file": path.name}]
+    if kind == "jsonl":
+        out = []
+        for i, ln in enumerate(text.splitlines(), 1):
+            if not ln.strip():
+                continue
+            obj = json.loads(ln)
+            out.append({**(obj if isinstance(obj, dict) else {"value": obj}), "_line": i, "_file": path.name})
+        return out
+    return [{"_line": i, "_file": path.name, "text": ln} for i, ln in enumerate(text.splitlines(), 1)]
+
+
+def query_files(root: Path | None, args: dict[str, Any]) -> str:
+    import json
+
+    raw_paths = args.get("paths")
+    targets: list[Path] = []
+    if isinstance(raw_paths, list) and raw_paths:
+        for p in raw_paths[:MAX_EDITS]:
+            if isinstance(p, str) and p.strip():
+                resolved = resolve(root, p)
+                if is_secret(resolved):
+                    return f"error: secret file refused ({resolved.name})"
+                if resolved.is_file():
+                    targets.append(resolved)
+    elif isinstance(args.get("pattern"), str) and args["pattern"].strip():
+        base = resolve(root, args.get("path"))
+        want = args["pattern"].strip().lower().replace("\\", "/")
+        for p in _walk(base):
+            if is_secret(p):
+                continue
+            rel = _rel(base, p)
+            if fnmatch.fnmatch(p.name.lower(), want) or ("/" in want and fnmatch.fnmatch(rel.lower(), want)):
+                targets.append(p)
+                if len(targets) >= 32:
+                    break
+    else:
+        return "error: give paths or a pattern"
+    if not targets:
+        return "no matching files"
+    fmt = args.get("format") if args.get("format") in ("auto", "csv", "tsv", "json", "jsonl", "lines") else "auto"
+    where_ast = None
+    if isinstance(args.get("where"), str) and args["where"].strip():
+        try:
+            where_ast = ast.parse(args["where"].strip(), mode="eval").body
+        except SyntaxError as exc:
+            return f"error: bad where expression ({exc.msg})"
+    records: list[dict[str, Any]] = []
+    for t in targets:
+        try:
+            rows = _load_records(t, fmt)
+        except (OSError, ValueError) as exc:
+            return f"error: {exc}"
+        for r in rows:
+            if len(records) >= 50000:
+                break
+            if where_ast is not None:
+                try:
+                    if not _eval_row(where_ast, r):
+                        continue
+                except Exception as exc:
+                    return f"error: {exc}"
+            records.append(r)
+    group_by = args.get("group_by") if isinstance(args.get("group_by"), str) and args["group_by"].strip() else ""
+    agg = args.get("agg") if args.get("agg") in ("count", "sum", "min", "max") else "count"
+    agg_field = args.get("agg_field") if isinstance(args.get("agg_field"), str) and args["agg_field"].strip() else ""
+    if group_by:
+        buckets: dict[str, list[Any]] = {}
+        for r in records:
+            key = str(r.get(group_by, ""))
+            buckets.setdefault(key, []).append(r.get(agg_field) if agg_field else 1)
+        out_rows: list[dict[str, Any]] = []
+        for key, vals in buckets.items():
+            if agg == "count":
+                val: Any = len(vals)
+            else:
+                nums = []
+                for v in vals:
+                    try:
+                        nums.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+                if not nums:
+                    val = None
+                elif agg == "sum":
+                    val = sum(nums)
+                elif agg == "min":
+                    val = min(nums)
+                else:
+                    val = max(nums)
+            out_rows.append({group_by: key, f"{agg}_{agg_field or 'rows'}": val})
+        records = out_rows
+    sort_by = args.get("sort_by") if isinstance(args.get("sort_by"), str) and args["sort_by"].strip() else ""
+    if sort_by:
+        def _sk(r: dict[str, Any]) -> tuple[int, Any]:
+            v = r.get(sort_by)
+            if v is None:
+                return (2, "")
+            try:
+                return (0, float(v))
+            except (TypeError, ValueError):
+                return (1, str(v))
+        records.sort(key=_sk, reverse=args.get("desc") is True)
+    select = [c for c in (args.get("select") or []) if isinstance(c, str)] if isinstance(args.get("select"), list) else []
+    if select and not group_by:
+        records = [{k: r.get(k) for k in select} for r in records]
+    lim = args.get("limit")
+    limit = lim if isinstance(lim, int) and not isinstance(lim, bool) and 1 <= lim <= 200 else 50
+    shown = records[:limit]
+    text_out = json.dumps({"matched": len(records), "shown": len(shown), "rows": shown}, ensure_ascii=False, indent=1)
+    return text_out[:MAX_FILE_CHARS] + ("\n... (truncated)" if len(text_out) > MAX_FILE_CHARS else "")

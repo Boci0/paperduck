@@ -555,7 +555,13 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         host = None if self._testing else self._tool_host
         cancel = self._cancel = threading.Event()
         if host is not None:
-            host.cancel, host.ran, host.layout_open = cancel, [], ""
+            if hasattr(host, "reset_answer"):
+                host.reset_answer(cancel)
+            else:
+                host.cancel, host.ran, host.layout_open = cancel, [], ""
+            if hasattr(host, "prewarm_groups"):
+                last_txt = next((t.get("content", "") for t in reversed(history or []) if t.get("role") == "user"), "")
+                host.prewarm_groups(last_txt if isinstance(last_txt, str) else "")
 
         self._clear_stream()
 
@@ -585,7 +591,12 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             sent, n, summary = (compact_history(url, key, compact_model, history, cancel, keep, tasks) if long
                                 else (history, 0, ""))
             # shortcut: Claude still gets earlier answers in note form (its turns are built in another shape)
-            reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url), extra_system=REMOTE_SYSTEM_NOTE if self._remote_only else ""), thinking=thinking,
+            ws_note = host.workspace_note() if hasattr(host, "workspace_note") else ""
+            proj = host._project() if hasattr(host, "_project") else None
+            last_msg = next((t.get("content", "") for t in reversed(sent) if t.get("role") == "user"), "")
+            scope_hint = f"{proj.name if proj else ''} {last_msg if isinstance(last_msg, str) else ''}".strip()
+            extra_parts = [part for part in (REMOTE_SYSTEM_NOTE if self._remote_only else "", ws_note) if part]
+            reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url), extra_system="\n\n".join(extra_parts), memory_scope=scope_hint), thinking=thinking,
                         screen_thinking=screen, host=host, progress=note,
                         steer=lambda: self._take_steer(cancel), cancel=cancel)
             reply.compacted, reply.summary, reply.archive = n, summary, saved[0]
@@ -1469,6 +1480,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._allowed.clear()
         if hasattr(self._tool_host, "mcp_loaded"):
             self._tool_host.mcp_loaded.clear()
+        if hasattr(self._tool_host, "tool_groups_loaded"):
+            self._tool_host.tool_groups_loaded.clear()
         self._remote_steers.clear()
         self._draft.clear()
         self._clear_attachments()
