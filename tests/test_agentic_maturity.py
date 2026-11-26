@@ -229,3 +229,93 @@ def test_menu_wheel_macros_and_customize_dialog(monkeypatch: pytest.MonkeyPatch)
     assert dlg._tabs.count() == 3
     dlg.close()
     dlg.deleteLater()
+
+
+def test_repeating_port_and_window_errands_edge_trigger() -> None:
+    listening = [True]
+    title = ["Build Failed"]
+    plugin = ErrandsPlugin()
+    plugin.probes = Probes(listening=lambda _p: listening[0], title=lambda: title[0])
+
+    # Set while port is closed / window not front so initial baseline isn't active
+    listening[0] = False
+    title[0] = "Editor"
+    ep = plugin.add({"kind": "port_opens", "port": 8080}, "check port", "s1", now=100.0, repeat=True)
+    ew = plugin.add({"kind": "window_appears", "title": "Build Failed"}, "check win", "s1", now=100.0, repeat=True)
+    assert ep.repeat and ew.repeat
+
+    # Transition to active -> fires once
+    listening[0] = True
+    title[0] = "Build Failed - Log"
+    assert plugin.poll(now=101.0)
+    assert len(plugin.fired) == 2
+    plugin.fired.clear()
+
+    # Still active -> must NOT re-fire
+    assert not plugin.poll(now=102.0)
+    assert plugin.fired == []
+
+    # Clear active state -> still does not fire
+    listening[0] = False
+    title[0] = "Editor"
+    assert not plugin.poll(now=103.0)
+
+    # Transition back to active -> fires again
+    listening[0] = True
+    title[0] = "Build Failed"
+    assert plugin.poll(now=104.0)
+    assert len(plugin.fired) == 2
+
+
+def test_checkpoint_tried_once_per_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _app = QApplication.instance() or QApplication([])
+    import src.ui.ai_tool_host as host_mod
+
+    calls = 0
+
+    def fake_cp(_root: Path | None) -> None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(host_mod, "create_checkpoint", fake_cp)
+    host = AiToolHost(QObject())
+    host._project = lambda: tmp_path  # type: ignore[method-assign]
+    monkeypatch.setattr(host, "_allowed", lambda *a, **k: False)
+
+    host.run("run_command", {"command": "echo 1"})
+    host.run("run_command", {"command": "echo 2"})
+    assert calls == 1
+
+    import threading
+    host.reset_answer(threading.Event())
+    host.run("run_command", {"command": "echo 3"})
+    assert calls == 2
+
+
+def test_send_prompt_steers_when_busy() -> None:
+    from src.ui.ai_chat import AiChat
+
+    steered: list[str] = []
+    fake = SimpleNamespace(_job=object(), _testing=False, _steer=lambda txt: steered.append(txt))
+    assert AiChat.send_prompt(fake, "  follow up  ") is True  # type: ignore[arg-type]
+    assert steered == ["follow up"]
+
+    fake_testing = SimpleNamespace(_job=object(), _testing=True, _steer=lambda txt: steered.append(txt))
+    assert AiChat.send_prompt(fake_testing, "ignored") is False  # type: ignore[arg-type]
+
+
+def test_pet_window_shutdown_closes_quick_bar() -> None:
+    from src.engine.pet_state import PetStateMachine
+    from src.ui.pet_window import PetWindow
+
+    _app = QApplication.instance() or QApplication([])
+    sm = PetStateMachine()
+    win = PetWindow(state_machine=sm)
+    win.open_quick_bar()
+    bar = win._quick_bar
+    assert bar is not None and bar.isVisible()
+    win.shutdown()
+    assert win._quick_bar is None
+    assert not bar.isVisible()
+    win.close()

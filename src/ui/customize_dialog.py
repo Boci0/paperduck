@@ -43,7 +43,7 @@ class CustomizeDialog(QDialog):
         super().__init__(parent)
         self._win = win
         self.setWindowTitle("Paperduck - Customize")
-        self.setMinimumSize(500, 460)
+        self.setMinimumSize(540, 480)
         self.setStyleSheet(
             f"QDialog {{ background: {rgba_css(GLASS_RGBA)}; color: {TEXT_HEX}; font-family: \"{FONT_FAMILY}\"; }}"
             f"QLabel {{ color: {TEXT_HEX}; background: transparent; }}"
@@ -95,6 +95,7 @@ class CustomizeDialog(QDialog):
 
         scroll = QScrollArea(page)
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.viewport().setAutoFillBackground(False)
         self._wheel_box = QWidget(scroll)
@@ -176,6 +177,7 @@ class CustomizeDialog(QDialog):
         left.addWidget(pin_lbl)
         pin_scroll = QScrollArea(page)
         pin_scroll.setWidgetResizable(True)
+        pin_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         pin_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         pin_scroll.viewport().setAutoFillBackground(False)
         pin_box = QWidget(pin_scroll)
@@ -198,6 +200,7 @@ class CustomizeDialog(QDialog):
         right.addWidget(sec_lbl)
         sec_scroll = QScrollArea(page)
         sec_scroll.setWidgetResizable(True)
+        sec_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         sec_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         sec_scroll.viewport().setAutoFillBackground(False)
         sec_box = QWidget(sec_scroll)

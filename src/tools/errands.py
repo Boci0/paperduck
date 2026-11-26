@@ -216,14 +216,22 @@ def check(errand: Errand, probes: Probes, now: float) -> str | None:
             return f"new in {arg['folder']}: {names}"
         return None
     if kind == "port_opens":
-        return f"port {arg['port']} is listening" if probes.listening(arg["port"]) else None
+        is_open = probes.listening(arg["port"])
+        if base.get("active"):
+            if not is_open:
+                base["active"] = False
+            return None
+        return f"port {arg['port']} is listening" if is_open else None
     if kind == "window_appears":
         from src.tools.watch import is_private_title
 
         title = probes.title()
-        if title and not is_private_title(title) and arg["title"].lower() in title.lower():
-            return f"the front window is {title[:120]!r}"
-        return None
+        matched = bool(title and not is_private_title(title) and arg["title"].lower() in title.lower())
+        if base.get("active"):
+            if not matched:
+                base["active"] = False
+            return None
+        return f"the front window is {title[:120]!r}" if matched else None
     if kind in ("at_time", "every"):
         return "it is time" if now >= base.get("due", 0) else None
     if kind == "user_returns":
@@ -321,6 +329,8 @@ class ErrandsPlugin:
                         errand.base = baseline(errand.kind, errand.arg, self.probes, now)
                     except (OSError, ValueError):
                         pass
+                    if errand.kind in ("port_opens", "window_appears"):
+                        errand.base["active"] = True
                     self.fired.append((replace(errand, base=dict(errand.base), arg=dict(errand.arg)), evidence))
                 else:
                     self.errands.remove(errand)

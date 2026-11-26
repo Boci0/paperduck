@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from PyQt6.QtCore import QRect, QUrl
@@ -196,7 +197,8 @@ class AiMixin:
 
     def _run_errand(self) -> None:
         errands, chat = self._errands(), self._ai_chat
-        if errands is None or chat is None or not errands.fired or chat._job is not None:
+        if (errands is None or chat is None or not errands.fired or chat._job is not None
+                or getattr(self, "_routine_job", None) is not None):
             return
         errand, evidence = errands.fired.pop(0)
         if not errands.take_run():
@@ -207,12 +209,17 @@ class AiMixin:
             project = getattr(self._state_machine.registry.get_plugin("project"), "repo", None)
             cwd = Path(project) if project and Path(project).is_dir() else None
             job = AiJob(self)
+            self._routine_job = job
 
             def run_compiled() -> tuple[bool, str]:
                 return run_routine_script(errand.script, cwd=cwd)
 
             def on_compiled(res: object, error: str) -> None:
+                if getattr(self, "_routine_job", None) is job:
+                    self._routine_job = None
                 job.deleteLater()
+                if self._is_shutting_down:
+                    return
                 handled, out = res if isinstance(res, tuple) and len(res) == 2 else (False, error or "script failed")
                 if not error and handled:
                     errands.done += 1
@@ -220,6 +227,9 @@ class AiMixin:
                     self.update()
                     return
                 merged = f"{evidence}\n\nCompiled script output:\n{out}"
+                if chat._job is not None:
+                    errands.fired.insert(0, (replace(errand, script=""), merged))
+                    return
                 if chat.run_errand(errand, merged):
                     self._errand_running = True
                     self._anim.play_oneshot("spin")

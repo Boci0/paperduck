@@ -104,7 +104,7 @@ class WatchMixin:
                           pomo is not None and not pomo.running, title=title,
                           watch_ok=hints.watch and self._watch_ready())
         if hint is not None and hint.action == "watch:tidy" and not hint.data:
-            self._check_folder(hint, foreground_title())  # the card shows only if the folder is messy
+            self._check_folder(hint, title)  # the card shows only if the folder is messy
             return
         if hint is not None:
             self._hint, self._hint_until = hint, time.monotonic() + 12.0

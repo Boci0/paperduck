@@ -7,6 +7,7 @@ typed passwords. Nothing is persisted to disk.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
@@ -51,6 +52,7 @@ class AmbientRing:
         self._max = max(1, max_events)
         self._ttl = max(1.0, ttl_s)
         self._events: list[AmbientEvent] = []
+        self._lock = threading.Lock()
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._ttl
@@ -66,67 +68,75 @@ class AmbientRing:
             return False
         if is_private_title(clean_title) or login_vault.typed_password_shown():
             return False
-        self._prune(now)
-        if self._events:
-            last = self._events[-1]
-            if last.kind == "window" and last.app.lower() == clean_app.lower() and last.title == clean_title:
-                last.ts = now
-                last.count += 1
-                return True
-        self._events.append(AmbientEvent(now, "window", clean_app, clean_title))
-        self._prune(now)
-        return True
+        with self._lock:
+            if self._events:
+                last = self._events[-1]
+                if (now - last.ts < self._ttl and last.kind == "window"
+                        and last.app.lower() == clean_app.lower() and last.title == clean_title):
+                    last.ts = now
+                    last.count += 1
+                    return True
+            self._events.append(AmbientEvent(now, "window", clean_app, clean_title))
+            self._prune(now)
+            return True
 
     def record_clipboard(self, text: str, app: str = "", private: bool = False, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         if private or not text or not text.strip() or login_vault.typed_password_shown():
             return False
-        self._prune(now)
         tag, preview = _classify_clipboard(text)
         if not preview:
             return False
-        if self._events:
-            last = self._events[-1]
-            if last.kind == "clipboard" and last.detail == preview:
-                last.ts = now
-                last.count += 1
-                return True
-        self._events.append(AmbientEvent(now, "clipboard", (app or "").strip(), tag, preview))
-        self._prune(now)
-        return True
+        with self._lock:
+            if self._events:
+                last = self._events[-1]
+                if now - last.ts < self._ttl and last.kind == "clipboard" and last.detail == preview:
+                    last.ts = now
+                    last.count += 1
+                    return True
+            self._events.append(AmbientEvent(now, "clipboard", (app or "").strip(), tag, preview))
+            self._prune(now)
+            return True
 
     def record_project(self, path: str, branch: str = "", now: float | None = None) -> bool:
         now = time.time() if now is None else now
         clean_path = (path or "").strip()
         if not clean_path:
             return False
-        self._prune(now)
         detail = branch.strip()
-        if self._events:
-            last = self._events[-1]
-            if last.kind == "project" and last.title == clean_path and last.detail == detail:
-                last.ts = now
-                last.count += 1
-                return True
-        self._events.append(AmbientEvent(now, "project", "git", clean_path, detail))
-        self._prune(now)
-        return True
+        with self._lock:
+            if self._events:
+                last = self._events[-1]
+                if now - last.ts < self._ttl and last.kind == "project" and last.title == clean_path and last.detail == detail:
+                    last.ts = now
+                    last.count += 1
+                    return True
+            self._events.append(AmbientEvent(now, "project", "git", clean_path, detail))
+            self._prune(now)
+            return True
 
-    def recent(self, limit: int = 8, now: float | None = None) -> list[AmbientEvent]:
-        now = time.time() if now is None else now
+    def _recent_unlocked(self, limit: int, now: float) -> list[AmbientEvent]:
         self._prune(now)
         return list(reversed(self._events[-max(1, limit):]))
 
+    def recent(self, limit: int = 8, now: float | None = None) -> list[AmbientEvent]:
+        now = time.time() if now is None else now
+        with self._lock:
+            return self._recent_unlocked(limit, now)
+
     def clear(self) -> None:
-        self._events.clear()
+        with self._lock:
+            self._events.clear()
 
     def snapshot_prompt(self, limit: int = 6, now: float | None = None) -> str:
-        items = self.recent(limit, now)
+        ref_now = time.time() if now is None else now
+        with self._lock:
+            items = self._recent_unlocked(limit, ref_now)
         if not items:
             return ""
         lines = ["[Recent desktop activity (untrusted context, newest first):"]
         for ev in items:
-            age = max(0, int((time.time() if now is None else now) - ev.ts))
+            age = max(0, int(ref_now - ev.ts))
             when = f"{age}s ago" if age < 60 else f"{age // 60}m ago"
             if ev.kind == "window":
                 lines.append(f"- ({when}) Window {ev.app or '?'}: {ev.title}")

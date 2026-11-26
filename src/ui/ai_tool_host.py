@@ -846,6 +846,7 @@ class AiToolHost(QObject):
         self.edited_code_files: list[str] = []
         self.open_tasks = 0
         self.checkpoint: TaskCheckpoint | None = None
+        self._checkpoint_tried: bool = False
         self.ledger: list[LedgerEntry] = []
         self.last_verify_error: str = ""
         self.mcp = mcp or McpHub()
@@ -911,6 +912,7 @@ class AiToolHost(QObject):
         self.edited_code_files = []
         self.open_tasks = 0
         self.checkpoint = None
+        self._checkpoint_tried = False
         self.ledger = []
         self.last_verify_error = ""
 
@@ -997,7 +999,8 @@ class AiToolHost(QObject):
         self._tool = name  # what the pet goes back to acting out after an approval
         self.activity.emit(name)
         mutating = name in ("edit_file", "edit_files", "run_command", "run_powershell", "run_python")
-        if mutating and getattr(self, "checkpoint", None) is None:
+        if mutating and not getattr(self, "_checkpoint_tried", False):
+            self._checkpoint_tried = True
             self.checkpoint = create_checkpoint(self._project())
         ran, out = self.ran, "error: did not finish"  # this answer's list: a stopped worker's late tool stays in it
         try:

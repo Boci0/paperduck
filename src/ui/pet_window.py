@@ -105,6 +105,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._state_machine = state_machine
         self.ambient = AmbientRing()
         self._quick_bar = None
+        self._routine_job: AiJob | None = None
         self._anim = animation_controller or AnimationController(size=32)
         self._always_on_top = always_on_top
         self._auto_wander = auto_wander
@@ -1030,6 +1031,11 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._perch_timer.stop()
         self._hint_timer.stop()
         self.remote.close()
+        self._routine_job = None
+        if self._quick_bar is not None:
+            self._quick_bar.close()
+            self._quick_bar.deleteLater()
+            self._quick_bar = None
         if self._ai_chat is not None:
             self._ai_chat.close()
             self._ai_chat = None

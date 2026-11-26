@@ -501,10 +501,15 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
                   [a.as_prompt() for a in usable if a.image_url], said=text)
 
     def send_prompt(self, text: str) -> bool:
-        """Submit a text prompt directly (used by QuickCommandBar and voice input)."""
+        """Submit a text prompt directly (used by QuickCommandBar); steers an active answer."""
         clean = (text or "").strip()
-        if not clean or self._job is not None:
+        if not clean:
             return False
+        if self._job is not None:
+            if self._testing:
+                return False
+            self._steer(clean)
+            return True
         self._draft.setPlainText(clean)
         self.send()
         return True
