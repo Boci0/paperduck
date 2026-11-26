@@ -80,8 +80,18 @@ class WheelLayout:
         """Every choosable slice with whether it is on: built-ins, opt-in extras, custom, then macros."""
         custom = [ToolWheelOption(label, "open", "#C9D1D9", custom_callback(t)) for label, t in self.custom]
         custom += [ToolWheelOption(name, "macro", "#F2A6E0", f"macro:{name}") for name in self.macros]
-        pairs = [(o, True) for o in base] + [(o, False) for o in EXTRA_SLICES] + [(o, True) for o in custom]
-        return [(o, self.overrides.get(o.callback_id, default)) for o, default in pairs]
+        pairs = [(o, True) for o in base] + [(o, False) for o in EXTRA_SLICES]
+        used = sum(1 for o, d in pairs if self.overrides.get(o.callback_id, d))
+        result: list[tuple[ToolWheelOption, bool]] = [(o, self.overrides.get(o.callback_id, d)) for o, d in pairs]
+        for o in custom:
+            if o.callback_id in self.overrides:
+                result.append((o, self.overrides[o.callback_id]))
+            elif used < MAX_SLICES:
+                result.append((o, True))
+                used += 1
+            else:
+                result.append((o, False))
+        return result
 
     def visible(self, base: list[ToolWheelOption]) -> list[ToolWheelOption]:
         shown = [o for o, on in self.catalog(base) if on][:MAX_SLICES]
@@ -110,7 +120,8 @@ class WheelLayout:
             return "TOO MANY"
         if not target.startswith(("http://", "https://")) and not Path(target).exists():
             return "BAD LINK"
-        if any(t == target for _l, t in self.custom):
+        cid = custom_callback(target)
+        if any(t == target or custom_callback(t) == cid for _l, t in self.custom) or cid in {o.callback_id for o in EXTRA_SLICES}:
             return "EXISTS"
         self.custom.append((label, target))
         return "ADDED"
@@ -152,6 +163,7 @@ class ToolWheel(RadialDropWheel):
         self,
         *,
         on_selected: Callable[[ToolWheelOption], None],
+        on_dismiss: Callable[[], None] | None = None,
         always_on_top: bool = True,
         parent: QWidget | None = None,
     ) -> None:
@@ -161,9 +173,15 @@ class ToolWheel(RadialDropWheel):
             parent=parent,
         )
         self._on_selected = on_selected
+        self._on_dismiss = on_dismiss
         self._button_up_ticks = 0
         self.setAcceptDrops(False)
         self.setWindowTitle("Paperduck Tool Wheel")
+
+    def dismiss(self) -> None:
+        super().dismiss()
+        if self._on_dismiss is not None:
+            self._on_dismiss()
 
     def open_tools(
         self,

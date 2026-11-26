@@ -158,6 +158,8 @@ class ToolsMixin:
     def _on_update_done(self, job: UpdateJob | None, status: str, tag: str, install: bool) -> None:
         if job in self._update_jobs:
             self._update_jobs.remove(job)
+        if job is not None:
+            job.deleteLater()
         if status == "installed":
             # A frozen build is only staged: the swap after restart can still fail, and the old build then says so
             self._show_toast("RESTARTING" if FROZEN else "UPDATED", QColor("#38B764"))
@@ -355,10 +357,18 @@ class ToolsMixin:
         )
         return options
 
+    def _on_tool_wheel_dismissed(self) -> None:
+        self._wheel_holding = False
+        self._press_global_pos = None
+        self._last_drag_global_pos = None
+        self._drag_offset = None
+        self._did_drag = False
+
     def open_tool_wheel(self, global_cursor: QPoint | None = None) -> ToolWheel:
         if self._tool_wheel is None:
             self._tool_wheel = ToolWheel(
                 on_selected=self._on_tool_wheel_selected,
+                on_dismiss=self._on_tool_wheel_dismissed,
                 always_on_top=self._always_on_top,
             )
         sprite_global = self.mapToGlobal(self.sprite_center_point())
@@ -451,8 +461,9 @@ class ToolsMixin:
         if mode == "watch":  # Alt+` or Ctrl+Shift+Alt+W: Watch lens on the screen now
             self.watch_now()
             return
-        if self._snip_session is not None:
+        if self._snip_session is not None or getattr(self, "_snip_pending", False):
             return
+        self._snip_pending = True
         if mode == "ask" and self._ai_chat is not None:
             self._ai_chat.hide()  # keep the bar out of the frozen grab
         # Hide Paperduck and let the context menu fade so neither lands in the frozen grab
@@ -460,10 +471,10 @@ class ToolsMixin:
         QTimer.singleShot(180, lambda: self._begin_snip(mode))
 
     def _begin_snip(self, mode: str) -> None:
+        self._snip_pending = False
         if self._is_shutting_down:
             return
         if self._snip_session is not None:  # a macro's region snip opened during the 180ms hide delay
-            show_quietly(self)
             return
         self._snip_session = SnipSession(mode, self._on_snip_result)
 

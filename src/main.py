@@ -145,7 +145,9 @@ class PaperduckApp:
             repair_autostart()  # copies updated in place may hold a Run value for a launcher they never received
             if is_installed():
                 # One quiet check per launch; installing waits for Settings > Check for Updates
-                QTimer.singleShot(20_000, lambda: self.window.check_for_updates(install=False))
+                QTimer.singleShot(20_000, lambda: (
+                    self.window.check_for_updates(install=False) if not self._is_shut_down else None
+                ))
 
         self._app.aboutToQuit.connect(self.shutdown)
         self._app.commitDataRequest.connect(lambda _mgr: self.save_state())
@@ -246,6 +248,19 @@ class PaperduckApp:
         self.save_state()
         self.window.shutdown()
         self.state_machine.shutdown()
+        try:
+            from src.tools import warm_ps
+            warm_ps.close_all()
+        except Exception:
+            pass
+        global _crash_file
+        if _crash_file is not None:
+            try:
+                faulthandler.disable()
+                _crash_file.close()
+            except OSError:
+                pass
+            _crash_file = None
 
         if self.tray_icon is not None:
             self.tray_icon.hide()
@@ -300,9 +315,11 @@ def prune_crash_log(path: Path) -> None:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return
+    if len(text) > 512 * 1024:
+        text = text[-256 * 1024:]
     blocks = _CRASH_BLOCK.split(text)
     kept = [b for b in blocks if not _HANDLED_CODE.match(b)]
-    if len(kept) != len(blocks):
+    if len(kept) != len(blocks) or len(text) > 256 * 1024:
         try:
             path.write_text("".join(kept), encoding="utf-8")
         except OSError:
@@ -392,8 +409,17 @@ def main(argv: list[str] | None = None) -> int:
             storage_override = StorageManager(Path(args[idx + 1]))
 
     controller = PaperduckApp(app=app, storage=storage_override)
-    install_crash_guard(lambda: (controller.window._react("#E05A47"),
-                                 controller.window._show_toast("OOPS", QColor("#E05A47"))))
+    last_toast = [0.0]
+
+    def _on_unhandled() -> None:
+        now = time.monotonic()
+        if now - last_toast[0] < 1.0:
+            return
+        last_toast[0] = now
+        controller.window._react("#E05A47")
+        controller.window._show_toast("OOPS", QColor("#E05A47"))
+
+    install_crash_guard(_on_unhandled)
 
     # Allow graceful Ctrl+C exit when launched from a terminal
     signal.signal(signal.SIGINT, lambda *_sig: controller.quit())

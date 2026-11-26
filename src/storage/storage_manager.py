@@ -70,7 +70,13 @@ def autostart_enabled() -> bool:
 def stale_autostart(value: str, root: Path, command: str) -> bool:
     """A Run value for this copy (it names `root`) that differs from today's command: the old inline -c form, or
     the root paperduck.pyw that updated copies never received. Another copy's value is never this copy's to fix."""
-    return str(root).lower() in value.lower() and value != command
+    root_low = str(root).lower().rstrip("\\/")
+    val_low = value.lower()
+    idx = val_low.find(root_low)
+    if idx < 0:
+        return False
+    after = val_low[idx + len(root_low):idx + len(root_low) + 1]
+    return after in ("", "\\", "/", '"', "'", " ") and value != command
 
 
 def repair_autostart() -> bool:
@@ -188,7 +194,7 @@ class StorageManager:
         raw_state = payload.get("state")
         try:
             state = PetState(raw_state)
-        except ValueError:
+        except (ValueError, TypeError):
             state = PetState.IDLE
 
         window_raw = payload.get("window")

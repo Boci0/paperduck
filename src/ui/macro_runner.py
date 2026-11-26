@@ -75,15 +75,17 @@ class MacroRunner:
 
     def _do_region(self, _arg: str) -> None:
         def begin() -> None:
+            if self._win._is_shutting_down:
+                return
             if self._win._snip_session is not None:  # a plain snip is already open: never stack overlays
-                self._win.show()
+                show_quietly(self._win)
                 self._stop("BUSY")
                 return
             self._win._snip_session = SnipSession("image", done)
 
         def done(_mode: str, result: object | None) -> None:
             self._win._snip_session = None
-            self._win.show()
+            show_quietly(self._win)
             if not isinstance(result, QImage):
                 self._stop("CANCEL")
                 return
@@ -94,9 +96,11 @@ class MacroRunner:
 
     def _do_screen(self, _arg: str) -> None:
         def grab() -> None:
+            if self._win._is_shutting_down:
+                return
             screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
             self._image = screen.grabWindow(0).toImage() if screen is not None else None
-            self._win.show()
+            show_quietly(self._win)
             if self._image is None or self._image.isNull():
                 self._stop("NO SCREEN")
                 return
@@ -128,7 +132,7 @@ class MacroRunner:
         self._next()
 
     def _do_quick(self, _arg: str) -> None:
-        self._win.open_quick_bar()
+        self._win.open_quick_bar(toggle=False)
         bar = getattr(self._win, "_quick_bar", None)
         words = self._words(" ")
         if bar is not None and words:

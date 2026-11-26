@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from src.tools import login_vault
 from src.tools.ai_sessions import _clean as _clean_secrets
+from src.tools.hints import PRIVATE_APPS
 from src.tools.watch import _ERROR_TEXT, _URL, _looks_like_code, is_private_title
 
 MAX_EVENTS = 40
@@ -33,6 +34,7 @@ class AmbientEvent:
 
 def _classify_clipboard(text: str) -> tuple[str, str]:
     """Return (kind_tag, scrubbed_single_line_preview) without keeping raw secrets."""
+    text = text[:2048]
     single = " ".join(_clean_secrets(text).split())
     if len(single) > 80:
         single = single[:77] + "..."
@@ -66,7 +68,7 @@ class AmbientRing:
         clean_title = " ".join((title or "").split())[:120]
         if not clean_title or clean_title.lower() in _IGNORED_TITLES:
             return False
-        if is_private_title(clean_title) or login_vault.typed_password_shown():
+        if clean_app.lower() in PRIVATE_APPS or is_private_title(clean_title) or login_vault.typed_password_shown():
             return False
         with self._lock:
             if self._events:
@@ -82,9 +84,10 @@ class AmbientRing:
 
     def record_clipboard(self, text: str, app: str = "", private: bool = False, now: float | None = None) -> bool:
         now = time.time() if now is None else now
-        if private or not text or not text.strip() or login_vault.typed_password_shown():
+        if (private or (app or "").strip().lower() in PRIVATE_APPS
+                or not text or not text.strip() or login_vault.typed_password_shown()):
             return False
-        tag, preview = _classify_clipboard(text)
+        tag, preview = _classify_clipboard(text[:2048])
         if not preview:
             return False
         with self._lock:

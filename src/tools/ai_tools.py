@@ -927,8 +927,9 @@ def run_file_tool(root: Path | None, name: str, args: dict[str, Any], secrets: b
                 return f"{folder.name} is a file ({folder.stat().st_size} bytes), not a folder; use read_file on it"
             if not folder.is_dir():
                 return "error: not a folder"
-            entries = sorted(folder.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-            rows = [f"{p.name}/" if p.is_dir() else f"{p.name}  ({p.stat().st_size} bytes)" for p in entries[:MAX_LISTED]]
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: (not e.is_dir(), e.name.lower()))
+            rows = [f"{e.name}/" if e.is_dir() else f"{e.name}  ({e.stat().st_size} bytes)" for e in entries[:MAX_LISTED]]
             if len(entries) > MAX_LISTED:
                 rows.append(f"... {len(entries) - MAX_LISTED} more; use find_files with a pattern to see them")
             return f"{_rel(base, folder)}:\n" + ("\n".join(rows) or "(empty)")
@@ -2027,7 +2028,7 @@ def python_file(script: Any, exe: str | None = None) -> tuple[Path, str]:
     path = scratch_dir() / f"py_{uuid.uuid4().hex[:10]}.py"
     path.write_text("\n".join(script.splitlines()) + "\n", encoding="utf-8", newline="\n")
     interp = exe or python_exe()
-    return path, f'"{interp}" "{path}"'
+    return path, f'call "{interp}" "{path}"'
 
 
 def python_error_note(out: str, script: str, file_name: str, saved_path: Path | None = None) -> str:
@@ -2514,8 +2515,10 @@ def parse_skill(text: str) -> tuple[dict[str, str], str]:
 
 RECHECK_S = 5.0  # an edited SKILL.md is seen within this; an added or removed folder at once
 # root -> (checked at, the folder's mtime, {name: (SKILL.md mtime, (description, body start))})
+_SKILL_LOCK = threading.Lock()
 _INDEX: dict[Path, tuple[float, int, dict[str, tuple[int, tuple[str, str]]]]] = {}
 _RECALL: dict[tuple[Path, str], str] = {}
+_ALL_SKILLS_CACHE: dict[Path, tuple[int, dict[str, tuple[str, str]]]] = {}
 
 
 def skill_index(root: Path) -> dict[str, tuple[str, str]]:
@@ -2526,32 +2529,34 @@ def skill_index(root: Path) -> dict[str, tuple[str, str]]:
         mtime = root.stat().st_mtime_ns
     except OSError:
         return {}
-    cached = _INDEX.get(root)
-    if cached and cached[1] == mtime and time.monotonic() - cached[0] < RECHECK_S:
-        return {name: entry for name, (_stamp, entry) in cached[2].items()}
-    old = cached[2] if cached else {}
-    try:
-        folders = sorted(p for p in root.iterdir() if p.is_dir() and _SKILL_NAME.match(p.name))
-    except OSError:
-        return {}
-    fresh: dict[str, tuple[int, tuple[str, str]]] = {}
-    for folder in folders:
+    with _SKILL_LOCK:
+        cached = _INDEX.get(root)
+        if cached and cached[1] == mtime and time.monotonic() - cached[0] < RECHECK_S:
+            return {name: entry for name, (_stamp, entry) in cached[2].items()}
+        old = cached[2] if cached else {}
         try:
-            stamp = (folder / "SKILL.md").stat().st_mtime_ns
-            if folder.name in old and old[folder.name][0] == stamp:
-                fresh[folder.name] = old[folder.name]
-            else:
-                meta, body = parse_skill((folder / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
-                fresh[folder.name] = (stamp, (" ".join(meta.get("description", "").split())[:MAX_SKILL_DESC],
-                                              body[:SEARCH_CHARS]))
+            folders = sorted(p for p in root.iterdir() if p.is_dir() and _SKILL_NAME.match(p.name))
         except OSError:
-            continue
-        if len(fresh) >= MAX_SKILLS:
-            break
-    if fresh != old:
-        _RECALL.clear()
-    _INDEX[root] = (time.monotonic(), mtime, fresh)
-    return {name: entry for name, (_stamp, entry) in fresh.items()}
+            return {}
+        fresh: dict[str, tuple[int, tuple[str, str]]] = {}
+        for folder in folders:
+            try:
+                stamp = (folder / "SKILL.md").stat().st_mtime_ns
+                if folder.name in old and old[folder.name][0] == stamp:
+                    fresh[folder.name] = old[folder.name]
+                else:
+                    meta, body = parse_skill((folder / "SKILL.md").read_text("utf-8", "replace")[:MAX_SKILL_CHARS])
+                    fresh[folder.name] = (stamp, (" ".join(meta.get("description", "").split())[:MAX_SKILL_DESC],
+                                                  body[:SEARCH_CHARS]))
+            except OSError:
+                continue
+            if len(fresh) >= MAX_SKILLS:
+                break
+        if fresh != old:
+            _RECALL.clear()
+            _ALL_SKILLS_CACHE.pop(root, None)
+        _INDEX[root] = (time.monotonic(), mtime, fresh)
+        return {name: entry for name, (_stamp, entry) in fresh.items()}
 
 
 def list_skills(root: Path) -> list[tuple[str, str]]:
@@ -2653,14 +2658,20 @@ def skills_recall(root: Path, message: str) -> str:
     (3 points: a name word, or two description words), so small talk gets no note."""
     if len(_all_skills(root)) <= LIST_IN_FULL:
         return ""
-    if (root, message) not in _RECALL:  # the same message always gets the same note, so the prompt cache holds
+    key = (root, message[:2000])
+    with _SKILL_LOCK:
+        cached = _RECALL.get(key)
+    if cached is not None:
+        return cached
+    found = rank_skills(root, key[1], RECALL_TOP, head_min=3)
+    note = ("\n\n[Paperduck: skills that may fit this message: " + "; ".join(
+        f"{name} ({desc or 'no description'})" for name, desc in found)
+        + ". load_skill one only if it fits.]" if found else "")
+    with _SKILL_LOCK:
         if len(_RECALL) > 500:
             _RECALL.clear()
-        found = rank_skills(root, message[:2000], RECALL_TOP, head_min=3)
-        _RECALL[(root, message)] = ("\n\n[Paperduck: skills that may fit this message: " + "; ".join(
-            f"{name} ({desc or 'no description'})" for name, desc in found)
-            + ". load_skill one only if it fits.]" if found else "")
-    return _RECALL[(root, message)]
+        _RECALL[key] = note
+    return note
 
 
 def skill_text(description: str, instructions: str) -> str:
@@ -3113,13 +3124,19 @@ def query_files(root: Path | None, args: dict[str, Any]) -> str:
     if isinstance(raw_paths, list) and raw_paths:
         for p in raw_paths[:MAX_EDITS]:
             if isinstance(p, str) and p.strip():
-                resolved = resolve(root, p)
+                try:
+                    resolved = resolve(root, p)
+                except (OSError, ValueError) as exc:
+                    return f"error: {exc}"
                 if is_secret(resolved):
                     return f"error: secret file refused ({resolved.name})"
                 if resolved.is_file():
                     targets.append(resolved)
     elif isinstance(args.get("pattern"), str) and args["pattern"].strip():
-        base = resolve(root, args.get("path"))
+        try:
+            base = resolve(root, args.get("path"))
+        except (OSError, ValueError) as exc:
+            return f"error: {exc}"
         want = args["pattern"].strip().lower().replace("\\", "/")
         for p in _walk(base):
             if is_secret(p):
@@ -3142,6 +3159,8 @@ def query_files(root: Path | None, args: dict[str, Any]) -> str:
             return f"error: bad where expression ({exc.msg})"
     records: list[dict[str, Any]] = []
     for t in targets:
+        if len(records) >= 50000:
+            break
         try:
             rows = _load_records(t, fmt)
         except (OSError, ValueError) as exc:

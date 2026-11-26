@@ -93,12 +93,13 @@ class AiMixin:
             self.open_ai_chat()
         return self._ai_chat
 
-    def open_quick_bar(self) -> None:
-        """Toggle the cursor-anchored 1-line Quick Command Bar with ambient context."""
+    def open_quick_bar(self, *, toggle: bool = True) -> None:
+        """Toggle (or open if `toggle=False`) the cursor-anchored 1-line Quick Command Bar with ambient context."""
         bar = getattr(self, "_quick_bar", None)
         if bar is not None and bar.isVisible():
-            bar.hide()
-            return
+            if toggle:
+                bar.hide()
+                return
         if bar is None:
             bar = QuickCommandBar()
             bar.submitted.connect(self._submit_quick_prompt)
@@ -185,7 +186,7 @@ class AiMixin:
         if self._ai_chat is None:
             self._prebuild_ai_chat()  # a next_startup errand can fire before the chat is built
         chat = self._ai_chat
-        if chat is None or chat._job is not None or (self._hint is not None and self._hint.rule == "errand_ready"):
+        if chat is None or chat._job is not None or not chat._ready() or (self._hint is not None and self._hint.rule == "errand_ready"):
             return
         errand, _evidence = errands.fired[0]
         procs = getattr(chat._tool_host, "procs", None)
@@ -201,7 +202,11 @@ class AiMixin:
                 or getattr(self, "_routine_job", None) is not None):
             return
         errand, evidence = errands.fired.pop(0)
-        if not errands.take_run():
+        charged: set[str] = getattr(self, "_errand_charged", None) or set()
+        self._errand_charged = charged
+        if errand.id in charged:
+            charged.discard(errand.id)
+        elif not errands.take_run():
             chat.add_note(f"Errand {errand.id} fired, but today's {MAX_ERRAND_RUNS} errand runs are used up.")
             self._show_toast("ERRAND CAP", QColor("#EF7D57"))
             return
@@ -228,6 +233,7 @@ class AiMixin:
                     return
                 merged = f"{evidence}\n\nCompiled script output:\n{out}"
                 if chat._job is not None:
+                    self._errand_charged.add(errand.id)
                     errands.fired.insert(0, (replace(errand, script=""), merged))
                     return
                 if chat.run_errand(errand, merged):

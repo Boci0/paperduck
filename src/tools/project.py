@@ -69,7 +69,8 @@ class ProjectPlugin:
         self._status: GitStatus | None = None
         self._error: str = ""
         self._proc: subprocess.Popen[bytes] | None = None
-        self._out: Any = None  # temp file holding the running git call's stdout
+        self._out: Any = None
+        self._code_exe: str | None = shutil.which("code")  # temp file holding the running git call's stdout
         self._next_run: float = 0.0
         self._git = shutil.which("git")
         self._notice: tuple[str, str] | None = None
@@ -115,10 +116,16 @@ class ProjectPlugin:
         if self._proc is not None:
             try:
                 self._proc.kill()
-            except OSError:
+                self._proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
             self._proc = None
-            self._out.close()
+            if self._out is not None:
+                try:
+                    self._out.close()
+                except OSError:
+                    pass
+                self._out = None
 
     def tick(self) -> bool:
         # Popen + poll keeps the UI thread free; git output is collected on a later tick
@@ -138,17 +145,30 @@ class ProjectPlugin:
             return True
         if self._repo is None or self._git is None or time.monotonic() < self._next_run:
             return False
+        if not self._repo.is_dir() or not (self._repo / ".git").exists():
+            self._next_run = time.monotonic() + self.REFRESH_SECONDS
+            if self._status is not None or not self._error:
+                self._status, self._error = None, "Not a git repo"
+                return True
+            return False
         self._next_run = time.monotonic() + self.REFRESH_SECONDS
+        out = None
         try:
-            self._out = tempfile.TemporaryFile()
+            out = tempfile.TemporaryFile()
             self._proc = subprocess.Popen(
                 [self._git, "-C", str(self._repo), "status", "--porcelain=v2", "--branch"],
                 # A temp file, not a PIPE: polled-but-unread pipes fill at 4 KB on Windows and git blocks forever
-                stdout=self._out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                 creationflags=_NO_WINDOW,
             )
+            self._out = out
         except OSError:
-            self._out.close()
+            if out is not None:
+                try:
+                    out.close()
+                except OSError:
+                    pass
+            self._status = None
             self._error = "git failed to start"
             return True
         return False
@@ -194,7 +214,7 @@ class ProjectPlugin:
         has_repo = self._repo is not None
         items = [
             ToolMenuItem(label="Open in VS Code", callback_id="project:code",
-                         enabled=has_repo and shutil.which("code") is not None, submenu=sub),
+                         enabled=has_repo and self._code_exe is not None, submenu=sub),
             ToolMenuItem(label="Open Terminal Here", callback_id="project:terminal", enabled=has_repo, submenu=sub),
             ToolMenuItem(label="Open in Explorer", callback_id="project:explorer", enabled=has_repo, submenu=sub),
             ToolMenuItem(label="Copy Branch Name", callback_id="project:branch",

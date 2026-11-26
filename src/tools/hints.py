@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -81,21 +82,30 @@ def suggest(app: str, clip: str, dwell_s: float, pomodoro_idle: bool) -> Suggest
     return None
 
 
+_APP_CACHE: tuple[int, str] = (0, "")
+_POWRPROF: Any = None
+_PASSWORD_LOCK = threading.Lock()
+
+
 def foreground_app() -> str:
     """Exe name of the foreground window ('' for none, Paperduck itself, or off Windows)."""
+    global _APP_CACHE
     if sys.platform != "win32":
         return ""
     user32 = ctypes.windll.user32
     user32.GetForegroundWindow.restype = wintypes.HWND
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    hwnd = user32.GetForegroundWindow()
+    hwnd = int(user32.GetForegroundWindow() or 0)
     if not hwnd:
         return ""
+    cached_hwnd, cached_app = _APP_CACHE
+    if hwnd == cached_hwnd:
+        return cached_app
     pid = wintypes.DWORD(0)
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    if pid.value in (0, os.getpid()):
-        return ""
-    return process_name(pid.value)
+    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    app = "" if pid.value in (0, os.getpid()) else process_name(pid.value)
+    _APP_CACHE = (hwnd, app)
+    return app
 
 
 class _LastInputInfo(ctypes.Structure):
@@ -115,11 +125,14 @@ def idle_seconds() -> float:
 
 def display_kept_on() -> bool:
     """True while any app asks Windows to keep the display on (video players, presentations, calls)."""
+    global _POWRPROF
     if sys.platform != "win32":
         return False
+    if _POWRPROF is None:
+        _POWRPROF = ctypes.WinDLL("powrprof")
     state = ctypes.c_ulong(0)
     # 16 = SystemExecutionState: the system-wide OR of every process's SetThreadExecutionState request
-    if ctypes.WinDLL("powrprof").CallNtPowerInformation(16, None, 0, ctypes.byref(state), ctypes.sizeof(state)):
+    if _POWRPROF.CallNtPowerInformation(16, None, 0, ctypes.byref(state), ctypes.sizeof(state)):
         return False
     return bool(state.value & 0x2)  # ES_DISPLAY_REQUIRED
 
@@ -163,11 +176,13 @@ def foreground_has_password_field() -> bool:
     if not hwnd:
         return False
     title = foreground_title()
-    h, t, at, found = _password_seen
-    if h == hwnd and t == title and time.monotonic() - at < PASSWORD_RECHECK_S:
-        return found
+    with _PASSWORD_LOCK:
+        h, t, at, found = _password_seen
+        if h == hwnd and t == title and time.monotonic() - at < PASSWORD_RECHECK_S:
+            return found
     found = (warm_ps.run("password", _PASSWORD_PS, {"Hwnd": hwnd}, 3.0) or "").strip() == "1"
-    _password_seen = (hwnd, title, time.monotonic(), found)
+    with _PASSWORD_LOCK:
+        _password_seen = (hwnd, title, time.monotonic(), found)
     return found
 
 
@@ -258,6 +273,8 @@ class HintsPlugin:
         if gate is None or (not gate.data and (gate.lens, title) in self._offered):
             return None
         if not gate.data:
+            if len(self._offered) >= 500:
+                self._offered.clear()
             self._offered.add((gate.lens, title))
         return Suggestion(f"watch_{gate.lens}", gate.text, f"watch:{gate.lens}", gate.data)
 

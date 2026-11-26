@@ -58,8 +58,10 @@ def create_checkpoint(root: Path | None) -> TaskCheckpoint | None:
     rc, head, _ = _git(repo, "rev-parse", "HEAD")
     if rc != 0 or not head:
         return None
-    rc, untracked_raw, _ = _git(repo, "ls-files", "--others", "--exclude-standard")
-    untracked = tuple(ln for ln in untracked_raw.splitlines() if ln.strip()) if rc == 0 else ()
+    rc, untracked_raw, _ = _git(repo, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z")
+    if rc != 0:
+        return None
+    untracked = tuple(p for p in untracked_raw.split("\0") if p)
     rc, stash_ref, _ = _git(repo, "stash", "create")
     return TaskCheckpoint(
         id=uuid.uuid4().hex[:8],
@@ -73,20 +75,20 @@ def create_checkpoint(root: Path | None) -> TaskCheckpoint | None:
 
 def revert_checkpoint(cp: TaskCheckpoint) -> str:
     """Restore tracked files to pre-task state and remove only untracked files created after the checkpoint."""
-    rc, _, err = _git(cp.root, "checkout", "--", ".")
+    rc, _, err = _git(cp.root, "reset", "--hard", cp.head)
     if rc != 0:
-        return f"error: git checkout failed: {err or 'unknown error'}"
-    rc, now_untracked, _ = _git(cp.root, "ls-files", "--others", "--exclude-standard")
+        return f"error: git reset failed: {err or 'unknown error'}"
+    rc, now_untracked, _ = _git(cp.root, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z")
     before = set(cp.untracked_before)
     removed = 0
     if rc == 0:
-        for rel in now_untracked.splitlines():
-            rel = rel.strip()
+        root_resolved = cp.root.resolve()
+        for rel in now_untracked.split("\0"):
             if not rel or rel in before:
                 continue
             target = (cp.root / rel).resolve()
             try:
-                if target.is_relative_to(cp.root.resolve()) and target.is_file():
+                if target.is_relative_to(root_resolved) and target.is_file():
                     target.unlink()
                     removed += 1
             except OSError:

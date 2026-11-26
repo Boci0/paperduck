@@ -561,10 +561,23 @@ def summary_turns(summary: str, archive: str = "", tasks: list[tuple[str, str]] 
 
 def compact_split(history: list[dict[str, Any]]) -> int:
     """How many oldest turns to summarize: all but the newest KEEP_TURNS, cut before a user turn (0: nothing)."""
+    head = 2 if history and str(history[0].get("content", "")).startswith(COMPACT_PREFIX) else 0
     split = len(history) - KEEP_TURNS
-    while split > 0 and history[split]["role"] != "user":
+    while split > head and history[split]["role"] != "user":
         split -= 1
-    return split if split >= 2 else 0
+    return split if split >= head + 2 else 0
+
+
+def _compact_messages(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Minimal user/assistant messages for summarization without heavy system prompts or image payloads."""
+    out: list[dict[str, Any]] = []
+    for turn in turns:
+        role = turn.get("role", "user")
+        content = str(turn.get("content", "") or "")
+        if not content:
+            continue
+        out.append({"role": role if role in ("user", "assistant") else "user", "content": content[:24000]})
+    return out
 
 
 def compact_history(base_url: str, key: str, model: str, history: list[dict[str, Any]],
@@ -576,12 +589,19 @@ def compact_history(base_url: str, key: str, model: str, history: list[dict[str,
     split = compact_split(history)
     if not split:
         return history, 0, ""
-    try:
-        summary = ask(base_url, key, model, [*chat_messages(history[:split]), {"role": "user", "content": COMPACT_PROMPT}],
-                      web=False, cancel=cancel).text.strip()
-    except ValueError:
-        _check(cancel)  # Stop during the summary stops the answer too
-        return history, 0, ""
+    head = 2 if history and str(history[0].get("content", "")).startswith(COMPACT_PREFIX) else 0
+    summary = ""
+    for end in (split, max(head + 2, split // 2)):
+        try:
+            summary = ask(base_url, key, model, [*_compact_messages(history[:end]), {"role": "user", "content": COMPACT_PROMPT}],
+                          web=False, cancel=cancel).text.strip()
+            split = end
+            break
+        except ValueError as exc:
+            _check(cancel)  # Stop during the summary stops the answer too
+            if "too long" in str(exc) and end > head + 2:
+                continue
+            return history, 0, ""
     if not summary:
         return history, 0, ""
     saved = archive(history[:split]) if archive is not None else None
@@ -889,6 +909,7 @@ def _read_stream(resp: Any, progress: Callable[[str], None]) -> dict[str, Any]:
     model = usage = finish = None
     written = thinking = wire = 0  # characters kept so far, bytes read
     deadline = time.monotonic() + MAX_STREAM_S
+    last_text_at = 0.0
     ended = False
     for raw_line in _stream_lines(resp):
         wire += len(raw_line)
@@ -958,12 +979,17 @@ def _read_stream(resp: Any, progress: Callable[[str], None]) -> dict[str, Any]:
             progress("Preparing " + (next(iter(calls.values()))["function"]["name"] or "a tool"))
         elif spoke:
             if (on_text := getattr(progress, "on_text", None)) is not None:
-                on_text("".join(text))
+                now = time.monotonic()
+                if now - last_text_at >= 0.06:
+                    last_text_at = now
+                    on_text("".join(text))
             progress(f"Writing, {written} characters")
         elif thought:
             progress(f"Thinking, {thinking} characters")
     if not ended and finish is None:  # the link closed mid-reply: half a tool call or answer is not a reply
         raise _Transient("network")
+    if text and (on_text := getattr(progress, "on_text", None)) is not None:
+        on_text("".join(text))
     message: dict[str, Any] = {"role": "assistant", "content": "".join(text) or (None if calls else "")}
     if thought:
         message["reasoning_content"] = "".join(thought)
@@ -993,8 +1019,18 @@ def _read_anthropic_stream(resp: Any, progress: Callable[[str], None]) -> dict[s
     done = False
     written = thinking = wire = spoke = 0  # `written` counts everything kept, `spoke` only answer text
     deadline = time.monotonic() + MAX_STREAM_S
+    last_text_at = 0.0
+    text_bufs: dict[int, list[str]] = {}
+    think_bufs: dict[int, list[str]] = {}
+    sig_bufs: dict[int, list[str]] = {}
 
     def finish(index: int) -> None:
+        if index in text_bufs and index in blocks:
+            blocks[index]["text"] = "".join(text_bufs.pop(index))
+        if index in think_bufs and index in blocks:
+            blocks[index]["thinking"] = "".join(think_bufs.pop(index))
+        if index in sig_bufs and index in blocks:
+            blocks[index]["signature"] = "".join(sig_bufs.pop(index))
         parts = json_bufs.pop(index, None)
         if parts is not None and index in blocks:
             try:
@@ -1049,18 +1085,22 @@ def _read_anthropic_stream(resp: Any, progress: Callable[[str], None]) -> dict[s
             block, delta = blocks[index], event["delta"]
             kind2 = delta.get("type")
             if kind2 == "text_delta" and isinstance(delta.get("text"), str):
-                block["text"] = block.get("text", "") + delta["text"]
+                text_bufs.setdefault(index, [block.get("text", "")] if block.get("text") else []).append(delta["text"])
                 written += len(delta["text"])
                 spoke += len(delta["text"])
                 if (on_text := getattr(progress, "on_text", None)) is not None:
-                    on_text("".join(b.get("text", "") for b in blocks.values() if b.get("type") == "text"))
+                    now = time.monotonic()
+                    if now - last_text_at >= 0.06:
+                        last_text_at = now
+                        on_text("".join("".join(text_bufs[i]) if i in text_bufs else b.get("text", "")
+                                        for i, b in blocks.items() if b.get("type") == "text"))
                 progress(f"Writing, {spoke} characters")
             elif kind2 == "thinking_delta" and isinstance(delta.get("thinking"), str):
-                block["thinking"] = block.get("thinking", "") + delta["thinking"]
+                think_bufs.setdefault(index, [block.get("thinking", "")] if block.get("thinking") else []).append(delta["thinking"])
                 thinking += len(delta["thinking"])
                 progress(f"Thinking, {thinking} characters")
             elif kind2 == "signature_delta" and isinstance(delta.get("signature"), str):
-                block["signature"] = block.get("signature", "") + delta["signature"]
+                sig_bufs.setdefault(index, [block.get("signature", "")] if block.get("signature") else []).append(delta["signature"])
             elif kind2 == "input_json_delta" and isinstance(delta.get("partial_json"), str) and index in json_bufs:
                 json_bufs[index].append(delta["partial_json"])
                 written += len(delta["partial_json"])
@@ -1072,8 +1112,11 @@ def _read_anthropic_stream(resp: Any, progress: Callable[[str], None]) -> dict[s
             raise ValueError("reply too large")
     if not done:
         raise _Transient("network")
-    for index in list(json_bufs):
+    for index in list(set(json_bufs) | set(text_bufs) | set(think_bufs) | set(sig_bufs)):
         finish(index)
+    if text_bufs or any(b.get("type") == "text" and b.get("text") for b in blocks.values()):
+        if (on_text := getattr(progress, "on_text", None)) is not None:
+            on_text("".join(b.get("text", "") for b in blocks.values() if b.get("type") == "text"))
     return {"model": message.get("model"), "content": [blocks[i] for i in sorted(blocks)], "usage": usage,
             "stop_reason": stop, "bad_input": bad}
 

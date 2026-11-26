@@ -234,6 +234,20 @@ def _pins(text: str) -> set[str]:
     return {f"{re.sub(r'[-_.]+', '-', m[1]).lower()}=={m[2]}" for m in found if m}
 
 
+_UPDATE_LOCK = threading.Lock()
+
+
+def _rename_with_retry(src: Path, dst: Path) -> None:
+    for attempt in range(12):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError:
+            if attempt == 11:
+                raise
+            time.sleep(0.25)
+
+
 def install_source_zip(data: bytes, app_dir: Path = APP_DIR) -> None:
     """Swap `app_dir/src` for the `src/` folder inside a verified release bundle.
 
@@ -274,7 +288,7 @@ def install_source_zip(data: bytes, app_dir: Path = APP_DIR) -> None:
     try:
         new_dir.rename(app_dir / "src")
     except OSError:
-        old_dir.rename(app_dir / "src")  # e.g. antivirus still scanning src.new: keep the old code, not none
+        _rename_with_retry(old_dir, app_dir / "src")  # e.g. antivirus still scanning src.new: keep the old code, not none
         raise
     shutil.rmtree(old_dir, ignore_errors=True)
     if wanted is not None:
@@ -372,7 +386,7 @@ def finish_frozen_update(old_pid: int, new_dir: Path = APP_DIR,
             raise OSError("the new build does not start")
     except OSError:
         shutil.rmtree(app_dir, ignore_errors=True)
-        old_dir.rename(app_dir)
+        _rename_with_retry(old_dir, app_dir)
         raise
     return app_dir
 
@@ -399,28 +413,29 @@ class UpdateJob(QObject):
 
     def _run(self, install: bool) -> None:
         tag = ""
-        try:
-            tag, zip_url, sig_url = latest_release()
-            if not is_newer(tag):
-                shutil.rmtree(APP_DIR.parent / CACHE_NAME, ignore_errors=True)  # the cached update is installed
-                emit_later(self, "finished", "current", tag)
-                return
-            if not is_installed():
-                emit_later(self, "finished", "available", tag)
-                return
-            if not install:  # the quiet startup check: fetch it now, at whatever speed GitHub gives
-                try:
-                    _bundle(tag, zip_url, sig_url)
-                except (OSError, ValueError, zipfile.BadZipFile, http.client.HTTPException) as exc:
-                    logger.warning("prefetching update %s failed: %s: %s", tag, type(exc).__name__, exc)
-                    emit_later(self, "finished", "available", tag)  # still say it exists; installing retries and explains
+        with _UPDATE_LOCK:
+            try:
+                tag, zip_url, sig_url = latest_release()
+                if not is_newer(tag):
+                    shutil.rmtree(APP_DIR.parent / CACHE_NAME, ignore_errors=True)  # the cached update is installed
+                    emit_later(self, "finished", "current", tag)
                     return
-                emit_later(self, "finished", "ready", tag)
+                if not is_installed():
+                    emit_later(self, "finished", "available", tag)
+                    return
+                if not install:  # the quiet startup check: fetch it now, at whatever speed GitHub gives
+                    try:
+                        _bundle(tag, zip_url, sig_url)
+                    except (OSError, ValueError, TypeError, zipfile.BadZipFile, http.client.HTTPException) as exc:
+                        logger.warning("prefetching update %s failed: %s: %s", tag, type(exc).__name__, exc)
+                        emit_later(self, "finished", "available", tag)  # still say it exists; installing retries and explains
+                        return
+                    emit_later(self, "finished", "ready", tag)
+                    return
+                apply = install_frozen_zip if FROZEN else install_source_zip
+                apply(_bundle(tag, zip_url, sig_url, lambda pct: emit_later(self, "progress", pct)))
+            except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, http.client.HTTPException) as exc:
+                logger.warning("update %s failed: %s: %s", tag or "check", type(exc).__name__, exc)
+                emit_later(self, "finished", "error", str(exc) or tag)
                 return
-            apply = install_frozen_zip if FROZEN else install_source_zip
-            apply(_bundle(tag, zip_url, sig_url, lambda pct: emit_later(self, "progress", pct)))
-        except (OSError, ValueError, KeyError, zipfile.BadZipFile, http.client.HTTPException) as exc:
-            logger.warning("update %s failed: %s: %s", tag or "check", type(exc).__name__, exc)
-            emit_later(self, "finished", "error", str(exc) or tag)
-            return
-        emit_later(self, "finished", "installed", tag)
+            emit_later(self, "finished", "installed", tag)

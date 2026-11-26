@@ -526,7 +526,7 @@ def _prepare_attachment(item: RemoteAttachment) -> tuple[Attachment | None, str]
         detail = f"{_size_text(len(item.data))}, {lines} lines"
         if len(extracted) <= INLINE_FILE_CHARS:
             return Attachment("file", safe_name, text=extracted, detail=detail, saved_path=str(dest)), ""
-        return Attachment("file", safe_name, text=extracted, detail=detail + ", read on demand", path=str(dest)), ""
+        return Attachment("file", safe_name, text=extracted[:3000], detail=detail + ", read on demand", path=str(dest)), ""
 
     return Attachment("file", safe_name, detail=f"{_size_text(len(item.data))}, uploaded file", path=str(dest)), ""
 
@@ -879,19 +879,13 @@ class RemoteController(QObject):
                     return c_bytes, c_mime, ""
 
         def trigger(done: Callable[[Any], None]) -> None:
-            def on_captured(image: Any) -> None:
-                data, mime = _encode_image(image, max_w, fmt=fmt_norm, quality=q_norm or 78)
-                if data is None:
-                    done((None, "", "Screen unavailable (Windows locked or headless)"))
-                else:
-                    done((data, mime, ""))
+            _capture_monitor(self._win, monitor, done)
 
-            _capture_monitor(self._win, monitor, on_captured)
-
-        res = self._on_gui(trigger, timeout_s=5.0)
-        if not isinstance(res, tuple):
-            return None, "", "Screen capture timed out"
-        data, mime, err = res
+        image = self._on_gui(trigger, timeout_s=5.0)
+        if not isinstance(image, QImage) or image.isNull():
+            return None, "", "Screen unavailable (Windows locked or headless)"
+        data, mime = _encode_image(image, max_w, fmt=fmt_norm, quality=q_norm or 78)
+        err = "" if data is not None else "Screen unavailable (Windows locked or headless)"
         if data is not None:
             with self._screen_lock:
                 self._last_screen = (time.monotonic(), monitor, max_w, fmt_norm, q_norm, data, mime)

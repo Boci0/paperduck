@@ -7,6 +7,7 @@ import ctypes.wintypes as wintypes
 import os
 import shutil
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,24 +59,24 @@ class _WinCpuSampler:
         self._prev_kernel: int | None = None
         self._prev_user: int | None = None
         self._last_cpu: float = 0.0
+        self._idle_ft = _FILETIME()
+        self._kernel_ft = _FILETIME()
+        self._user_ft = _FILETIME()
 
     def sample(self) -> float:
         if sys.platform != "win32":
             return 0.0
-        idle_ft = _FILETIME()
-        kernel_ft = _FILETIME()
-        user_ft = _FILETIME()
         ok = ctypes.windll.kernel32.GetSystemTimes(
-            ctypes.byref(idle_ft),
-            ctypes.byref(kernel_ft),
-            ctypes.byref(user_ft),
+            ctypes.byref(self._idle_ft),
+            ctypes.byref(self._kernel_ft),
+            ctypes.byref(self._user_ft),
         )
         if not ok:
             return self._last_cpu
 
-        idle = _filetime_to_u64(idle_ft)
-        kernel = _filetime_to_u64(kernel_ft)
-        user = _filetime_to_u64(user_ft)
+        idle = _filetime_to_u64(self._idle_ft)
+        kernel = _filetime_to_u64(self._kernel_ft)
+        user = _filetime_to_u64(self._user_ft)
 
         if self._prev_idle is None or self._prev_kernel is None or self._prev_user is None:
             self._prev_idle = idle
@@ -103,26 +104,36 @@ class _WinCpuSampler:
 _DEFAULT_CPU_SAMPLER = _WinCpuSampler()
 
 
+_MEM_STRUCT = _MEMORYSTATUSEX()
+_MEM_STRUCT.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+_DISK_CACHE: tuple[float, float] = (0.0, 0.0)
+
+
 def _sample_ram_percent() -> float:
     if sys.platform == "win32":
-        mem = _MEMORYSTATUSEX()
-        mem.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
-        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
-        if ok and mem.ullTotalPhys > 0:
-            used = mem.ullTotalPhys - mem.ullAvailPhys
-            return max(0.0, min(100.0, (used / mem.ullTotalPhys) * 100.0))
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_MEM_STRUCT))
+        if ok and _MEM_STRUCT.ullTotalPhys > 0:
+            used = _MEM_STRUCT.ullTotalPhys - _MEM_STRUCT.ullAvailPhys
+            return max(0.0, min(100.0, (used / _MEM_STRUCT.ullTotalPhys) * 100.0))
     return 0.0
 
 
 def _sample_disk_percent() -> float:
+    global _DISK_CACHE
+    now = time.monotonic()
+    cached_at, cached_val = _DISK_CACHE
+    if cached_at > 0.0 and now - cached_at < 30.0:
+        return cached_val
     target = os.environ.get("SystemDrive", "C:") + os.sep if sys.platform == "win32" else "/"
     try:
         usage = shutil.disk_usage(Path(target))
         if usage.total > 0:
-            return max(0.0, min(100.0, (usage.used / usage.total) * 100.0))
+            val = max(0.0, min(100.0, (usage.used / usage.total) * 100.0))
+            _DISK_CACHE = (now, val)
+            return val
     except OSError:
         pass
-    return 0.0
+    return cached_val
 
 
 def get_system_metrics() -> SystemMetrics:
@@ -155,6 +166,7 @@ class SystemMonitorPlugin:
         self._sampler = sampler or get_system_metrics
         # Prime the delta sampler once at init so the next sample has a baseline
         self._metrics = self._sampler()
+        self._last_tick_at = time.monotonic()
 
     @property
     def tool_id(self) -> str:
@@ -173,6 +185,11 @@ class SystemMonitorPlugin:
         return self._metrics
 
     def tick(self) -> bool:
+        if self._sampler is get_system_metrics:
+            now = time.monotonic()
+            if now - self._last_tick_at < 1.5:
+                return False
+            self._last_tick_at = now
         prev = self._metrics
         self._metrics = self._sampler()
         return self._metrics != prev

@@ -58,6 +58,24 @@ class _Worker:
                     return out
             return None
 
+    def _cleanup_proc(self, proc: subprocess.Popen[bytes]) -> None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        for stream in (proc.stdin, proc.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        try:
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if self.proc is proc:
+            self.proc = None
+
     def _ask(self, script: str, args: dict[str, Any], timeout_s: float) -> str | None:
         proc, end = self.proc, uuid.uuid4().hex
         assert proc is not None and proc.stdin is not None and proc.stdout is not None
@@ -65,7 +83,7 @@ class _Worker:
             proc.stdin.write((json.dumps({"script": script, "args": args, "end": end}) + "\n").encode("utf-8"))
             proc.stdin.flush()
         except OSError:
-            proc.kill()
+            self._cleanup_proc(proc)
             return None
         lines: list[bytes] = []
         status = [""]
@@ -82,8 +100,9 @@ class _Worker:
         reader.start()
         reader.join(timeout_s)
         if reader.is_alive() or not status[0]:  # hung or died mid-script: never reuse it
-            proc.kill()
-            return None if not reader.is_alive() else ""
+            timed_out = reader.is_alive()
+            self._cleanup_proc(proc)
+            return "" if timed_out else None
         if status[0] != "1":
             return ""  # the script failed, as a non-zero exit did before
         return b"".join(lines).decode("utf-8", errors="replace").strip()
@@ -99,3 +118,14 @@ def run(kind: str, script: str, args: dict[str, Any], timeout_s: float = 25.0) -
     with _workers_lock:
         worker = _workers.setdefault(kind, _Worker())
     return worker.run(script, args, timeout_s)
+
+
+def close_all() -> None:
+    """Stop all warm PowerShell workers cleanly on shutdown."""
+    with _workers_lock:
+        workers = list(_workers.values())
+        _workers.clear()
+    for w in workers:
+        with w.lock:
+            if w.proc is not None:
+                w._cleanup_proc(w.proc)

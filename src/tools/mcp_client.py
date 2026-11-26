@@ -439,27 +439,33 @@ class McpHub:
     def server_of(self, name: str) -> str | None:
         """The server that owns a model-facing tool name, if any."""
         server, sep, tool = name.partition(SEP)
-        return server if sep and tool in getattr(self._servers.get(server), "tools", {}) else None
+        if not sep:
+            return None
+        with self._lock:
+            srv = self._servers.get(server)
+            return server if srv is not None and tool in srv.tools else None
 
     def is_destructive(self, name: str) -> bool:
         """Whether the tool's server declared it destructive (it then asks before every call)."""
         server, _sep, tool = name.partition(SEP)
-        return tool in getattr(self._servers.get(server), "destructive", ())
+        with self._lock:
+            return tool in getattr(self._servers.get(server), "destructive", ())
 
     def is_readonly(self, name: str) -> bool:
         """Whether the tool's server declared it read-only."""
         server, _sep, tool = name.partition(SEP)
-        return tool in getattr(self._servers.get(server), "readonly", ())
+        with self._lock:
+            return tool in getattr(self._servers.get(server), "readonly", ())
 
     def call(self, name: str, args: dict[str, Any], cancel: threading.Event | None = None) -> str:
         server, _sep, tool = name.partition(SEP)
         self.image = b""
-        if self.server_of(name) is None:
-            return "error: unknown MCP tool"
+        with self._lock:
+            running = self._servers.get(server)
+            known = running is not None and bool(_sep) and tool in running.tools
+        if not known or running is None:
+            return "error: unknown MCP tool" if not running else "error: the MCP server stopped; try again"
         self._used = time.monotonic()
-        running = self._servers.get(server)  # specs() or close_idle() may have stopped it meanwhile
-        if running is None:
-            return "error: the MCP server stopped; try again"
         out = running.call(tool, args, cancel)
         self.image = running.image
         if (not self.image and LOOK_TOOL in running.tools and tool not in NO_LOOK and tool not in running.readonly

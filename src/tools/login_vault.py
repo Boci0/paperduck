@@ -85,12 +85,16 @@ blocked_at = 0.0  # monotonic time of the last withheld screenshot, so the host 
 
 def remember_typed(hwnd: int, value: str) -> None:
     """Watch window `hwnd` for this password showing up in plain text."""
+    if not value:
+        return
     with _typed_lock:
         _typed.append((hwnd, len(value), hashlib.sha256(value.encode("utf-8")).digest(),
                        time.monotonic() + REVEAL_WATCH_S))
 
 
 def _shows(text: str, length: int, digest: bytes) -> bool:
+    if length <= 0 or length > len(text):
+        return False
     return any(hashlib.sha256(text[i:i + length].encode("utf-8")).digest() == digest
                for i in range(len(text) - length + 1))
 

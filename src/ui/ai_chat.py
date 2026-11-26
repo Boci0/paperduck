@@ -202,12 +202,16 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._steer_sent: list[str] = []  # the ones it took
         self._steer_typed: list[str] = []  # the user's own words in each, same order ("" for attachments only)
         self._remote_steers: list[dict[str, Any]] = []  # steering bubbles shown in remote_snapshot while job runs
+        self._chat_gen = 0  # incremented on new_chat/resume so stale singleShot timers never fire into a new chat
         self._branch_q: list[BranchNote] = []  # background branch posts waiting for a tool round or a send
         self._branch_sent: list[BranchNote] = []  # the ones the running answer took
         self._branch_lock = threading.Lock()  # sub-agents post from their own threads
         self._posted.connect(self._show_branch)
         self._progress = ""  # what the worker is doing now (written on its thread, shown by _tick_dots)
         self._stream_text = ""  # cumulative response text while streaming (written on worker thread)
+        self._shown_progress = ""
+        self._shown_stream = ""
+        self._last_remote_emit_at = 0.0
         self._stream_at = 0.0
         self._stream_row: QWidget | None = None
         self._stream_label: ChatText | None = None
@@ -390,11 +394,10 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
     def _take_steer(self, cancel: threading.Event) -> list[str]:
         """Worker thread: what the user typed since the last tool result. A stopped answer's worker takes no branch
         notes (checked under the lock stop() sets `cancel` under), so they stay queued for the next message."""
-        taken: list[str] = []
-        while self._steer_q:
-            taken.append(self._steer_q.pop(0))
-        self._steer_sent.extend(taken)
         with self._branch_lock:
+            taken = list(self._steer_q)
+            self._steer_q.clear()
+            self._steer_sent.extend(taken)
             if cancel.is_set():
                 return taken
             branch, self._branch_q = self._branch_q, []
@@ -411,8 +414,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         if any(a.pending for a in self._attachments):
             self._add_bubble("error", "Still reading an image. Send again in a moment.")
             return
-        self._steer_q.append(content[:MAX_INPUT_CHARS])
-        self._steer_typed.append(text)
+        with self._branch_lock:
+            self._steer_q.append(content[:MAX_INPUT_CHARS])
+            self._steer_typed.append(text)
         self._remote_steers.append({
             "role": "user",
             "text": text if (text or not usable) else "(attachment)",
@@ -432,23 +436,25 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         usable = [a for a in (attachments or []) if a.text or a.image_url or a.path]
         if not clean and not usable:
             return False, "empty message"
-        for item in usable:
-            if item.kind == "image" and item.thumb is None and item.image_url.startswith("data:image/") and ";base64," in item.image_url:
-                try:
-                    raw = base64.b64decode(item.image_url.split(",", 1)[1], validate=False)
-                    px = QPixmap()
-                    if px.loadFromData(raw):
-                        item.thumb = px
-                except Exception:
-                    pass
+        if not self._remote_only:
+            for item in usable:
+                if item.kind == "image" and item.thumb is None and item.image_url.startswith("data:image/") and ";base64," in item.image_url:
+                    try:
+                        raw = base64.b64decode(item.image_url.split(",", 1)[1], validate=False)
+                        px = QPixmap()
+                        if px.loadFromData(raw):
+                            item.thumb = px
+                    except Exception:
+                        pass
         if self._testing:
             return False, "connection test in progress"
         if self._job is not None:
             content = "\n\n".join([*( [clean] if clean else [] ), *(a.as_prompt() for a in usable)]).strip()[:MAX_INPUT_CHARS]
             if not content:
                 return False, "empty message"
-            self._steer_q.append(content)
-            self._steer_typed.append(clean)
+            with self._branch_lock:
+                self._steer_q.append(content)
+                self._steer_typed.append(clean)
             self._remote_steers.append({
                 "role": "user",
                 "text": clean if (clean or not usable) else "(attachment)",
@@ -510,8 +516,11 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
                 return False
             self._steer(clean)
             return True
-        self._draft.setPlainText(clean)
-        self.send()
+        if not self._ready():
+            self._open_setup()
+            return False
+        self._add_bubble("user", clean)
+        self._ask(clean, [], said=clean)
         return True
 
     def _ask(self, content: str, images: list[str] | None = None, image_notes: list[str] | None = None,
@@ -566,7 +575,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._asked = (model, thinking)
         job = self._job = AiJob(self)
         job.finished.connect(self._on_done)
-        self._steer_q, self._steer_sent, self._steer_typed, self._branch_sent = [], [], [], []
+        with self._branch_lock:
+            self._steer_q, self._steer_sent, self._steer_typed, self._branch_sent = [], [], [], []
         self._remote_steers.clear()
         host = None if self._testing else self._tool_host
         cancel = self._cancel = threading.Event()
@@ -652,8 +662,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._dots_timer.stop()
         self._hide_status()
         self._clear_stream()
-        said, left, typed = self._steer_sent, self._steer_q, self._steer_typed
-        self._steer_sent, self._steer_q, self._steer_typed = [], [], []
+        with self._branch_lock:
+            said, left, typed = self._steer_sent, self._steer_q, self._steer_typed
+            self._steer_sent, self._steer_q, self._steer_typed = [], [], []
         self._remote_steers.clear()
         for note in self._branch_sent:  # branch posts the model read: kept as the untrusted notes it saw
             self._history.append({"role": "user", "content": note.note().strip()})
@@ -699,7 +710,9 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._accept_reply(reply)
         if left:  # typed too late for a tool round: it is the next message (its bubble is already shown)
             words = "\n\n".join(w for w in typed[len(said):] if w)
-            QTimer.singleShot(0, lambda: self._job is None and self._ask("\n\n".join(left)[:MAX_INPUT_CHARS], said=words))
+            gen = self._chat_gen
+            QTimer.singleShot(0, lambda: self._chat_gen == gen and self._job is None
+                              and self._ask("\n\n".join(left)[:MAX_INPUT_CHARS], said=words))
 
     def add_watch_answer(self, label: str, reply: AiReply) -> bool:
         """A Watch mode answer the pet fetched itself, shown as a normal exchange so the user can follow up.
@@ -896,18 +909,24 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._think_dots.update()
         text = self._progress or "Thinking"
         changed = False
-        if self._thinking_label is not None and self._thinking_label.toPlainText() != text:
+        if self._thinking_label is not None and self._shown_progress != text:
+            self._shown_progress = text
             old_h = self._thinking_label.height()
             self._thinking_label.set_text(text)
             if self._thinking_label.height() != old_h:
                 self._relayout()
             changed = True
         if self._sync_stream() or changed:
-            self._last_remote_tick = (self._progress, self._stream_text)
-            self.remote_changed.emit()
+            now = time.monotonic()
+            if now - self._last_remote_emit_at >= 0.15:
+                self._last_remote_emit_at = now
+                self._last_remote_tick = (self._progress, self._stream_text)
+                self.remote_changed.emit()
 
     def _clear_stream(self) -> None:
         self._stream_text = ""
+        self._shown_stream = ""
+        self._shown_progress = ""
         self._stream_at = 0.0
         if self._stream_row is not None:
             self._thread_layout.removeWidget(self._stream_row)
@@ -927,12 +946,13 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             content_w = max(1, (self._scroll.viewport().width() if self._scroll.viewport().width() > 24
                                 else self._width - 2 * (6 + SHADOW) - 6) - 16)
             self._stream_label.resize(content_w, 0)
-        if self._stream_label.toPlainText() == stream:
+        if self._shown_stream == stream:
             return False
         now = time.monotonic()
-        if self._stream_at and now - self._stream_at < 0.08 and len(stream) - len(self._stream_label.toPlainText()) < 40:
+        if self._stream_at and now - self._stream_at < 0.08 and len(stream) - len(self._shown_stream) < 40:
             return False
         self._stream_at = now
+        self._shown_stream = stream
         self._stream_label.set_text(stream, markdown=False)
         self._relayout_and_scroll()
         return True
@@ -1016,7 +1036,15 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             return
         bar = self._scroll.verticalScrollBar()
         target = self._scroll_target
-        bar.setValue(min(bar.maximum(), max(0, target.y() - 4)) if target is not None else bar.maximum())
+        if target is not None:
+            try:
+                y = target.y()
+            except RuntimeError:
+                self._scroll_target = None
+                y = None
+        else:
+            y = None
+        bar.setValue(min(bar.maximum(), max(0, y - 4)) if y is not None else bar.maximum())
 
     def _add_bubble(self, role: str, text: str, attachments: list[Attachment] | None = None) -> QLabel:
         return self._add_row(role, text, attachments)[1]
@@ -1495,6 +1523,8 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
 
     def new_chat(self) -> None:
         """Fresh start: drops a pending reply, the thread, the draft and any attachments."""
+        self._chat_gen += 1
+        self._scroll_target = None
         self.stop()
         if (agents := getattr(self._tool_host, "agents", None)) is not None:
             agents.stop_all()  # an agent can outlive its answer; its report must not land in the next chat

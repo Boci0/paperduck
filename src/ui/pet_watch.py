@@ -138,6 +138,9 @@ class WatchMixin:
         if hint.rule.startswith("errand"):
             if hint.rule == "errand_ready":
                 self._run_errand()
+                errands = self._errands()
+                if errands is not None and not errands.fired:
+                    return
             self.ensure_ai_chat()
             return
         if hints is not None:
@@ -249,12 +252,14 @@ class WatchMixin:
         if not self._watch_ready():
             self.open_ai_chat()  # Setup when no key or model; a chat mid-answer is shown as is
             return
+        hwnd = computer.foreground_window()
         app, title = foreground_app(), foreground_title()
         lens = hotkey_lens(app, title)
         project = editor_workspace(app, title)
-        grab_screen(self, lambda image: self._open_ask(app, title, lens, project, image), window=True)
+        grab_screen(self, lambda image: self._open_ask(app, title, lens, project, image, hwnd), window=True)
 
-    def _open_ask(self, app: str, title: str, lens: str, project: str, image: QImage | None) -> None:
+    def _open_ask(self, app: str, title: str, lens: str, project: str, image: QImage | None,
+                  hwnd: int = 0) -> None:
         chat = self.ensure_ai_chat()
         if chat is None or chat._job is not None:
             return
@@ -288,7 +293,7 @@ class WatchMixin:
                 chat.set_ask(ask_context(app, title, found[0]), actions(found[0]))
 
             job.finished.connect(done)
-            job.start(lambda: folder_check(computer.foreground_window(), title, min_files=1))
+            job.start(lambda: folder_check(hwnd or computer.foreground_window(), title, min_files=1))
 
     def _use_project(self, path: str, why: str) -> None:
         """Point the chat's file tools at `path` (the folder the user is looking at), with a visible note."""

@@ -66,14 +66,28 @@ def perch_lost(rect: Rect | None, monitors: Sequence[Rect], feet_x: int) -> bool
 # ---------------------------------------------------------------------------- Win32
 
 
+_USER32: Any = None
+_DWMAPI: Any = None
+
+
 def _user32():
-    u = ctypes.windll.user32
-    u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    for fn in (u.IsWindow, u.IsWindowVisible, u.IsIconic):
-        fn.argtypes = [wintypes.HWND]
-    return u
+    global _USER32
+    if _USER32 is None:
+        u = ctypes.windll.user32
+        u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        for fn in (u.IsWindow, u.IsWindowVisible, u.IsIconic):
+            fn.argtypes = [wintypes.HWND]
+        _USER32 = u
+    return _USER32
+
+
+def _dwmapi():
+    global _DWMAPI
+    if _DWMAPI is None:
+        _DWMAPI = ctypes.windll.dwmapi
+    return _DWMAPI
 
 
 def _class(u, hwnd: int) -> str:
@@ -107,6 +121,8 @@ def top_level_windows(stop_at_hwnd: int | None = None) -> list[tuple[int, Rect]]
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def visit(hwnd, _lp):
+        if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+            return True
         pid = wintypes.DWORD()
         u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value != me:

@@ -376,7 +376,13 @@ def compress_to_zip(
                     if ext in _PRECOMPRESSED_EXTS
                     else zipfile.ZIP_DEFLATED
                 )
-                zinfo = zipfile.ZipInfo.from_file(src_file, arcname=arcname)
+                try:
+                    zinfo = zipfile.ZipInfo.from_file(src_file, arcname=arcname)
+                except ValueError:
+                    zinfo = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+                    zinfo.file_size = src_file.stat().st_size
+                if zinfo.date_time[0] < 1980:
+                    zinfo.date_time = (1980, 1, 1, 0, 0, 0)
                 zinfo.compress_type = method
 
                 with src_file.open("rb") as fin, zf.open(zinfo, mode="w") as fout:
@@ -652,9 +658,9 @@ def extract_archive_safe(
         )
 
     dest_dir = output_dir or _unique_output_dir(src.parent, _strip_archive_stem(src))
-    staging_dir = dest_dir.with_name(
-        f".forge_extract_{os.getpid()}_{threading.get_ident()}_{dest_dir.name}"
-    )
+    staging_parent = dest_dir.parent if dest_dir.name else dest_dir
+    staging_name = f".forge_extract_{os.getpid()}_{threading.get_ident()}_{dest_dir.name or 'root'}"
+    staging_dir = staging_parent / staging_name
     extracted_bytes = 0
     buf = bytearray(STREAM_CHUNK_BYTES)
     view = memoryview(buf)
@@ -694,6 +700,7 @@ def extract_archive_safe(
                             if on_progress is not None and total_uncomp > 0:
                                 on_progress(min(99.0, (extracted_bytes / total_uncomp) * 100.0))
         else:
+            tar_total = max(src_bytes, 1)
             with tarfile.open(src, mode="r:*") as tf:
                 for member in tf:
                     _check_cancel(cancel_event)
@@ -702,12 +709,15 @@ def extract_archive_safe(
                     target = _resolve_safe_member_path(staging_root, member.name)
                     if member.isdir():
                         target.mkdir(parents=True, exist_ok=True)
+                        tf.members.clear()
                         continue
                     if not member.isfile():
+                        tf.members.clear()
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
                     fin_obj = tf.extractfile(member)
                     if fin_obj is None:
+                        tf.members.clear()
                         continue
                     with fin_obj, target.open("wb") as fout:
                         while True:
@@ -719,9 +729,19 @@ def extract_archive_safe(
                             if extracted_bytes > max_extract_bytes:
                                 raise ValueError("Archive bomb limit exceeded")
                             fout.write(chunk)
+                            if on_progress is not None:
+                                on_progress(min(99.0, (extracted_bytes / tar_total) * 100.0))
+                    tf.members.clear()
 
         _check_cancel(cancel_event)
-        os.replace(staging_dir, dest_dir)
+        for attempt in range(6):
+            try:
+                os.replace(staging_dir, dest_dir)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05)
         _carry_mark_of_web(src, (dest_dir,))
         if on_progress is not None:
             on_progress(100.0)
@@ -970,6 +990,8 @@ def _scrub_pdf(data: bytes) -> bytes | None:
         if obj is None:
             return None
         end = data.find(b"endobj", obj.end())
+        if end == -1:
+            return None
         removed = False
         for key in re.compile(rb"/([A-Za-z]+)\s*([(<])").finditer(data, obj.end(), end):
             name, close = key.group(1), _pdf_string_end(data, key.start(2))
@@ -1513,16 +1535,19 @@ def process_paths_sync(
         outputs_txt: list[Path] = []
         src_sum = 0
         out_sum = 0
-        for idx, p in enumerate(existing):
-            _check_cancel(cancel_event)
-            r = clean_text_file(p)
-            if not r.ok:
-                return r
-            outputs_txt.extend(r.output_paths)
-            src_sum += r.source_bytes
-            out_sum += r.output_bytes
-            if on_progress is not None:
-                on_progress(((idx + 1) / len(existing)) * 100.0)
+        try:
+            for idx, p in enumerate(existing):
+                _check_cancel(cancel_event)
+                r = clean_text_file(p)
+                if not r.ok:
+                    return r
+                outputs_txt.extend(r.output_paths)
+                src_sum += r.source_bytes
+                out_sum += r.output_bytes
+                if on_progress is not None:
+                    on_progress(((idx + 1) / len(existing)) * 100.0)
+        except InterruptedError:
+            return ForgeResult(False, (), src_sum, 0, "ABORTED", "#8A9AF2")
         return ForgeResult(True, tuple(outputs_txt), src_sum, out_sum, "CLEAN OK", "#38B764")
 
     if mode in {ForgeMode.JSON_PRETTY, ForgeMode.JSON_MIN, ForgeMode.CSV, ForgeMode.TSV}:
@@ -1743,12 +1768,12 @@ class FileForgePlugin:
             self._cancel_event.clear()
             mode_snapshot = mode_override if isinstance(mode_override, ForgeMode) else self._mode
 
-        if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="paperduck-forge",
-            )
-        self._executor.submit(self._run_worker, clean, mode_snapshot)
+            if self._executor is None:
+                self._executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="paperduck-forge",
+                )
+            self._executor.submit(self._run_worker, clean, mode_snapshot)
         return True
 
     def _run_worker(self, paths: list[Path | str], mode: ForgeMode) -> None:

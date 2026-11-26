@@ -162,6 +162,11 @@ class SnipOverlay(QWidget):
         if event is not None and event.key() == Qt.Key.Key_Escape:
             self._finish(None)
 
+    def closeEvent(self, event: Any) -> None:
+        self._finish(None)
+        if event is not None:
+            super().closeEvent(event)
+
 
 class SnipSession:
     """Spans one SnipOverlay over every monitor and reports a single result."""
@@ -331,11 +336,20 @@ class OcrJob(QObject):
         threading.Thread(target=self._run, args=(png,), daemon=True).start()
 
     def _run(self, png: Path) -> None:
-        text = ocr_image_file(png)
-        for leftover in (png, png.with_suffix(".ps1")):
-            leftover.unlink(missing_ok=True)
-        png.parent.rmdir()
-        emit_later(self, "finished", text)
+        text = ""
+        try:
+            text = ocr_image_file(png)
+        finally:
+            for leftover in (png, png.with_suffix(".ps1")):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                png.parent.rmdir()
+            except OSError:
+                pass
+            emit_later(self, "finished", text)
 
 
 # ---------------------------------------------------------------------------

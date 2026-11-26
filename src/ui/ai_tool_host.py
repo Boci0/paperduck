@@ -163,17 +163,24 @@ def grab_screen(win: Any, done: Callable[[Any], None], primary: bool = False, wi
         w.hide()
 
     def grab() -> None:
-        hwnd = computer.focus_front_app() if primary else computer.front_app()  # the app under the pet and chat
-        image = _front_window_shot(hwnd) if window else None
-        if image is None:
-            screen = (None if primary else QGuiApplication.screenAt(QCursor.pos())) or QGuiApplication.primaryScreen()
-            image = screen.grabWindow(0).toImage() if screen is not None else None
-        for w in shown:
-            if w in hidden:
-                show_quietly(w)
-            else:
-                computer.exclude_from_capture(int(w.winId()), False)
-        done((image, hwnd) if primary else image)
+        image = None
+        hwnd = 0
+        try:
+            hwnd = computer.focus_front_app() if primary else computer.front_app()  # the app under the pet and chat
+            image = _front_window_shot(hwnd) if window else None
+            if image is None:
+                screen = (None if primary else QGuiApplication.screenAt(QCursor.pos())) or QGuiApplication.primaryScreen()
+                image = screen.grabWindow(0).toImage() if screen is not None else None
+        finally:
+            for w in shown:
+                try:
+                    if w in hidden:
+                        show_quietly(w)
+                    else:
+                        computer.exclude_from_capture(int(w.winId()), False)
+                except RuntimeError:
+                    pass
+            done((image, hwnd) if primary else image)
 
     QTimer.singleShot(180 if hidden else 30, grab)  # the compositor applies the affinity on its next frame
 
@@ -840,6 +847,7 @@ class AiToolHost(QObject):
         self.tool_groups_loaded: set[str] = set()
         self._tool_group_order: list[str] = []
         self._mcp_loaded_order: list[str] = []
+        self._tools_lock = threading.Lock()
         self.layout_open = ""  # the last layout_check's problems, "" once one passes (the chat clears it per answer)
         self.edit_gen = 0
         self.verified_gen = 0
@@ -879,26 +887,31 @@ class AiToolHost(QObject):
     def activate_groups(self, groups: Iterable[str]) -> list[str]:
         """Monotonically append newly activated built-in tool groups in stable order."""
         added: list[str] = []
-        for g in groups:
-            if g in TOOL_GROUPS and g not in self.tool_groups_loaded:
-                self.tool_groups_loaded.add(g)
-                if g not in self._tool_group_order:
-                    self._tool_group_order.append(g)
-                added.append(g)
+        with self._tools_lock:
+            for g in groups:
+                if g in TOOL_GROUPS and g not in self.tool_groups_loaded:
+                    self.tool_groups_loaded.add(g)
+                    if g not in self._tool_group_order:
+                        self._tool_group_order.append(g)
+                    added.append(g)
         return added
 
     def activate_mcp(self, server: str) -> None:
         """Monotonically append an activated MCP server in stable order."""
-        if server and server not in self.mcp_loaded:
-            self.mcp_loaded.add(server)
-            if server not in self._mcp_loaded_order:
-                self._mcp_loaded_order.append(server)
+        if not server:
+            return
+        with self._tools_lock:
+            if server not in self.mcp_loaded:
+                self.mcp_loaded.add(server)
+                if server not in self._mcp_loaded_order:
+                    self._mcp_loaded_order.append(server)
 
     def clear_loaded_tools(self) -> None:
-        self.tool_groups_loaded.clear()
-        self._tool_group_order.clear()
-        self.mcp_loaded.clear()
-        self._mcp_loaded_order.clear()
+        with self._tools_lock:
+            self.tool_groups_loaded.clear()
+            self._tool_group_order.clear()
+            self.mcp_loaded.clear()
+            self._mcp_loaded_order.clear()
 
     def prewarm_groups(self, text: str) -> None:
         self.activate_groups(sorted(infer_tool_groups(text)))
@@ -1084,7 +1097,7 @@ class AiToolHost(QObject):
             shown = json.dumps(args, ensure_ascii=False)
             # Values only: an argument named "format" or "truncate" is not a destructive command
             risk = "destructive tool" if self.mcp.is_destructive(name) else destructive_reason("\n".join(_strings(args)))
-            if _host_auto_mode(self) and f"mcp:{server}" not in chat._allowed:
+            if _host_auto_mode(self) and (risk or f"mcp:{server}" not in chat._allowed):
                 if not risk and not self.outside and self.mcp.is_readonly(name):
                     review = (True, "read-only MCP tool")
                 else:
@@ -1169,7 +1182,13 @@ class AiToolHost(QObject):
                                  "(restores tracked files and removes newly created untracked files).",
                                  "checkpoint revert"):
                 return "error: the user declined reverting this checkpoint"
-            return revert_checkpoint(cp)
+            res = revert_checkpoint(cp)
+            if not res.startswith("error") and hasattr(self, "edit_gen"):
+                self.edit_gen = 0
+                self.verified_gen = 0
+                self.edited_code_files.clear()
+                self.last_verify_error = ""
+            return res
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
@@ -1561,7 +1580,7 @@ class AiToolHost(QObject):
             if ps:
                 command = f'powershell -NoProfile -ExecutionPolicy Bypass -File "{user_script}"'
             else:
-                command = f'"{python_exe(cwd, self._project())}" "{user_script}"'
+                command = f'call "{python_exe(cwd, self._project())}" "{user_script}"'
         elif ps:  # the user saw the script; it runs from a file so no cmd.exe quoting touches it
             try:
                 script, command = powershell_file(command)
@@ -1572,8 +1591,8 @@ class AiToolHost(QObject):
                 script, command = python_file(command, exe=python_exe(cwd, self._project()))
             except (ValueError, OSError) as exc:
                 return f"error: {exc}"
-        pdfs = {pdf: file_stamp(pdf) for pdf in print_to_pdf_paths(command, cwd)}
-        media = media_stamps(command, cwd)
+        pdfs = {pdf: file_stamp(pdf) for pdf in print_to_pdf_paths(source, cwd)}
+        media = media_stamps(source, cwd)
         out = run_command(cwd, command, self.cancel, seconds)
         failed = out.startswith(("error", "stopped after")) or (
             out.startswith("exit code") and not out.startswith("exit code 0"))
@@ -1593,7 +1612,7 @@ class AiToolHost(QObject):
                 out += f"\n[Paperduck: {pdf.name}: metadata {scrub_metadata(pdf)}]"
             else:
                 out += f"\n[Paperduck: {pdf.name} was not written within {PDF_WAIT_S:g} s; call clean_metadata on it]"
-        unclean = [p for p in changed_media(media, cwd, command)
+        unclean = [p for p in changed_media(media, cwd, source)
                    if p not in pdfs and scrub_metadata(p, dry_run=True) == "would clean"]
         if unclean:
             names = ", ".join(_rel_name(p, cwd) for p in unclean[:8])
@@ -1648,10 +1667,13 @@ class AiToolHost(QObject):
         delete key or a destructive typed command asks every time. `approved`: the batch it is in was allowed whole."""
         raw_id = args.get("id")
         items = getattr(self, "_items", {})
-        target_label = str(args.get("name") or (items[raw_id][4] if isinstance(raw_id, int) and raw_id in items else ""))
-        args = resolve_target(name, _given(args), items)
-        if isinstance(args, str):
-            return args
+        batch_label = getattr(self, "_batch_label", "")
+        self._batch_label = ""
+        target_label = str(batch_label or args.get("name") or (items[raw_id][4] if isinstance(raw_id, int) and raw_id in items else ""))
+        if not approved:
+            args = resolve_target(name, _given(args), items)
+            if isinstance(args, str):
+                return args
         try:
             what, risk = computer_action(name, args)
         except ValueError as exc:
@@ -2079,8 +2101,11 @@ class AiToolHost(QObject):
                 continue
             if tool not in COMPUTER_TOOLS:
                 return f"error: step {i} needs \"tool\" set to one of {', '.join(sorted(COMPUTER_TOOLS | {'wait', 'wait_for_ui'}))}"
-            args = resolve_target(tool, _given({k: v for k, v in step.items() if k != "tool"}),
-                                  getattr(self, "_items", {}))
+            raw_step = _given({k: v for k, v in step.items() if k != "tool"})
+            raw_id = raw_step.get("id")
+            items = getattr(self, "_items", {})
+            step_label = str(raw_step.get("name") or (items[raw_id][4] if isinstance(raw_id, int) and raw_id in items else ""))
+            args = resolve_target(tool, raw_step, items)
             if isinstance(args, str):
                 return f"error: step {i}: {args.removeprefix('error: ')}"
             try:
@@ -2089,7 +2114,7 @@ class AiToolHost(QObject):
                 return f"error: step {i}: {exc}"
             plan.append(f"{i}. {what}")
             risks += [risk] if risk else []
-            todo.append((tool, args))
+            todo.append((tool, args, step_label))
         if not self._allowed("computer", "The model wants to control your computer in these steps:\n\n" + "\n".join(plan),
                              "computer control", ", ".join(risks)):
             return "error: the user declined these actions"
@@ -2098,7 +2123,9 @@ class AiToolHost(QObject):
         cancel, lines = self.cancel, []
         self._batch_acted = False
         try:
-            for i, (tool, args) in enumerate(todo, 1):
+            for i, entry in enumerate(todo, 1):
+                tool, args = entry[0], entry[1]
+                step_label = entry[2] if len(entry) > 2 else ""
                 if cancel.is_set():
                     return "\n".join([*lines, "error: stopped by the user"])
                 if tool == "wait":
@@ -2112,6 +2139,7 @@ class AiToolHost(QObject):
                         return "\n".join([*lines, f"error: stopped at step {i} of {len(steps)}"])
                     continue
                 self._in_batch = i < len(todo)
+                self._batch_label = step_label
                 out = self._computer(tool, args, approved=True)
                 self._batch_acted = True
                 lines.append(f"{i}. {out}")

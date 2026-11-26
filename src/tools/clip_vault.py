@@ -165,6 +165,8 @@ class ClipVaultPlugin:
         self._transform_count: int = 0
         self._ignore_digest: bytes | None = None
         self._attached_clipboard: Any = None
+        self._pending_clip_change: bool = False
+        self._last_clip_seq: int | None = None
 
         self._read_text_fn = read_text
         self._write_text_fn = write_text
@@ -211,21 +213,48 @@ class ClipVaultPlugin:
         if clipboard is None:
             return
         self._attached_clipboard = clipboard
-        clipboard.dataChanged.connect(self._on_qt_clipboard_changed)
+        clipboard.dataChanged.connect(self._schedule_qt_clipboard_changed)
         # Seed initial item if safe plain text is currently on clipboard
         self._on_qt_clipboard_changed(notify=False)
+
+    def _schedule_qt_clipboard_changed(self) -> None:
+        if self._pending_clip_change or self._attached_clipboard is None:
+            return
+        self._pending_clip_change = True
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._flush_qt_clipboard_changed)
+        except Exception:
+            self._pending_clip_change = False
+            self._on_qt_clipboard_changed()
+
+    def _flush_qt_clipboard_changed(self) -> None:
+        self._pending_clip_change = False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+                if seq and seq == self._last_clip_seq:
+                    return
+                self._last_clip_seq = seq
+            except Exception:
+                pass
+        self._on_qt_clipboard_changed()
 
     def _on_qt_clipboard_changed(self, *, notify: bool = True) -> None:
         cb = self._attached_clipboard
         if cb is None:
             return
-        mime = cb.mimeData()
-        if mime is None or clipboard_is_private(mime):  # password manager and Windows privacy exclusion formats
-            return
+        try:
+            mime = cb.mimeData()
+            if mime is None or clipboard_is_private(mime):  # password manager and Windows privacy exclusion formats
+                return
 
-        if not mime.hasText():
+            if not mime.hasText():
+                return
+            text = mime.text()
+        except (RuntimeError, OSError):
             return
-        text = mime.text()
         if self.capture_text(text) and notify and self._on_change is not None:
             self._on_change()
 
@@ -484,7 +513,7 @@ class ClipVaultPlugin:
                         return (True, "B64 DEC", "#73EFF7")
                 except (binascii.Error, UnicodeDecodeError, ValueError):
                     pass
-            encoded_str = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+            encoded_str = base64.b64encode(raw.encode("utf-8", errors="replace")).decode("ascii")
             self._set_current_text(encoded_str)
             self._transform_count += 1
             return (True, "B64 ENC", "#73EFF7")
@@ -492,9 +521,12 @@ class ClipVaultPlugin:
         if callback_id == "clipvault:sha256":
             paths = self._get_current_paths()
             target_file: Path | None = None
-            if paths and paths[0].is_file():
-                target_file = paths[0]
-            else:
+            try:
+                if paths and paths[0].is_file():
+                    target_file = paths[0]
+            except OSError:
+                target_file = None
+            if target_file is None:
                 raw_txt = self._get_current_text()
                 candidate_str = raw_txt.strip().strip('"')
                 if candidate_str and len(candidate_str) <= 1024:
@@ -518,7 +550,7 @@ class ClipVaultPlugin:
             raw = self._get_current_text()
             if not raw:
                 return (True, "EMPTY", "#EF7D57")
-            digest_hex = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            digest_hex = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
             self._set_current_text(digest_hex)
             self._transform_count += 1
             return (True, "SHA256!", "#FFCD75")

@@ -283,7 +283,8 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
     def _reassert_topmost(self) -> None:
         if sys.platform != "win32" or not self._always_on_top or not self.isVisible():
             return
-        if QApplication.activePopupWidget() is not None or QToolTip.isVisible():  # raising would cover it
+        if (QApplication.activePopupWidget() is not None or QApplication.activeModalWidget() is not None
+                or QToolTip.isVisible()):  # raising would cover it
             return
         wheels = self._open_wheels()
         own = {int(w.winId()) for w in (self, *wheels, self._ai_chat) if w is not None and w.isVisible()}
@@ -361,7 +362,10 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
                 if self._on_notification is not None:
                     self._on_notification(f"Hotkey not changed: {exc}")
                 return
-            if label in (self.hotkeys.get(m) or default_hotkey(m) for m in HOTKEY_ACTIONS if m != mode):
+            taken_hk = {self.hotkeys.get(m) or default_hotkey(m) for m in HOTKEY_ACTIONS if m != mode}
+            taken_hk.update(f"Ctrl+Shift+Alt+{n}" for n in range(1, 10))
+            taken_hk.add("Alt+`")
+            if label in taken_hk:
                 self._show_toast("IN USE", QColor("#E05A47"))
                 return
             self.hotkeys[mode] = label
@@ -615,6 +619,10 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._start_fall()
 
     def _start_perch_timer(self) -> None:
+        if self._fall_to is not None:
+            self._perch_timer.setInterval(16)
+        elif getattr(self, "_perch_taskbar", False):
+            self._perch_timer.setInterval(150)
         if not self._perch_timer.isActive():
             self._perch_clock.start()
             self._perch_timer.start()
@@ -622,6 +630,8 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
     def _on_perch_tick(self) -> None:
         dt = min(0.1, self._perch_clock.restart() / 1000.0)  # measured; a stall never teleports the fall
         if self._fall_to is not None:
+            if self._perch_timer.interval() != 16:
+                self._perch_timer.setInterval(16)
             self._fall_v += self.FALL_ACCEL * dt
             self._fall_y = min(float(self._fall_to), self._fall_y + self._fall_v * dt)
             self.move(self._fall_x, round(self._fall_y))
@@ -632,7 +642,13 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
             if self._perch_ticks % self.PERCH_COVER_EVERY == 0:
                 self._check_perch_cover()  # a full window scan (~0.7ms), so not every frame
             if self._perch is not None and self._walk_steps_remaining <= 0:
+                old_pos = (self.x(), self.y())
                 self._follow_perch()  # a hop steps along the edge on the overlay tick instead
+                if self._perch is not None:
+                    moved = (self.x(), self.y()) != old_pos
+                    target_iv = 16 if moved else (150 if getattr(self, "_perch_taskbar", False) else 80)
+                    if self._perch_timer.interval() != target_iv:
+                        self._perch_timer.setInterval(target_iv)
         if self._perch is None and self._fall_to is None:
             self._perch_timer.stop()
 
@@ -665,7 +681,11 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
     def _start_fall(self) -> None:
         """Flutter down (dangle clip, accelerating) to the work-area floor under the duck."""
         sx, fy = self._feet_local()
-        scr = QGuiApplication.screenAt(QPoint(self.x() + sx, self.y() + fy)) or self.screen()
+        scr = (QGuiApplication.screenAt(QPoint(self.x() + sx, self.y() + fy))
+               or self.screen() or QGuiApplication.primaryScreen())
+        if scr is None:
+            self._fall_to = self._perch = None
+            return
         floor = scr.availableGeometry().bottom() + 1
         self._fall_x, fall_to = self._clamp_feet(self.x(), floor - fy)
         self._fall_y, self._fall_v = float(self.y()), 0.0
@@ -1037,8 +1057,15 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
             self._quick_bar.deleteLater()
             self._quick_bar = None
         if self._ai_chat is not None:
+            self._ai_chat.stop()
+            if (agents := getattr(self._ai_chat._tool_host, "agents", None)) is not None:
+                agents.stop_all()
+            self._ai_chat._stop_all_procs()
             self._ai_chat.close()
+            self._ai_chat.deleteLater()
             self._ai_chat = None
+        self._click_timer.stop()
+        self._wheel_release_timer.stop()
         if self._snip_session is not None:
             self._snip_session.close()
             self._snip_session = None

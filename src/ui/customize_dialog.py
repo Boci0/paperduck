@@ -5,11 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QPushButton,
@@ -42,6 +44,7 @@ class CustomizeDialog(QDialog):
     def __init__(self, win: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._win = win
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setWindowTitle("Paperduck - Customize")
         self.setMinimumSize(540, 480)
         self.setStyleSheet(
@@ -146,7 +149,7 @@ class CustomizeDialog(QDialog):
             box.blockSignals(True)
             box.setChecked(not box.isChecked())
             box.blockSignals(False)
-            self._win._show_toast(res)
+            self._win._show_toast(res, QColor("#EF7D57"))
         self._refresh_wheel_count()
 
     def _refresh_wheel_count(self) -> None:
@@ -159,9 +162,18 @@ class CustomizeDialog(QDialog):
         self._refresh_wheel_tab()
 
     def _remove_selected_custom(self) -> None:
-        if not self._win.wheel.custom:
+        custom = self._win.wheel.custom
+        if not custom:
             return
-        self._win.wheel.remove_custom(len(self._win.wheel.custom) - 1)
+        if len(custom) == 1:
+            idx = 0
+        else:
+            labels = [f"{i + 1}. {lbl} ({tgt})" for i, (lbl, tgt) in enumerate(custom)]
+            choice, ok = QInputDialog.getItem(self, "Remove Custom Slice", "Choose slice to remove:", labels, 0, False)
+            if not ok or not choice:
+                return
+            idx = labels.index(choice)
+        self._win.wheel.remove_custom(idx)
         self._refresh_wheel_tab()
 
     # ------------------------------------------------------------------ Menu

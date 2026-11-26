@@ -106,7 +106,12 @@ class QuickCommandBar(QWidget):
         super().mouseReleaseEvent(event)
 
     def changeEvent(self, event: QEvent) -> None:
-        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow() and self._drag_offset is None:
+        if (
+            event.type() == QEvent.Type.ActivationChange
+            and not self.isActiveWindow()
+            and self._drag_offset is None
+            and QApplication.activePopupWidget() is None
+        ):
             self.hide()
         super().changeEvent(event)
 

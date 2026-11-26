@@ -147,13 +147,24 @@ class ReadOnlyHost:
             return self._cmd_runner(self.root, args)
         if name in EDIT_TOOLS and self.role == "worker" and self.allowed_paths:
             try:
-                planned = plan_edits(self.root, args) if name == "edit_files" else [plan_edit(self.root, args)]
+                if name == "edit_files":
+                    planned = plan_edits(self.root, args)
+                else:
+                    raw_p = args.get("path")
+                    prior = (next((e for e in self.staged_edits if e.path == resolve(self.root, raw_p)), None)
+                             if isinstance(raw_p, str) and raw_p.strip() else None)
+                    planned = [plan_edit(self.root, args, prior=prior)]
             except ValueError as exc:
                 return f"error: {exc}"
             for edit in planned:
                 if not self._can_stage(edit.path):
                     return f"error: {edit.rel} is outside this worker's allowed_paths"
-            self.staged_edits.extend(planned)
+            for edit in planned:
+                prior_idx = next((i for i, e in enumerate(self.staged_edits) if e.path == edit.path), None)
+                if prior_idx is not None:
+                    self.staged_edits[prior_idx] = edit
+                else:
+                    self.staged_edits.append(edit)
             return "staged " + ", ".join(f"{e.rel} (+{e.added} -{e.removed})" for e in planned) + " for parent approval"
         if name in FILE_TOOLS:
             out = run_file_tool(self.root, name, args)
@@ -297,7 +308,7 @@ class Agents:
         except Exception as exc:  # a bug must not leave wait_agents hanging on this agent
             kind, report = "failed", f"(failed: {type(exc).__name__})"
         try:
-            if agent.dropped:  # New chat: nothing of the old chat may reach the new one's inbox or sheets
+            if agent.dropped or cancel.is_set():  # New chat or Stop: nothing of the cancelled run may reach the inbox
                 return
             agent.report = report
             if host.staged_edits:

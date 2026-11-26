@@ -570,7 +570,13 @@ def tidy(path: str, url: str, key: str, model: str, thinking: str = "off") -> Wa
         return WatchReply(text="I could not read any files in that folder.")
     from datetime import datetime
 
-    listing = "\n".join(f"{n}\t{s:,} B\t{datetime.fromtimestamp(m):%Y-%m-%d}" for n, s, m in rows)
+    def _fmt_dt(ts: float) -> str:
+        try:
+            return f"{datetime.fromtimestamp(ts):%Y-%m-%d}"
+        except (OSError, OverflowError, ValueError):
+            return "unknown"
+
+    listing = "\n".join(f"{n}\t{s:,} B\t{_fmt_dt(m)}" for n, s, m in rows)
     got = ask(url, key, model, [{"role": "system", "content": SYSTEM}, {"role": "user", "content":
               TIDY_PROMPT.format(path=path) + f"\n\n<data>\n{listing}\n</data>"}], web=False, thinking=thinking)
     plan = parse_tidy_plan(got.text, {n for n, _s, _m in rows})

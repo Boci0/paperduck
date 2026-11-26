@@ -389,11 +389,11 @@ class ErrandsPlugin:
         if not isinstance(data, dict):
             return
         now = time.time() if now is None else now
-        if isinstance(data.get("next"), int) and data["next"] > 0:
+        if isinstance(data.get("next"), int) and not isinstance(data.get("next"), bool) and data["next"] > 0:
             self._next = data["next"]
-        if data.get("day") == self._day and isinstance(data.get("runs"), int):
+        if data.get("day") == self._day and isinstance(data.get("runs"), int) and not isinstance(data.get("runs"), bool):
             self.runs = max(0, data["runs"])
-        if isinstance(data.get("done"), int):
+        if isinstance(data.get("done"), int) and not isinstance(data.get("done"), bool):
             self.done = max(0, data["done"])
         for raw in data.get("errands") or []:
             try:
@@ -416,6 +416,8 @@ class ErrandsPlugin:
                 self.fired.append((errand, "Paperduck just started (the PC was restarted, or the app was)"))
             elif len(self.errands) < MAX_ERRANDS:
                 self.errands.append(errand)
+            if errand.id.startswith("e") and errand.id[1:].isdigit():
+                self._next = max(self._next, int(errand.id[1:]) + 1)
 
 
 # ---------------------------------------------------------------------- Windows probes

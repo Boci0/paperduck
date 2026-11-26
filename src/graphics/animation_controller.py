@@ -119,6 +119,12 @@ class AnimationController:
         prev_index = self._frame_index
         self._elapsed_in_frame_ms += elapsed_ms
 
+        clip = self.current_clip()
+        if self._oneshot_state is None and clip.loop:
+            total = sum(clip.durations_ms)
+            if total > 0 and self._elapsed_in_frame_ms >= total:
+                self._elapsed_in_frame_ms %= total
+
         while True:
             clip = self.current_clip()
             frame_duration = clip.durations_ms[self._frame_index]

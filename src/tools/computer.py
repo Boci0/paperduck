@@ -101,8 +101,26 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _U)]
 
 
+_USER32: Any = None
+
+
 def _user32():
-    return ctypes.WinDLL("user32", use_last_error=True)
+    global _USER32
+    if _USER32 is None:
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsWindowVisible.restype = wintypes.BOOL
+        u.IsIconic.argtypes = [wintypes.HWND]
+        u.IsIconic.restype = wintypes.BOOL
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetForegroundWindow.restype = wintypes.BOOL
+        _USER32 = u
+    return _USER32
 
 
 def _send(*inputs: _Input) -> None:
