@@ -346,7 +346,7 @@ _MOD_ALT, _MOD_CONTROL, _MOD_SHIFT, _MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 _WM_HOTKEY, _WM_QUIT = 0x0312, 0x0012
 HOTKEY_LABEL = "Ctrl+Shift+Alt"
 HOTKEY_MODES: dict[int, tuple[str, str]] = {1: ("S", "image"), 2: ("T", "text"), 3: ("C", "color"), 4: ("A", "ai"),
-                                             5: ("W", "watch")}
+                                             5: ("W", "watch"), 6: ("Q", "quick")}
 # shortcut: 1..9 are held even with fewer macros, register per macro if a user reports a clash
 HOTKEY_MODES.update({10 + n: (str(n), f"macrokey:{n}") for n in range(1, 10)})
 # Two-key combos (id: modifiers, virtual key, mode). Alt+` (VK_OEM_3) has no Windows or app-menu meaning
@@ -355,7 +355,7 @@ WATCH_SHORT_LABEL = "Alt+`"
 _MOD_WIN = 0x8
 # Rebindable actions (Settings > Hotkeys), in menu order; macro digits stay on Ctrl+Shift+Alt+1..9
 HOTKEY_ACTIONS: dict[str, str] = {"image": "Snip Image", "text": "Snip Text", "color": "Pick Color",
-                                  "ai": "AI Chat", "watch": "Watch Now"}
+                                  "ai": "AI Chat", "watch": "Watch Now", "quick": "Quick Command"}
 _MOD_NAMES = {"ctrl": _MOD_CONTROL, "control": _MOD_CONTROL, "shift": _MOD_SHIFT, "alt": _MOD_ALT,
               "win": _MOD_WIN, "meta": _MOD_WIN}
 

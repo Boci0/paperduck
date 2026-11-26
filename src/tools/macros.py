@@ -18,13 +18,15 @@ STEPS: dict[str, tuple[bool, str]] = {
     "ocr": (False, "read its text"),
     "ask": (False, "ask the AI"),
     "chat": (False, "put it in the AI chat"),
+    "quick": (False, "open Quick Command"),
+    "ambient": (False, "add recent desktop context"),
     "copy": (False, "copy it"),
     "save": (False, "save the image"),
     "search": (False, "Google it"),
     "open": (True, "open {arg}"),
     "tool": (True, "run {arg}"),
 }
-STEP_HELP = ("region  screen  clipboard  text:Your words  ocr  ask  chat  copy  save  search  "
+STEP_HELP = ("region  screen  clipboard  ambient  text:Your words  ocr  ask  chat  quick  copy  save  search  "
              "open:https://site/?q={text}  tool:pomodoro:toggle")
 MAX_MACROS = 9  # Ctrl+Shift+Alt+1..9
 MAX_NAME = 12  # wheel slice label width

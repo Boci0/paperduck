@@ -306,10 +306,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "come back. Triggers are checked on the PC for free; the model runs once, when it fires. The user allows "
         "each errand first. Kinds: " + "; ".join(f"{k} ({v})" for k, v in ERRAND_KINDS.items()) + ".",
         {"when": {"type": "object", "description": "{\"kind\": ..., plus its fields}, e.g. {\"kind\": "
-                  "\"background_done\", \"id\": \"bg2\"} or {\"kind\": \"file_appears\", \"pattern\": "
+                  "\"background_done\", \"id\": \"bg2\"}, {\"kind\": \"every\", \"minutes\": 30}, or {\"kind\": \"file_appears\", \"pattern\": "
                   "\"~/Downloads/*.zip\"}"},
          "instruction": {"type": "string", "description": "What to do when it fires, written to your future self "
-                         "with everything needed (paths, what done looks like)"}},
+                         "with everything needed (paths, what done looks like)"},
+         "repeat": {"type": "boolean", "description": "Keep this routine active after firing (always true for kind='every')"},
+         "script": {"type": "string", "description": "Optional deterministic cmd command to run first; wakes the AI only on failure or NEEDS_AI:"}},
         ("when", "instruction")),
     _fn("cancel_errand", "Cancel a waiting errand by its id (pet_status lists them).", {"id": {"type": "string"}},
         ("id",)),
@@ -368,6 +370,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
          "steps": {"type": "integer", "description": "How many recent edit batches to undo (1 to 10, default 1)"},
          "id": {"type": "string", "description": "Optional specific batch id from list=true"},
          "force": {"type": "boolean", "description": "Overwrite even if the file changed after the AI edit"}}),
+    _fn("revert_checkpoint", "Revert the entire current task's git checkpoint (restores tracked files and removes "
+        "newly created untracked files after user approval)."),
     _fn("file_outline", "Show classes, functions, methods, or markdown headings with line numbers for a source file.",
         {"path": _PATH}, ("path",)),
     _fn("search_sessions", "Search saved past chats by keyword in titles or messages.",
@@ -442,6 +446,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
         {"name": {"type": "string"}, "instructions": {"type": "string", "description": "The whole new body"},
          "description": {"type": "string", "description": "Optional new one-line description"}},
         ("name", "instructions")),
+    _fn("crystallize_skill", "Distill the current successful workflow run into a reusable skill and save it after "
+        "user approval.",
+        {"name": {"type": "string", "description": "Optional short skill slug"},
+         "description": {"type": "string", "description": "Optional one-line description"},
+         "goal": {"type": "string", "description": "Optional workflow goal summary"}}),
     _fn("remember", "Save one short lasting note to your memory, which every later chat sees: a correction, a "
         "preference, or a fact about the user's setup (e.g. 'Tests run with .venv\\Scripts\\python -m pytest'). "
         "Optional scope tags like [project:name], [app:exe], or [topic:tag] keep prompts lean. "
@@ -473,23 +482,27 @@ TOOL_SPECS: list[dict[str, Any]] = [
          "agg_field": {"type": "string"},
          "sort_by": {"type": "string"}, "desc": {"type": "boolean"},
          "limit": {"type": "integer"}}),
-    _fn("search_tools", "Discover and activate deferred built-in tool groups (computer, design_docs, "
-        "background_errands, desktop_pet, meta_skills) by keyword or group name.",
+    _fn("search_tools", "Discover and activate deferred built-in tool groups (screen_inspect, computer_control, "
+        "canvas_design, design_docs, background_errands, desktop_pet, meta_skills) or configured MCP servers by "
+        "keyword, group, or server name.",
         {"query": {"type": "string"},
-         "group": {"type": "string", "enum": ["computer", "design_docs", "background_errands", "desktop_pet", "meta_skills"]}}),
+         "group": {"type": "string", "enum": ["screen_inspect", "computer_control", "canvas_design", "design_docs",
+                                             "background_errands", "desktop_pet", "meta_skills"]},
+         "server": {"type": "string", "description": "Optional MCP server name to activate"}}),
 ]
 CORE_TOOL_NAMES = frozenset({
     "list_files", "read_file", "file_outline", "batch_read", "query_files", "find_files", "search_text",
-    "edit_file", "edit_files", "undo_edits", "run_command", "run_powershell", "run_python", "plan_tasks", "calculate",
-    "find_skill", "load_skill", "search_tools",
+    "edit_file", "edit_files", "undo_edits", "revert_checkpoint", "run_command", "run_powershell", "run_python",
+    "plan_tasks", "calculate", "find_skill", "load_skill", "search_tools",
 })
 TOOL_GROUPS: dict[str, frozenset[str]] = {
-    "computer": frozenset({
-        "read_screen", "screen_map", "peek_region", "sample_colors", "layout_check", "mouse_click",
-        "mouse_hover", "mouse_drag", "mouse_path", "type_text", "type_login", "paste_text", "press_key",
-        "computer_batch", "scroll", "list_windows", "focus_window", "ui_action", "wait_for_ui",
+    "screen_inspect": frozenset({"read_screen", "screen_map", "list_windows", "view_image"}),
+    "computer_control": frozenset({
+        "mouse_click", "mouse_hover", "mouse_drag", "type_text", "type_login", "paste_text", "press_key",
+        "computer_batch", "scroll", "focus_window", "ui_action", "wait_for_ui",
     }),
-    "design_docs": frozenset({"preview_document", "view_image", "make_sheet", "clean_metadata", "save_file"}),
+    "canvas_design": frozenset({"peek_region", "sample_colors", "layout_check", "mouse_path"}),
+    "design_docs": frozenset({"preview_document", "make_sheet", "clean_metadata", "save_file"}),
     "background_errands": frozenset({
         "start_background", "read_background", "send_background_input", "stop_background", "set_errand", "cancel_errand",
     }),
@@ -497,14 +510,18 @@ TOOL_GROUPS: dict[str, frozenset[str]] = {
         "read_clipboard", "copy_text", "pet_status", "pet_action", "run_macro", "open_link", "search_sessions",
     }),
     "meta_skills": frozenset({
-        "find_mcp_servers", "add_mcp_server", "add_skill", "update_skill", "remember", "search_memory", "forget",
+        "find_mcp_servers", "add_mcp_server", "add_skill", "update_skill", "crystallize_skill", "remember",
+        "search_memory", "forget",
     }),
+}
+_GROUP_ALIASES: dict[str, tuple[str, ...]] = {
+    "computer": ("screen_inspect", "computer_control"),
 }
 _TOOL_GROUP_MAP = {name: grp for grp, names in TOOL_GROUPS.items() for name in names}
 # the user allows each call in the chat (or all of them for a chat)
 COMPUTER_TOOLS = {"mouse_click", "mouse_hover", "mouse_drag", "mouse_path", "type_text", "paste_text", "press_key", "scroll", "focus_window", "ui_action"}  # computer_batch runs these as its steps
 SCREEN_TOOLS = COMPUTER_TOOLS | {"screen_map", "peek_region", "sample_colors", "computer_batch", "layout_check", "wait_for_ui"}  # an answer using these gets screen_thinking
-APPROVED_TOOLS = COMPUTER_TOOLS | {"computer_batch", "edit_file", "edit_files", "undo_edits", "run_command", "run_powershell", "run_python", "start_background", "send_background_input", "add_mcp_server", "add_skill", "update_skill", "remember", "forget", "set_errand"}
+APPROVED_TOOLS = COMPUTER_TOOLS | {"computer_batch", "edit_file", "edit_files", "undo_edits", "revert_checkpoint", "run_command", "run_powershell", "run_python", "start_background", "send_background_input", "add_mcp_server", "add_skill", "update_skill", "crystallize_skill", "remember", "forget", "set_errand"}
 FILE_TOOLS = {"list_files", "read_file", "find_files", "search_text"}
 
 
@@ -2902,11 +2919,16 @@ def tool_group_of(name: str) -> str:
 
 
 _GROUP_HINTS: dict[str, tuple[str, ...]] = {
-    "computer": ("screen", "click", "window", "mouse", "type", "login", "browser", "canva", "button", "app", "ui"),
-    "design_docs": ("pdf", "word", "docx", "slide", "pptx", "excel", "xlsx", "sheet", "image", "png", "poster", "design"),
-    "background_errands": ("background", "errand", "server", "watch", "daemon", "remind", "later", "port"),
-    "desktop_pet": ("clipboard", "copy", "macro", "session", "past chat", "pomodoro", "timer", "pet"),
-    "meta_skills": ("skill", "remember", "forget", "memory", "mcp"),
+    "screen_inspect": ("screenshot", "screen", "open windows", "list windows", "view image", "ocr"),
+    "computer_control": (
+        "click", "double click", "right click", "mouse", "drag", "press key", "hotkey",
+        "type login", "log me in", "focus window", "automate", "scroll down", "scroll up",
+    ),
+    "canvas_design": ("canva", "layout check", "sample color", "eyedropper", "contrast ratio", "canvas", "poster", "flyer", "slide layout"),
+    "design_docs": ("pdf", "docx", "word doc", "pptx", "powerpoint", "xlsx", "excel", "cheat sheet", "handout", "one-page", "metadata", "save file"),
+    "background_errands": ("background process", "in the background", "errand", "remind me", "daemon", "when it finishes", "when port"),
+    "desktop_pet": ("clipboard", "macro", "past chat", "previous chat", "pomodoro", "focus timer"),
+    "meta_skills": ("mcp server", "add skill", "update skill", "remember that", "forget that", "my memory", "saved memory"),
 }
 
 
@@ -2914,21 +2936,27 @@ def infer_tool_groups(text: str) -> set[str]:
     low = (text or "").lower()
     out: set[str] = set()
     for grp, words in _GROUP_HINTS.items():
-        if any(re.search(rf"\b{re.escape(w)}", low) for w in words):
+        if any(re.search(rf"\b{re.escape(w)}\b", low) for w in words):
             out.add(grp)
     return out
 
 
 def search_tools_catalog(query: Any = "", group: Any = "") -> tuple[set[str], str]:
     want_group = group.strip() if isinstance(group, str) else ""
-    if want_group and want_group not in TOOL_GROUPS:
-        return set(), "error: unknown group. Groups: " + ", ".join(sorted(TOOL_GROUPS))
+    want_groups: set[str] = set()
+    if want_group:
+        if want_group in TOOL_GROUPS:
+            want_groups = {want_group}
+        elif want_group in _GROUP_ALIASES:
+            want_groups = set(_GROUP_ALIASES[want_group])
+        else:
+            return set(), "error: unknown group. Groups: " + ", ".join(sorted(TOOL_GROUPS))
     q = query.strip().lower() if isinstance(query, str) else ""
     terms = [t for t in re.findall(r"[a-z0-9_]+", q) if len(t) > 1]
-    if not want_group and not terms:
+    if not want_groups and not terms:
         summary = "\n".join(f"- {g}: {', '.join(sorted(names))}" for g, names in TOOL_GROUPS.items())
         return set(), "Deferred tool groups:\n" + summary
-    activated: set[str] = {want_group} if want_group else set()
+    activated: set[str] = set(want_groups)
     lines: list[str] = []
     for spec in TOOL_SPECS:
         fn = spec["function"]
@@ -2936,7 +2964,7 @@ def search_tools_catalog(query: Any = "", group: Any = "") -> tuple[set[str], st
         grp = _TOOL_GROUP_MAP.get(name, "")
         if not grp:
             continue
-        if want_group and grp != want_group:
+        if want_groups and grp not in want_groups:
             continue
         hay = f"{name} {grp} {fn['description']}".lower()
         if terms and not any(t in hay for t in terms):

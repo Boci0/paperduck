@@ -31,6 +31,7 @@ from src.updater import (APP_DIR, FROZEN, FROZEN_EXE, launch_env, finish_frozen_
 # Stored beside plugin state in state.json "tools"; not a ToolPlugin, so it never joins the HUD cycle
 RECENT_FILES_KEY = "recent"
 WHEEL_KEY = "wheel"
+MENU_KEY = "menu"
 MACROS_KEY = "macros"
 TIPS_KEY = "tips"
 SIZE_KEY = "size"
@@ -90,6 +91,7 @@ class PaperduckApp:
         )
         self.window.recent.load_dict(saved.tools_data.get(RECENT_FILES_KEY))
         self.window.wheel.load_dict(saved.tools_data.get(WHEEL_KEY))
+        self.window.menu_layout.load_dict(saved.tools_data.get(MENU_KEY))
         self.window.macros.load_dict(saved.tools_data.get(MACROS_KEY))
         tips = saved.tools_data.get(TIPS_KEY)
         # No tips entry but saved tools: an install from before tips, whose user already knows the pet
@@ -204,6 +206,7 @@ class PaperduckApp:
             tools_payload[plugin.tool_id] = plugin.to_dict()
         tools_payload[RECENT_FILES_KEY] = self.window.recent.to_dict()
         tools_payload[WHEEL_KEY] = self.window.wheel.to_dict()
+        tools_payload[MENU_KEY] = self.window.menu_layout.to_dict()
         tools_payload[MACROS_KEY] = self.window.macros.to_dict()
         tools_payload[TIPS_KEY] = {"seen": self.window.tips_seen}
         tools_payload[SIZE_KEY] = {"scale": self.window.pet_scale}

@@ -445,6 +445,9 @@ class ToolsMixin:
         if mode == "ai":  # Ctrl+Shift+Alt+A opens the chat bar
             self.open_ai_chat()
             return
+        if mode == "quick":
+            self.open_quick_bar()
+            return
         if mode == "watch":  # Alt+` or Ctrl+Shift+Alt+W: Watch lens on the screen now
             self.watch_now()
             return

@@ -500,6 +500,15 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._ask(content, [a.image_url for a in usable if a.image_url],
                   [a.as_prompt() for a in usable if a.image_url], said=text)
 
+    def send_prompt(self, text: str) -> bool:
+        """Submit a text prompt directly (used by QuickCommandBar and voice input)."""
+        clean = (text or "").strip()
+        if not clean or self._job is not None:
+            return False
+        self._draft.setPlainText(clean)
+        self.send()
+        return True
+
     def _ask(self, content: str, images: list[str] | None = None, image_notes: list[str] | None = None,
              said: str = "") -> None:
         """Start an answer to `content`, whose bubble is already in the thread. `image_notes` (each image's name and
@@ -595,12 +604,18 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
             compact_model = getattr(p, "helper_model", "") or model
             sent, n, summary = (compact_history(url, key, compact_model, history, cancel, keep, tasks) if long
                                 else (history, 0, ""))
+            if n > 0 and host is not None and hasattr(host, "clear_loaded_tools"):
+                host.clear_loaded_tools()
+                last_txt = next((t.get("content", "") for t in reversed(sent) if t.get("role") == "user"), "")
+                if hasattr(host, "prewarm_groups"):
+                    host.prewarm_groups(last_txt if isinstance(last_txt, str) else "")
             # shortcut: Claude still gets earlier answers in note form (its turns are built in another shape)
             ws_note = host.workspace_note() if hasattr(host, "workspace_note") else ""
+            amb_note = host.ambient_note() if hasattr(host, "ambient_note") else ""
             proj = host._project() if hasattr(host, "_project") else None
             last_msg = next((t.get("content", "") for t in reversed(sent) if t.get("role") == "user"), "")
             scope_hint = f"{proj.name if proj else ''} {last_msg if isinstance(last_msg, str) else ''}".strip()
-            extra_parts = [part for part in (REMOTE_SYSTEM_NOTE if self._remote_only else "", ws_note) if part]
+            extra_parts = [part for part in (REMOTE_SYSTEM_NOTE if self._remote_only else "", ws_note, amb_note) if part]
             reply = ask(url, key, model, chat_messages(sent, wire=not is_anthropic(url), extra_system="\n\n".join(extra_parts), memory_scope=scope_hint), thinking=thinking,
                         screen_thinking=screen, host=host, progress=note,
                         steer=lambda: self._take_steer(cancel), cancel=cancel)
@@ -1485,10 +1500,13 @@ class AiChat(ChatSetupMixin, ChatAttachMixin, QWidget):
         self._last_prompt_tokens = 0
         self._history.clear()
         self._allowed.clear()
-        if hasattr(self._tool_host, "mcp_loaded"):
-            self._tool_host.mcp_loaded.clear()
-        if hasattr(self._tool_host, "tool_groups_loaded"):
-            self._tool_host.tool_groups_loaded.clear()
+        if hasattr(self._tool_host, "clear_loaded_tools"):
+            self._tool_host.clear_loaded_tools()
+        else:
+            if hasattr(self._tool_host, "mcp_loaded"):
+                self._tool_host.mcp_loaded.clear()
+            if hasattr(self._tool_host, "tool_groups_loaded"):
+                self._tool_host.tool_groups_loaded.clear()
         self._remote_steers.clear()
         self._draft.clear()
         self._clear_attachments()

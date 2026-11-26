@@ -60,6 +60,9 @@ class WatchMixin:
         self._check_away()
         self._poll_errands()
         app = foreground_app()  # ~0.03ms per 3s tick
+        title = foreground_title()
+        if (ambient := getattr(self, "ambient", None)) is not None:
+            ambient.record_window(app, title)
         if (hints := self._hints_plugin()) is not None:
             hints.note_app(app)
         if self._hint is not None:
@@ -90,12 +93,15 @@ class WatchMixin:
         else:
             cb = QGuiApplication.clipboard()
             # a password manager's copy is never inspected or offered to Watch
-            clip = cb.text() if cb is not None and not clipboard_is_private(cb.mimeData()) else ""
+            private = cb is None or clipboard_is_private(cb.mimeData())
+            clip = cb.text() if cb is not None and not private else ""
+            if clip and (ambient := getattr(self, "ambient", None)) is not None:
+                ambient.record_clipboard(clip, app, private=False)
             if seq is not None and seq != 0:
                 self._last_hint_clip_seq = seq
         pomo = self._state_machine.pomodoro_plugin
         hint = hints.poll(app, clip,
-                          pomo is not None and not pomo.running, title=foreground_title(),
+                          pomo is not None and not pomo.running, title=title,
                           watch_ok=hints.watch and self._watch_ready())
         if hint is not None and hint.action == "watch:tidy" and not hint.data:
             self._check_folder(hint, foreground_title())  # the card shows only if the folder is messy

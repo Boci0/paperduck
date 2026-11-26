@@ -1156,6 +1156,18 @@ def claude_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str,
     return system, turns
 
 
+def _claude_tools(host: ToolHost | None, web: bool, dynamic: bool) -> list[dict[str, Any]]:
+    specs = (host.specs if dynamic else _all_specs(host)) if host else []
+    tools = (CLAUDE_TOOLS if web else []) + [
+        {"name": s["function"]["name"], "description": s["function"]["description"],
+         "input_schema": s["function"]["parameters"]}
+        for s in specs
+    ]
+    if tools:
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    return tools
+
+
 def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str, Any]], thinking: str,
                     timeout: float | None, host: ToolHost | None = None,
                     progress: Callable[[str], None] | None = None, web: bool = True,
@@ -1167,19 +1179,17 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     A tool_use stop runs `host`'s local tools and sends their results back. Anthropic's own web_fetch only
     opens links already in the conversation, so it needs no exfiltration guard here.
     """
-    # Fixed for the whole answer: thinking blocks are bound to the tool list, so an MCP server added mid-answer
-    # joins with the next message
-    tools = (CLAUDE_TOOLS if web else []) + [{"name": s["function"]["name"], "description": s["function"]["description"],
-                             "input_schema": s["function"]["parameters"]} for s in (_all_specs(host) if host else [])]
-    if tools:
-        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    # When adaptive thinking is on, thinking blocks are bound to the tool list so it stays fixed for the answer;
+    # when thinking is off, Claude uses dynamic host.specs so newly activated groups/MCPs join on the next round.
+    effort = CLAUDE_EFFORT.get(thinking)
+    dynamic_tools = effort is None
+    tools = _claude_tools(host, web, dynamic_tools)
     system, turns = claude_messages(messages)
     last = turns[-1]  # prompt cache breakpoint: tools, system and the chat so far are reused by the next message
     blocks = [{"type": "text", "text": last["content"]}] if isinstance(last["content"], str) else list(last["content"])
     if blocks:
         blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
         turns = [*turns[:-1], {**last, "content": blocks}]
-    effort = CLAUDE_EFFORT.get(thinking)
     spent = [0, 0, 0]  # input, output, thinking tokens over every round
     paid = 0  # the same, billable (see _billable)
     last_prompt = 0
@@ -1194,6 +1204,8 @@ def _post_anthropic(base_url: str, key: str, model: str, messages: list[dict[str
     start = len(turns)  # this answer's own turns follow
     verify_pushed = False
     for _ in range(MAX_NATIVE_ROUNDS + MAX_TOOL_ROUNDS + 2):
+        if dynamic_tools and host is not None:
+            tools = _claude_tools(host, web, True)
         body: dict[str, Any] = {"model": model, "system": system, "messages": turns, **({"tools": tools} if tools else {}),
                                 "max_tokens": MAX_THINKING_TOKENS if effort else MAX_REPLY_TOKENS,
                                 **({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": effort}}
@@ -2496,6 +2508,7 @@ class AiAssistPlugin:
         sub = self.SUBMENU_NAME
         return [
             ToolMenuItem(label=f"Open AI Chat\t{HOTKEY_LABEL}+A", callback_id="ai:chat", submenu=sub),
+            ToolMenuItem(label=f"Quick Command\t{HOTKEY_LABEL}+Q", callback_id="snip:quick", submenu=sub),
             ToolMenuItem(label="Set Up Starter Pack", callback_id="ai:starter", enabled=not self._setting_up,
                          submenu=sub),
             ToolMenuItem(label="Open Skills Folder", callback_id="ai:skills", submenu=sub),

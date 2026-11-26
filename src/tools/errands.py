@@ -12,14 +12,16 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 from src.engine.models import CompanionState, HudBar, HudData, ToolMenuItem
 
 MAX_ERRANDS = 8  # waiting at once
 MAX_ERRAND_CHARS = 1000  # one instruction
+MAX_SCRIPT_CHARS = 2000  # compiled routine script
 MAX_ERRAND_RUNS = 20  # fires per day
 ERRAND_HOURS = 24  # how long an errand waits
 STARTUP_DAYS = 7  # a next_startup errand waits longer: the PC may stay on for days
@@ -27,6 +29,7 @@ EVIDENCE_LINES = 40  # output lines handed to the model when a background errand
 AWAY_S = 300  # user_returns needs this long without input first (same as the pet's sleep)
 PARTIAL_SUFFIXES = (".crdownload", ".part", ".partial", ".tmp", ".download")
 ERRAND_MARK = "[Paperduck: an errand you set fired"
+_REPEATABLE = frozenset({"every", "at_time", "file_appears", "window_appears", "port_opens", "user_returns"})
 KINDS: dict[str, str] = {
     "background_done": "id: a background command (bgN) exits",
     "background_prints": "id, text: a background command's new output contains text",
@@ -35,6 +38,7 @@ KINDS: dict[str, str] = {
     "port_opens": "port: a local TCP port starts listening",
     "window_appears": "title: the front window's title contains text",
     "at_time": "time: HH:MM local time, or minutes: from now",
+    "every": "minutes: repeat every N minutes (1 to 10080)",
     "user_returns": "(no fields): the user comes back after 5 minutes away",
     "next_startup": "(no fields): the next time Paperduck starts (after a reboot or crash)",
 }
@@ -63,6 +67,10 @@ class Errand:
     created: float = 0.0
     expires: float = 0.0
     base: dict[str, Any] = field(default_factory=dict)  # state at creation (output offset, files already there)
+    repeat: bool = False
+    script: str = ""
+    last_run: float = 0.0
+    run_count: int = 0
 
 
 def parse_when(when: Any) -> tuple[str, dict[str, Any]]:
@@ -108,6 +116,11 @@ def parse_when(when: Any) -> tuple[str, dict[str, Any]]:
         if not _HHMM.match(text("time", 5)):
             raise ValueError("time is HH:MM in 24-hour local time, or give minutes")
         return kind, {"time": when["time"].strip()}
+    if kind == "every":
+        minutes = when.get("minutes")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 10080:
+            raise ValueError("every needs minutes (whole number from 1 to 10080)")
+        return kind, {"minutes": minutes}
     return kind, {}
 
 
@@ -131,6 +144,7 @@ def describe(kind: str, arg: dict[str, Any]) -> str:
         "port_opens": lambda: f"when port {arg['port']} opens",
         "window_appears": lambda: f"when a window titled {arg['title']!r} comes to the front",
         "at_time": lambda: (f"in {arg['minutes']} minutes" if "minutes" in arg else f"at {arg['time']}"),
+        "every": lambda: f"every {arg['minutes']} minutes",
         "user_returns": lambda: "when you come back to the PC",
         "next_startup": lambda: "the next time Paperduck starts",
     }[kind]()
@@ -165,7 +179,7 @@ def baseline(kind: str, arg: dict[str, Any], probes: Probes, now: float) -> dict
             raise ValueError(f"{arg['exe']} is not running now")
     if kind == "file_appears":
         return {"names": sorted(_matches(arg["folder"], arg["glob"]))}
-    if kind == "at_time":
+    if kind in ("at_time", "every"):
         return {"due": _due(arg, now)}
     return {}
 
@@ -210,7 +224,7 @@ def check(errand: Errand, probes: Probes, now: float) -> str | None:
         if title and not is_private_title(title) and arg["title"].lower() in title.lower():
             return f"the front window is {title[:120]!r}"
         return None
-    if kind == "at_time":
+    if kind in ("at_time", "every"):
         return "it is time" if now >= base.get("due", 0) else None
     if kind == "user_returns":
         idle = probes.idle()
@@ -254,19 +268,27 @@ class ErrandsPlugin:
     def desired_state(self) -> CompanionState | None:
         return None
 
-    def add(self, when: Any, instruction: Any, sid: str, now: float | None = None) -> Errand:
+    def add(self, when: Any, instruction: Any, sid: str, now: float | None = None,
+            repeat: bool = False, script: str = "") -> Errand:
         """A new waiting errand, or ValueError (bad trigger, too many, too long)."""
         kind, arg = parse_when(when)
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("give the instruction to follow when it fires")
         if len(instruction) > MAX_ERRAND_CHARS:
             raise ValueError(f"keep the instruction under {MAX_ERRAND_CHARS} characters")
+        clean_script = script.strip() if isinstance(script, str) else ""
+        if len(clean_script) > MAX_SCRIPT_CHARS:
+            raise ValueError(f"keep the compiled script under {MAX_SCRIPT_CHARS} characters")
+        is_repeat = bool(repeat) or kind == "every"
+        if is_repeat and kind not in _REPEATABLE:
+            raise ValueError(f"{kind} cannot repeat")
         if len(self.errands) >= MAX_ERRANDS:
             raise ValueError(f"{MAX_ERRANDS} errands are already waiting; cancel one first")
         now = time.time() if now is None else now
+        ttl = 0.0 if is_repeat else now + (STARTUP_DAYS * 86400 if kind == "next_startup" else ERRAND_HOURS * 3600)
         errand = Errand(f"e{self._next}", kind, arg, instruction.strip(), sid, now,
-                        now + (STARTUP_DAYS * 86400 if kind == "next_startup" else ERRAND_HOURS * 3600),
-                        baseline(kind, arg, self.probes, now))
+                        ttl, baseline(kind, arg, self.probes, now),
+                        repeat=is_repeat, script=clean_script)
         self._next += 1
         self.errands.append(errand)
         return errand
@@ -283,7 +305,7 @@ class ErrandsPlugin:
         now = time.time() if now is None else now
         changed = False
         for errand in list(self.errands):
-            if now >= errand.expires:
+            if errand.expires > 0 and now >= errand.expires:
                 self.errands.remove(errand)
                 changed = True
                 continue
@@ -292,8 +314,17 @@ class ErrandsPlugin:
             except (OSError, ValueError, KeyError):
                 evidence = None  # a probe hiccup never fires an errand
             if evidence is not None:
-                self.errands.remove(errand)
-                self.fired.append((errand, evidence))
+                if errand.repeat:
+                    errand.last_run = now
+                    errand.run_count += 1
+                    try:
+                        errand.base = baseline(errand.kind, errand.arg, self.probes, now)
+                    except (OSError, ValueError):
+                        pass
+                    self.fired.append((replace(errand, base=dict(errand.base), arg=dict(errand.arg)), evidence))
+                else:
+                    self.errands.remove(errand)
+                    self.fired.append((errand, evidence))
                 changed = True
         return changed
 
@@ -337,7 +368,11 @@ class ErrandsPlugin:
     def to_dict(self) -> dict[str, Any]:
         return {"next": self._next, "day": self._day, "runs": self.runs, "done": self.done, "errands": [
             {"id": e.id, "kind": e.kind, "arg": e.arg, "instruction": e.instruction, "sid": e.sid,
-             "created": e.created, "expires": e.expires, "base": e.base} for e in self.errands]}
+             "created": e.created, "expires": e.expires, "base": e.base,
+             **({"repeat": True} if e.repeat else {}),
+             **({"script": e.script} if e.script else {}),
+             **({"last_run": e.last_run, "run_count": e.run_count} if e.run_count else {})}
+            for e in self.errands]}
 
     def load_dict(self, data: dict[str, Any], now: float | None = None) -> None:
         """Background-command errands are dropped (those commands died with the app); next_startup ones fire."""
@@ -354,12 +389,18 @@ class ErrandsPlugin:
             try:
                 kind, arg = parse_when({"kind": raw["kind"], **raw["arg"]}) if raw["kind"] != "file_appears" \
                     else (raw["kind"], {k: str(raw["arg"][k]) for k in ("pattern", "folder", "glob")})
-                errand = Errand(str(raw["id"]), kind, arg, str(raw["instruction"])[:MAX_ERRAND_CHARS],
-                                str(raw.get("sid") or ""), float(raw["created"]), float(raw["expires"]),
-                                dict(raw.get("base") or {}))
+                errand = Errand(
+                    str(raw["id"]), kind, arg, str(raw["instruction"])[:MAX_ERRAND_CHARS],
+                    str(raw.get("sid") or ""), float(raw["created"]), float(raw["expires"]),
+                    dict(raw.get("base") or {}),
+                    repeat=bool(raw.get("repeat")) or kind == "every",
+                    script=str(raw.get("script") or "")[:MAX_SCRIPT_CHARS],
+                    last_run=float(raw.get("last_run") or 0.0),
+                    run_count=int(raw.get("run_count") or 0),
+                )
             except (KeyError, TypeError, ValueError):
                 continue  # a hand-edited or old entry is skipped, never crashes the start
-            if kind.startswith("background_") or now >= errand.expires or not errand.instruction:
+            if kind.startswith("background_") or (errand.expires > 0 and now >= errand.expires) or not errand.instruction:
                 continue
             if kind == "next_startup":
                 self.fired.append((errand, "Paperduck just started (the PC was restarted, or the app was)"))
@@ -404,4 +445,13 @@ def _idle_seconds() -> float:
     from src.tools.hints import idle_seconds
 
     return idle_seconds()
+
+
+def run_routine_script(script: str, cwd: Path | None = None, timeout_s: int = 60) -> tuple[bool, str]:
+    """Run a compiled routine command locally. Returns (handled_quietly, output)."""
+    from src.tools.ai_tools import run_command
+
+    out = run_command(cwd or Path.home(), script, None, timeout_s)
+    handled = out.startswith("exit code 0") and "NEEDS_AI:" not in out
+    return handled, out
 

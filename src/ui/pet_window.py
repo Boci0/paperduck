@@ -32,6 +32,7 @@ from src.engine.pet_state import PetStateMachine
 from src.graphics.animation_controller import AnimationController
 from src.tools.file_forge import ForgeMode, get_wheel_options_for_paths
 from src.tools.ai_assist import AiJob, AiReply
+from src.tools.ambient import AmbientRing
 from src.tools.macros import MacroBook
 from src.tools.hints import Suggestion
 from src.tools import computer
@@ -44,6 +45,7 @@ from src.tools.web_drop import WebImageJob, web_image_stem
 from src.ui.context_menu import PetContextMenu
 from src.ui.drop_wheel import RadialDropWheel
 from src.ui.macro_runner import MacroRunner
+from src.ui.menu_layout import MenuLayout
 from src.ui import perch
 from src.ui.quick_tools import HOTKEY_ACTIONS, OcrJob, SnipSession, default_hotkey, hotkey_label, parse_hotkey
 from src.ui.sfx import preload_tick_sounds, prewarm as prewarm_ticks
@@ -101,6 +103,8 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
     ) -> None:
         super().__init__(parent)
         self._state_machine = state_machine
+        self.ambient = AmbientRing()
+        self._quick_bar = None
         self._anim = animation_controller or AnimationController(size=32)
         self._always_on_top = always_on_top
         self._auto_wander = auto_wander
@@ -183,6 +187,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
         self._web_intermediate: Path | None = None
         self.recent = RecentFiles()
         self.wheel = WheelLayout()  # Settings > Customize Wheel, persisted as tools.wheel
+        self.menu_layout = MenuLayout()  # Customize... -> Menu, persisted as tools.menu
         self.macros = MacroBook()  # right-click > Macros, persisted as tools.macros
         self._macro_runner = MacroRunner(self)
         self.remote = RemoteController(self)
@@ -992,6 +997,7 @@ class PetWindow(WatchMixin, ToolsMixin, AiMixin, PaintMixin, QWidget):
             pet_scales=self.PET_SCALES,
             theme=saved_theme(),
             phone_bridge_on=self.remote.running,
+            menu_layout=self.menu_layout,
             parent=self,
         )
 

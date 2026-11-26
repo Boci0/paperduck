@@ -14,12 +14,13 @@ from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication
 from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog
 
 from src.engine.models import PetState
-from src.tools.ai_assist import AiAssistPlugin
+from src.tools.ai_assist import AiAssistPlugin, AiJob
 from src.tools.ai_tools import skills_dir
-from src.tools.errands import MAX_ERRAND_RUNS, ErrandsPlugin
+from src.tools.errands import MAX_ERRAND_RUNS, ErrandsPlugin, run_routine_script
 from src.tools.hints import Suggestion
 from src.ui.ai_chat import AiChat
 from src.ui.ai_tool_host import AiToolHost
+from src.ui.quick_bar import QuickCommandBar
 from src.ui.screen_glow import play_screen_glow
 from src.storage.storage_manager import log_text
 from src.ui.macro_editor import MacroEditor
@@ -90,6 +91,31 @@ class AiMixin:
         if self._ai_chat is None or not self._ai_chat.isVisible():
             self.open_ai_chat()
         return self._ai_chat
+
+    def open_quick_bar(self) -> None:
+        """Toggle the cursor-anchored 1-line Quick Command Bar with ambient context."""
+        bar = getattr(self, "_quick_bar", None)
+        if bar is not None and bar.isVisible():
+            bar.hide()
+            return
+        if bar is None:
+            bar = QuickCommandBar()
+            bar.submitted.connect(self._submit_quick_prompt)
+            self._quick_bar = bar
+        ctx = ""
+        if (ambient := getattr(self, "ambient", None)) is not None:
+            for ev in ambient.recent(6):
+                app_low = ev.app.lower()
+                if app_low in ("paperduck.exe", "pythonw.exe", "python.exe") or ev.title.lower() == "paperduck":
+                    continue
+                ctx = ev.app.removesuffix(".exe").removesuffix(".EXE") or ev.title
+                break
+        bar.open_at_cursor(ctx)
+
+    def _submit_quick_prompt(self, text: str) -> None:
+        chat = self.ensure_ai_chat()
+        if chat is not None:
+            chat.send_prompt(text)
 
     def _edit_macro(self, old_name: str = "") -> None:
         old = self.macros.find(old_name) if old_name else None
@@ -176,6 +202,34 @@ class AiMixin:
         if not errands.take_run():
             chat.add_note(f"Errand {errand.id} fired, but today's {MAX_ERRAND_RUNS} errand runs are used up.")
             self._show_toast("ERRAND CAP", QColor("#EF7D57"))
+            return
+        if errand.script:
+            project = getattr(self._state_machine.registry.get_plugin("project"), "repo", None)
+            cwd = Path(project) if project and Path(project).is_dir() else None
+            job = AiJob(self)
+
+            def run_compiled() -> tuple[bool, str]:
+                return run_routine_script(errand.script, cwd=cwd)
+
+            def on_compiled(res: object, error: str) -> None:
+                job.deleteLater()
+                handled, out = res if isinstance(res, tuple) and len(res) == 2 else (False, error or "script failed")
+                if not error and handled:
+                    errands.done += 1
+                    self._show_toast("ROUTINE DONE", QColor("#38B764"))
+                    self.update()
+                    return
+                merged = f"{evidence}\n\nCompiled script output:\n{out}"
+                if chat.run_errand(errand, merged):
+                    self._errand_running = True
+                    self._anim.play_oneshot("spin")
+                    self._schedule_next_anim_tick()
+                    if not chat.isVisible():
+                        self._show_errand_hint("errand_busy", "Errand: working on it", errand.instruction)
+                    self.update()
+
+            job.finished.connect(on_compiled)
+            job.start(run_compiled)
             return
         if chat.run_errand(errand, evidence):
             self._errand_running = True
@@ -352,6 +406,11 @@ class AiMixin:
             return
         if callback_id == "pet:clips":
             self._open_clip_history(QCursor.pos())
+            return
+        if callback_id == "pet:customize":
+            from src.ui.customize_dialog import CustomizeDialog
+
+            CustomizeDialog(self).exec()
             return
         if callback_id == "project:pick":
             folder = QFileDialog.getExistingDirectory(self, "Paperduck - Choose Project Folder")

@@ -50,6 +50,9 @@ MAX_CUSTOM = 8
 EXTRA_SLICES: tuple[ToolWheelOption, ...] = (
     ToolWheelOption("Snip", "region", "#73EFF7", "snip:image"),
     ToolWheelOption("Color", "pick", "#FFCD75", "snip:color"),
+    ToolWheelOption("Quick", "prompt", "#F2BE3A", "snip:quick"),
+    ToolWheelOption("Watch", "window", "#73EFF7", "snip:watch"),
+    ToolWheelOption("Phone", "bridge", "#38B764", "remote:toggle"),
     ToolWheelOption("JSON", "format", "#38B764", "clipvault:json_toggle"),
     ToolWheelOption("UUID", "new", "#8A9AF2", "clipvault:dev:uuid"),
     ToolWheelOption("VS Code", "project", "#41A6F6", "project:code"),

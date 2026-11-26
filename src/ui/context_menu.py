@@ -16,6 +16,7 @@ from src.engine.pet_state import PetStateMachine
 from src.storage.recent_files import format_age
 from src import __version__
 from src.storage.storage_manager import autostart_enabled, set_autostart
+from src.ui.menu_layout import MenuLayout
 from src.ui.quick_tools import HOTKEY_LABEL
 from src.ui.theme import (
     ACCENT_HEX,
@@ -159,6 +160,7 @@ class PetContextMenu(QMenu):
         pet_scales: dict[int, str] | None = None,
         theme: str = "system",
         phone_bridge_on: bool | None = None,
+        menu_layout: MenuLayout | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -192,9 +194,38 @@ class PetContextMenu(QMenu):
                     lambda _checked=False, c=cid: state_machine.execute_tool_action(c)
                 )
 
-        # Tools: screenshot first (most used), then plugin submenus
+        layout = menu_layout or MenuLayout()
+        more_menu_holder: list[QMenu] = []
+
+        def more_menu() -> QMenu:
+            if not more_menu_holder:
+                more_menu_holder.append(style_menu(QMenu("More Tools", self)))
+            return more_menu_holder[0]
+
+        def add_section_menu(section_name: str, menu: QMenu) -> None:
+            if layout.is_hidden(section_name):
+                more_menu().addMenu(menu)
+            else:
+                self.addMenu(menu)
+
         self.plugin_actions: dict[str, QAction] = {}
         self.plugin_submenus: dict[str, QMenu] = {}
+
+        if layout.pinned:
+            added_pin = False
+            for cid in layout.pinned:
+                label = layout.label_for(cid)
+                if not label:
+                    continue
+                p_act = QAction(label, self)
+                connect(p_act, cid)
+                self.addAction(p_act)
+                self.plugin_actions.setdefault(cid, p_act)
+                added_pin = True
+            if added_pin:
+                self.addSeparator()
+
+        # Tools: screenshot first (most used), then plugin submenus
         self.quick_menu = style_menu(QMenu("Screenshot", self))
         for label, cid in QUICK_TOOL_ITEMS:
             q_act = QAction(label, self.quick_menu)
@@ -202,7 +233,7 @@ class PetContextMenu(QMenu):
                 q_act.triggered.connect(lambda _checked=False, c=cid: on_tool_action(c))
             self.quick_menu.addAction(q_act)
             self.plugin_actions[cid] = q_act
-        self.addMenu(self.quick_menu)
+        add_section_menu("Screenshot", self.quick_menu)
 
         # Macros: run one, or build chains of quick tools (hotkey Ctrl+Shift+Alt+1..9 in list order)
         self.macro_menu = style_menu(QMenu("Macros", self))
@@ -232,7 +263,7 @@ class PetContextMenu(QMenu):
                 d_act.setChecked(name == double_click_macro)
             for sub in (edit_menu, dbl_menu, remove_menu):
                 self.macro_menu.addMenu(sub)
-        self.addMenu(self.macro_menu)
+        add_section_menu("Macros", self.macro_menu)
 
         # Recent outputs: click reveals the file selected in Explorer
         self.recent_menu = style_menu(QMenu("Recent Files", self))
@@ -255,7 +286,7 @@ class PetContextMenu(QMenu):
                 f_act.triggered.connect(lambda _checked=False, c=cid: on_tool_action(c))
             self.recent_menu.addAction(f_act)
             self.plugin_actions[cid] = f_act
-        self.addMenu(self.recent_menu)
+        add_section_menu("Recent Files", self.recent_menu)
 
         top_level_items = []
         timer_subs: list[QMenu] = []
@@ -273,6 +304,8 @@ class PetContextMenu(QMenu):
                 group = "timer" if item.submenu in TIMER_SUBMENUS else "ai" if item.submenu in AI_SUBMENUS else "tools"
                 if group == "timer":
                     timer_subs.append(sub)
+                elif layout.is_hidden(item.submenu):
+                    more_menu().addMenu(sub)
                 else:
                     if group not in groups_started:
                         self.addSeparator()
@@ -305,9 +338,7 @@ class PetContextMenu(QMenu):
             phone_menu.addAction(rot_act)
             self.plugin_actions["remote:rotate"] = rot_act
             self.plugin_submenus["Phone Control"] = phone_menu
-            self.addMenu(phone_menu)
-
-        self.addSeparator()
+            add_section_menu("Phone Control", phone_menu)
 
         # Focus timer group
         pomo = state_machine.pomodoro_plugin
@@ -316,20 +347,30 @@ class PetContextMenu(QMenu):
             if (pomo is not None and pomo.running)
             else f"Start / Resume Pomodoro ({pomo.work_minutes if pomo is not None else 25}m)"
         )
-        self.play_action = QAction(pomo_label, self)
+        pomo_hidden = layout.is_hidden("Pomodoro")
+        pomo_target = style_menu(QMenu("Pomodoro", more_menu())) if pomo_hidden else self
+        if not pomo_hidden:
+            self.addSeparator()
+        self.play_action = QAction(pomo_label, pomo_target)
         self.play_action.triggered.connect(lambda _checked=False: on_play())
-        self.addAction(self.play_action)
+        pomo_target.addAction(self.play_action)
         for item in top_level_items:
-            p_act = QAction(item.label, self)
+            p_act = QAction(item.label, pomo_target)
             p_act.setEnabled(item.enabled)
             if item.checkable:
                 p_act.setCheckable(True)
                 p_act.setChecked(item.checked)
             connect(p_act, item.callback_id)
-            self.addAction(p_act)
+            pomo_target.addAction(p_act)
             self.plugin_actions[item.callback_id] = p_act
         for sub in timer_subs:
-            self.addMenu(sub)
+            pomo_target.addMenu(sub)
+        if pomo_hidden:
+            more_menu().addMenu(pomo_target)
+
+        if more_menu_holder:
+            self.addSeparator()
+            self.addMenu(more_menu_holder[0])
 
         self.addSeparator()
 
@@ -360,6 +401,14 @@ class PetContextMenu(QMenu):
         self.feed_action.triggered.connect(lambda _checked=False: on_feed())
         self.hud_menu.addAction(self.feed_action)
         self.addMenu(self.hud_menu)
+
+        if on_tool_action is not None:
+            self.customize_action: QAction | None = QAction("Customize...", self)
+            self.customize_action.triggered.connect(lambda _checked=False: on_tool_action("pet:customize"))
+            self.addAction(self.customize_action)
+            self.plugin_actions["pet:customize"] = self.customize_action
+        else:
+            self.customize_action = None
 
         # Window settings
         self.settings_menu = style_menu(QMenu("Settings", self))

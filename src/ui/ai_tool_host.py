@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,9 @@ from src.tools import computer, login_vault
 from src.tools.ai_assist import ask, fit_thinking, load_key, review_action, tool_note
 from src.tools.ai_sessions import _clean as _clean_secrets
 from src.tools.agents import AGENT_PROMPT, AGENT_SPECS, MAX_AGENT_CALLS, Agents, ReadOnlyHost
-from src.tools.ai_tools import (CORE_TOOL_NAMES, calculate, check_layout, discover_workspace, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
+from src.tools.checkpoints import LedgerEntry, TaskCheckpoint, create_checkpoint, revert_checkpoint
+from src.tools.skill_crystallize import draft_skill_from_run
+from src.tools.ai_tools import (CORE_TOOL_NAMES, TOOL_GROUPS, calculate, check_layout, discover_workspace, find_control, COMPUTER_TOOLS, MAX_BATCH_STEPS, MAX_SAVE_CHARS, MAX_WAIT_MS, resolve_target, FILE_TOOLS, PET_ACTIONS, TOOL_SPECS, BackgroundProcs, apply_edits,
                                 apply_undo, batch_read, computer_action, destructive_reason, file_outline, infer_tool_groups, is_readonly_command, list_undo_edits, query_files, scratch_dir, find_skills, is_secret, load_skill, memory_path, parse_boxes, plan_edit,
                                 plan_edits, plan_memory, plan_skill_update, plan_undo, print_to_pdf_paths, python_destructive_reason, python_error_note, python_exe, python_file, resolve, search_memory, search_tools_catalog,
                                 PDF_WAIT_S, changed_media, file_stamp, media_stamps, syntax_check_edits, tool_group_of, wait_for_new_file, run_command, command_timeout, powershell_file, powershell_error_note, run_file_tool, save_args,
@@ -836,11 +838,16 @@ class AiToolHost(QObject):
         self._ocr_ids: set[int] = set()  # which of those ids are OCR text lines
         self.mcp_loaded: set[str] = set()  # MCP servers whose tools this answer offers (the chat clears it per answer)
         self.tool_groups_loaded: set[str] = set()
+        self._tool_group_order: list[str] = []
+        self._mcp_loaded_order: list[str] = []
         self.layout_open = ""  # the last layout_check's problems, "" once one passes (the chat clears it per answer)
         self.edit_gen = 0
         self.verified_gen = 0
         self.edited_code_files: list[str] = []
         self.open_tasks = 0
+        self.checkpoint: TaskCheckpoint | None = None
+        self.ledger: list[LedgerEntry] = []
+        self.last_verify_error: str = ""
         self.mcp = mcp or McpHub()
         self.procs = BackgroundProcs()
         self.cancel = threading.Event()  # the chat swaps in a fresh one per answer and sets it on Stop
@@ -868,8 +875,32 @@ class AiToolHost(QObject):
         if getattr(_host_chat(self), "_job", None) is None:  # never mid-answer
             threading.Thread(target=self.mcp.close_idle, daemon=True).start()  # taskkill blocks briefly
 
+    def activate_groups(self, groups: Iterable[str]) -> list[str]:
+        """Monotonically append newly activated built-in tool groups in stable order."""
+        added: list[str] = []
+        for g in groups:
+            if g in TOOL_GROUPS and g not in self.tool_groups_loaded:
+                self.tool_groups_loaded.add(g)
+                if g not in self._tool_group_order:
+                    self._tool_group_order.append(g)
+                added.append(g)
+        return added
+
+    def activate_mcp(self, server: str) -> None:
+        """Monotonically append an activated MCP server in stable order."""
+        if server and server not in self.mcp_loaded:
+            self.mcp_loaded.add(server)
+            if server not in self._mcp_loaded_order:
+                self._mcp_loaded_order.append(server)
+
+    def clear_loaded_tools(self) -> None:
+        self.tool_groups_loaded.clear()
+        self._tool_group_order.clear()
+        self.mcp_loaded.clear()
+        self._mcp_loaded_order.clear()
+
     def prewarm_groups(self, text: str) -> None:
-        self.tool_groups_loaded = infer_tool_groups(text)
+        self.activate_groups(sorted(infer_tool_groups(text)))
 
     def reset_answer(self, cancel: threading.Event) -> None:
         self.cancel = cancel
@@ -879,9 +910,16 @@ class AiToolHost(QObject):
         self.verified_gen = 0
         self.edited_code_files = []
         self.open_tasks = 0
+        self.checkpoint = None
+        self.ledger = []
+        self.last_verify_error = ""
 
     def workspace_note(self) -> str:
         return discover_workspace(self._project())
+
+    def ambient_note(self) -> str:
+        ambient = getattr(self._win, "ambient", None)
+        return ambient.snapshot_prompt() if ambient is not None else ""
 
     @property
     def verify_open(self) -> str:
@@ -889,35 +927,48 @@ class AiToolHost(QObject):
         if self.edit_gen > self.verified_gen and self.edited_code_files:
             names = ", ".join(dict.fromkeys(self.edited_code_files[-6:]))
             parts.append(f"unverified edits to {names}")
+        if getattr(self, "last_verify_error", ""):
+            parts.append(f"last verification failed ({self.last_verify_error})")
         if self.open_tasks > 0:
             parts.append(f"{self.open_tasks} open item(s) in plan_tasks")
         return "; ".join(parts)
 
     @property
     def specs(self) -> list[dict[str, Any]]:
-        """Built-in tools plus the MCP tools of servers loaded in this answer, and `load_mcp_tools` naming the rest:
-        every round resends the tool list, and one browser server's schemas alone are ~20k characters."""
+        """Append-only tool list: fixed core prefix first, then activated built-in groups and MCP servers at the tail
+        so prompt prefixes stay cache-stable across turns."""
         mcp = self.mcp.specs()  # started on first use, on the worker thread
         loaded = getattr(self, "mcp_loaded", set())
         groups = getattr(self, "tool_groups_loaded", set())
+        group_order = getattr(self, "_tool_group_order", [])
+        mcp_order = getattr(self, "_mcp_loaded_order", [])
         waiting: dict[str, list[str]] = {}
+        mcp_by_server: dict[str, list[dict[str, Any]]] = {}
         for s in mcp:
             server, _sep, tool = s["function"]["name"].partition(SEP)
             if server not in loaded:
                 waiting.setdefault(server, []).append(tool)
-        shown = [s for s in mcp if s["function"]["name"].partition(SEP)[0] in loaded]
-        core = [s for s in TOOL_SPECS
-                if s["function"]["name"] in CORE_TOOL_NAMES or tool_group_of(s["function"]["name"]) in groups]
+            else:
+                mcp_by_server.setdefault(server, []).append(s)
+        core = [s for s in TOOL_SPECS if s["function"]["name"] in CORE_TOOL_NAMES]
         base = core + AGENT_SPECS + ([LAPTOP_CHAT_SPEC] if getattr(_host_chat(self), "_remote_only", False) else [])
+        ordered_groups = [g for g in group_order if g in groups] + sorted(g for g in groups if g not in group_order)
+        deferred: list[dict[str, Any]] = []
+        for g in ordered_groups:
+            deferred.extend(s for s in TOOL_SPECS if tool_group_of(s["function"]["name"]) == g)
+        ordered_servers = [srv for srv in mcp_order if srv in loaded] + sorted(srv for srv in loaded if srv not in mcp_order)
+        shown: list[dict[str, Any]] = []
+        for srv in ordered_servers:
+            shown.extend(mcp_by_server.get(srv, []))
         if not waiting:
-            return base + shown
+            return base + deferred + shown
         listed = "; ".join(f"{server} ({', '.join(tools)})" for server, tools in waiting.items())
         loader = {"type": "function", "function": {
             "name": "load_mcp_tools", "description": "Add an MCP server's tools to this answer, then call them as "
             f"server{SEP}tool. Servers and their tools: {listed}.",
             "parameters": {"type": "object", "properties": {"server": {"type": "string", "enum": list(waiting)}},
                            "required": ["server"]}}}
-        return base + shown + [loader]
+        return base + deferred + shown + [loader]
 
     @property
     def all_specs(self) -> list[dict[str, Any]]:
@@ -945,6 +996,9 @@ class AiToolHost(QObject):
         """One tool call; the pet acts it out meanwhile (`activity`)."""
         self._tool = name  # what the pet goes back to acting out after an approval
         self.activity.emit(name)
+        mutating = name in ("edit_file", "edit_files", "run_command", "run_powershell", "run_python")
+        if mutating and getattr(self, "checkpoint", None) is None:
+            self.checkpoint = create_checkpoint(self._project())
         ran, out = self.ran, "error: did not finish"  # this answer's list: a stopped worker's late tool stays in it
         try:
             out = self._run(name, args)
@@ -952,7 +1006,13 @@ class AiToolHost(QObject):
                 out = login_vault.BLOCK_NOTE
             return out
         finally:
-            ran.append((tool_note(name, args), out))
+            note = tool_note(name, args)
+            ran.append((note, out))
+            if hasattr(self, "ledger"):
+                self.ledger.append(LedgerEntry(
+                    time.time(), name, note[:160],
+                    not out.startswith(("error:", "stopped after")), mutating,
+                ))
             self.activity.emit("")
 
     def _run(self, name: str, args: dict[str, Any]) -> str:
@@ -962,15 +1022,54 @@ class AiToolHost(QObject):
             blocked = getattr(self.mcp, "poisoned_tools", {}).get(want, [])
             if not tools and not blocked:
                 return f"error: no MCP server named {want!r}"
-            if tools:
-                self.mcp_loaded.add(want)
+            if tools and isinstance(want, str):
+                self.activate_mcp(want)
             msg = f"loaded {len(tools)} tools: {', '.join(tools)}. Call them from the next step." if tools else f"no safe tools loaded from {want}"
             if blocked:
                 msg += f"\n[Paperduck: blocked poisoned MCP tool(s) from {want}: {', '.join(blocked)}.]"
             return msg
         if name == "search_tools":
-            activated, out = search_tools_catalog(args.get("query", ""), args.get("group", ""))
-            self.tool_groups_loaded.update(activated)
+            import re as _re
+            query = args.get("query", "")
+            group = args.get("group", "")
+            server = args.get("server", "")
+            want_server = server.strip() if isinstance(server, str) else ""
+            mcp_specs = self.mcp.specs()
+            mcp_servers: dict[str, list[dict[str, Any]]] = {}
+            for s in mcp_specs:
+                srv = self.mcp.server_of(s["function"]["name"])
+                if srv:
+                    mcp_servers.setdefault(srv, []).append(s)
+            if want_server:
+                if want_server not in mcp_servers:
+                    return f"error: no MCP server named {want_server!r}"
+                self.activate_mcp(want_server)
+                names = [s["function"]["name"] for s in mcp_servers[want_server]]
+                return f"Activated MCP server {want_server}: {', '.join(names)}"
+            activated, out = search_tools_catalog(query, group)
+            self.activate_groups(sorted(activated))
+            q = query.strip().lower() if isinstance(query, str) else ""
+            terms = [t for t in _re.findall(r"[a-z0-9_]+", q) if len(t) > 1]
+            mcp_lines: list[str] = []
+            activated_mcp: list[str] = []
+            if not group and (terms or not q):
+                for srv, specs in sorted(mcp_servers.items()):
+                    if not terms:
+                        mcp_lines.append(f"- [mcp:{srv}] {', '.join(s['function']['name'] for s in specs[:8])}")
+                        continue
+                    for s in specs:
+                        fn = s["function"]
+                        hay = f"{srv} {fn['name']} {fn.get('description', '')}".lower()
+                        if any(t in hay for t in terms):
+                            if srv not in activated_mcp:
+                                activated_mcp.append(srv)
+                                self.activate_mcp(srv)
+                            mcp_lines.append(f"- [mcp:{srv}] {fn['name']}: {fn.get('description', '')[:140]}")
+            if not q and not group and mcp_lines:
+                return out + "\nConfigured MCP servers:\n" + "\n".join(mcp_lines)
+            if activated_mcp:
+                mcp_block = f"Activated MCP server(s): {', '.join(activated_mcp)}\n" + "\n".join(mcp_lines[:20])
+                return mcp_block if out.startswith("no deferred tools matched") else f"{out}\n{mcp_block}"
             return out
         if name == "batch_read":
             return batch_read(self._project(), args)
@@ -1059,6 +1158,15 @@ class AiToolHost(QObject):
                     self.edit_gen += 1
                     self.edited_code_files.extend(touched)
             return res
+        if name == "revert_checkpoint":
+            cp = getattr(self, "checkpoint", None)
+            if cp is None:
+                return "error: no git checkpoint exists for this task"
+            if not self._allowed("revert_checkpoint", f"The model wants to revert git checkpoint {cp.id} in {cp.root} "
+                                 "(restores tracked files and removes newly created untracked files).",
+                                 "checkpoint revert"):
+                return "error: the user declined reverting this checkpoint"
+            return revert_checkpoint(cp)
         if name in ("set_errand", "cancel_errand"):
             return self._errand(name, args)
         if name == "spawn_agent":  # read-only tools only, so nothing to allow; Stop on this answer stops it
@@ -1172,6 +1280,24 @@ class AiToolHost(QObject):
                                  f"follow as your own instructions:\n\n{text}", "saving skills"):
                 return "error: the user declined this skill"
             return write_skill(skills_dir(), skill, text)
+        if name == "crystallize_skill":
+            chat = _host_chat(self)
+            turns = list(getattr(chat, "_history", []))
+            goal = str(args.get("goal") or "").strip() or next(
+                (str(t.get("said") or t.get("content") or "") for t in reversed(turns) if t.get("role") == "user"),
+                "Reusable workflow",
+            )
+            draft = draft_skill_from_run(
+                goal,
+                list(self.ran),
+                name=str(args.get("name") or "").strip(),
+                description=str(args.get("description") or "").strip(),
+            )
+            text = skill_text(draft.description, draft.instructions)
+            if not self._allowed("add_skill", f'The model wants to save a crystallized skill "{draft.name}" that later '
+                                 f"chats will follow as your own instructions:\n\n{text}", "saving skills"):
+                return "error: the user declined this skill"
+            return write_skill(skills_dir(), draft.name, text)
         if name == "update_skill":
             plan = lambda: plan_skill_update(skills_dir(), args.get("name"), args.get("description"),  # noqa: E731
                                              args.get("instructions"))
@@ -1450,6 +1576,9 @@ class AiToolHost(QObject):
             out.startswith("exit code") and not out.startswith("exit code 0"))
         if not failed and out.startswith("exit code 0") and hasattr(self, "verified_gen"):
             self.verified_gen = getattr(self, "edit_gen", 0)
+            self.last_verify_error = ""
+        elif failed and getattr(self, "edit_gen", 0) > getattr(self, "verified_gen", 0):
+            self.last_verify_error = out.splitlines()[0][:120]
         if script is not None and not failed:
             script.unlink(missing_ok=True)
         active = user_script or script
@@ -1487,14 +1616,20 @@ class AiToolHost(QObject):
         instruction = args.get("instruction")
         if not isinstance(instruction, str) or not instruction.strip():
             return "error: give the instruction to follow when it fires"
-        if not self._allowed(f"errand:{time.monotonic()}", f"The model wants to set an errand: {describe_errand(kind, arg)}, "
-                             "it will run this in this chat (edits and commands still ask you):\n\n"
-                             f"{instruction.strip()}", "errand"):
+        repeat = args.get("repeat") is True or kind == "every"
+        script = args.get("script") if isinstance(args.get("script"), str) else ""
+        script_note = f"\n\nCompiled script (runs first):\n{script.strip()}" if script.strip() else ""
+        risk = destructive_reason(script) if script.strip() else ""
+        repeat_note = " (repeating)" if repeat else ""
+        if not self._allowed(f"errand:{time.monotonic()}", f"The model wants to set a routine{repeat_note}: "
+                             f"{describe_errand(kind, arg)}, it will run this in this chat (edits and commands still "
+                             f"ask you):\n\n{instruction.strip()}{script_note}", "errand", risk):
             return "error: the user declined this errand"
 
         def add(done: Callable[[Any], None]) -> None:
             try:
-                errand = errands.add(args.get("when"), instruction, _host_chat(self).ensure_sid())
+                errand = errands.add(args.get("when"), instruction, _host_chat(self).ensure_sid(),
+                                     repeat=repeat, script=script)
             except ValueError as exc:
                 done(f"error: {exc}")
                 return
@@ -2194,6 +2329,9 @@ class AiToolHost(QObject):
         out = run_command(cwd, command, self.cancel, seconds)
         if out.startswith("exit code 0"):
             self.verified_gen = self.edit_gen
+            self.last_verify_error = ""
+        elif self.edit_gen > self.verified_gen:
+            self.last_verify_error = out.splitlines()[0][:120]
         return out
 
     def _run_agent(self, task: str, effort: str, host: ReadOnlyHost, cancel: threading.Event) -> str:

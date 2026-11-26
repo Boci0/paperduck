@@ -121,6 +121,21 @@ class MacroRunner:
         self._prompt.append(arg)
         self._next()
 
+    def _do_ambient(self, _arg: str) -> None:
+        ambient = getattr(self._win, "ambient", None)
+        if ambient is not None and (snap := ambient.snapshot_prompt()):
+            self._prompt.append(snap)
+        self._next()
+
+    def _do_quick(self, _arg: str) -> None:
+        self._win.open_quick_bar()
+        bar = getattr(self._win, "_quick_bar", None)
+        words = self._words(" ")
+        if bar is not None and words:
+            bar._input.setText(words)
+            bar._input.setCursorPosition(len(words))
+        self._next()
+
     def _do_ocr(self, _arg: str) -> None:
         if self._image is None:
             self._stop("NO IMAGE")
